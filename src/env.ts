@@ -28,9 +28,8 @@ function parseAddressList(raw: string): string[] {
 export type CopyTradeConfig = {
   copyRatio: number;
   /**
-   * Buy: skip only if `clob − implied > this` (paying worse than target’s entry + margin).
-   * Sell: skip only if `implied − clob > this` (selling worse than target’s exit + margin).
-   * Cheaper buys / better sells vs implied are always allowed.
+   * Buy only: skip if `clob − implied > this` (would pay meaningfully above target’s on-chain entry).
+   * Sell copies ignore this guard and proceed (still subject to min size, book, etc.).
    */
   maxPriceDifference: number;
   minPositionUsdc: number;

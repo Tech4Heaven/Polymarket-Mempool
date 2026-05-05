@@ -1,6 +1,6 @@
 /**
- * Resolves a human-readable Polymarket **event** label for a CLOB outcome `tokenId`
- * via Gamma HTTP API (no CLOB round-trip on the hot path until we explicitly call this).
+ * Resolves a human-readable Polymarket **event** title for a CLOB outcome `tokenId`
+ * via Gamma HTTP API (event title, else market question).
  */
 export async function fetchPolymarketEventLabel(tokenId: string): Promise<string> {
   try {
