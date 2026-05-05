@@ -13,8 +13,10 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@polymarket/clob-client-v2": "^1.0.2",
     "dotenv": "^17.4.2",
-    "ethers": "^6.16.0"
+    "ethers": "^6.16.0",
+    "viem": "^2.48.7"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

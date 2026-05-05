@@ -1,34 +1,16 @@
-import { formatUnits, getAddress, type AbstractProvider, type TransactionResponse } from "ethers";
+import type { AbstractProvider } from "ethers";
+import { buildCopyDigests, ensureClobClient, executeCopyTrade } from "./copyTrade.js";
 import { extractCtf1155TransfersForTargets } from "./ctf1155Inbound.js";
-import type { DecodedExchangeCall } from "./decodeExchangeCall.js";
+import type { CopyTradeConfig } from "./env.js";
 import { loadConfig } from "./env.js";
 import { startMempoolWatcher } from "./mempool.js";
 import { aggregatePusdForTargets } from "./pusdTransfers.js";
 
-function formatMatchBlock(tx: TransactionResponse, decoded: DecodedExchangeCall): string {
-  const lines: string[] = [];
-  lines.push(`MATCH tx=${tx.hash}`);
-  lines.push(`from=${getAddress(tx.from)}`);
-  lines.push(`to=${tx.to ? getAddress(tx.to) : "(none)"}`);
-
-  if (decoded.kind === "matchOrders") {
-    lines.push(`kind=matchOrders`);
-    lines.push(`conditionId=${decoded.conditionId}`);
-    lines.push(`takerMaker=${getAddress(decoded.takerOrder.maker)}`);
-    lines.push(`takerSigner=${getAddress(decoded.takerOrder.signer)}`);
-  } else {
-    lines.push(`kind=preapproveOrder`);
-    lines.push(`maker=${getAddress(decoded.order.maker)}`);
-    lines.push(`signer=${getAddress(decoded.order.signer)}`);
-  }
-
-  return lines.join("\n");
-}
-
 async function logMinedTransfers(
   provider: AbstractProvider,
   txHash: string,
-  matchedTargets: string[]
+  matchedTargets: string[],
+  copyTrade: CopyTradeConfig | null
 ): Promise<void> {
   try {
     const receipt = await provider.waitForTransaction(txHash);
@@ -39,41 +21,39 @@ async function logMinedTransfers(
     const { received, sent } = aggregatePusdForTargets(receipt, matchedTargets);
     const { inbound, outbound } = extractCtf1155TransfersForTargets(receipt, matchedTargets);
 
-    const parts: string[] = [];
-    if (received !== 0n || sent !== 0n) {
-      const side: string[] = [];
-      if (received !== 0n) {
-        side.push(`+${formatUnits(received, 6)}`);
+    if (copyTrade) {
+      const digests = buildCopyDigests(received, sent, inbound, outbound);
+      for (const d of digests) {
+        void executeCopyTrade(copyTrade, d, txHash).catch((e) => {
+          console.error(`copy trade failed tx=${txHash} token=${d.tokenId}`, e);
+        });
       }
-      if (sent !== 0n) {
-        side.push(`−${formatUnits(sent, 6)}`);
-      }
-      parts.push(`pUSD ${side.join(" / ")}`);
     }
-    for (const o of inbound) {
-      parts.push(`outcome +${o.amountPer1e6} tokenId=${o.tokenId}`);
-    }
-    for (const o of outbound) {
-      parts.push(`outcome sent ${o.amountPer1e6} tokenId=${o.tokenId}`);
-    }
-
-    if (parts.length === 0) {
-      return;
-    }
-    console.log(`mined tx=${txHash}`);
-    console.log(parts.join("\n"));
-    console.log("---------------------------------------------------\n");
   } catch (e) {
     console.error(`mined error tx=${txHash}`, e);
   }
 }
 
-function main() {
+async function main() {
+  const config = loadConfig();
+
+  if (config.copyTrade) {
+    try {
+      await ensureClobClient(config.copyTrade);
+      console.info("CLOB: createOrDeriveApiKey OK (L2 credentials derived from wallet).");
+    } catch (e) {
+      console.error("CLOB: createOrDeriveApiKey failed — copy trades will fail until auth succeeds:", e);
+    }
+  }
+
+  if (config.copyTrade?.dryRun) {
+    console.info("COPY_TRADING_DRY_RUN=1 — copy logic runs; orders are not submitted.");
+  }
+
   const { provider } = startMempoolWatcher(
-    loadConfig(),
-    ({ tx, decoded, matchedTargets }) => {
-      console.log(formatMatchBlock(tx, decoded));
-      void logMinedTransfers(provider, tx.hash, matchedTargets);
+    config,
+    ({ tx, matchedTargets }) => {
+      void logMinedTransfers(provider, tx.hash, matchedTargets, config.copyTrade);
     },
     (err, context) => {
       console.error(`${context}:`, err);
@@ -81,4 +61,4 @@ function main() {
   );
 }
 
-main();
+void main();
