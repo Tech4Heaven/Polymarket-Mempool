@@ -255,14 +255,15 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   }
 
   const usdcNotional = parseFloat(formatUnits(digest.pusdRaw, 6)) * cfg.copyRatio;
-  const clippedUsdc = clamp(usdcNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
-  const orderShares = clippedUsdc / currentPrice;
-
-  const minOrder = parseFloat(book.min_order_size);
-  if (!Number.isNaN(minOrder) && orderShares < minOrder) {
-    await logCopySkip(`size ${orderShares} < min_order_size ${book.min_order_size}`, digest, txHash);
+  if (usdcNotional < cfg.minPositionUsdc) {
+    await logCopySkip(
+      `pUSD ${usdcNotional.toFixed(6)} < MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
+      digest,
+      txHash
+    );
     return;
   }
+  const clippedUsdc = clamp(usdcNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
 
   let limitPrice: number;
   if (digest.side === "buy") {
@@ -281,12 +282,21 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     limitPrice = roundToTick(Math.min(currentPrice, bid), tickSize, "down");
   }
 
+  // Size using executable limit price so buy notional does not exceed clippedUsdc.
+  const orderShares = clippedUsdc / limitPrice;
+
+  const minOrder = parseFloat(book.min_order_size);
+  if (!Number.isNaN(minOrder) && orderShares < minOrder) {
+    await logCopySkip(`size ${orderShares} < min_order_size ${book.min_order_size}`, digest, txHash);
+    return;
+  }
+
   const side = digest.side === "buy" ? Side.BUY : Side.SELL;
 
   if (cfg.dryRun) {
     const eventLabel = await fetchPolymarketEventLabel(digest.tokenId);
     const msg =
-      `[DRY RUN] would post GTC · side=${digest.side} tokenID=${digest.tokenId} size=${orderShares} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} clobMid~${currentPrice.toFixed(4)} · tx=${txHash} · event=${JSON.stringify(eventLabel)}`;
+      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${clippedUsdc.toFixed(6)} tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} clobMid~${currentPrice.toFixed(4)} · tx=${txHash} · event=${JSON.stringify(eventLabel)}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg);
     return;
@@ -304,7 +314,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   );
 
   const eventLabel = await fetchPolymarketEventLabel(digest.tokenId);
-  const msg = `copy posted · ${digest.side} shares=${orderShares} limit=${limitPrice} mid~${currentPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)} · event=${JSON.stringify(eventLabel)}`;
+  const msg = `copy posted · ${digest.side} shares=${orderShares} pUSD=${clippedUsdc.toFixed(6)} limit=${limitPrice} mid~${currentPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)} · event=${JSON.stringify(eventLabel)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg);
 }
