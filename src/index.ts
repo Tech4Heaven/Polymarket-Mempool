@@ -46,10 +46,6 @@ async function main() {
     }
   }
 
-  if (config.copyTrade?.dryRun) {
-    console.info("COPY_TRADING_DRY_RUN=1 — copy logic runs; orders are not submitted.");
-  }
-
   const { provider } = startMempoolWatcher(
     config,
     ({ tx, matchedTargets }) => {
