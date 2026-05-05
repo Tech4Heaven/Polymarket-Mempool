@@ -27,7 +27,11 @@ function parseAddressList(raw: string): string[] {
 
 export type CopyTradeConfig = {
   copyRatio: number;
-  /** Fixed max |market_ref − on_chain_exec| (0–1 price scale). */
+  /**
+   * Buy: skip only if `clob − implied > this` (paying worse than target’s entry + margin).
+   * Sell: skip only if `implied − clob > this` (selling worse than target’s exit + margin).
+   * Cheaper buys / better sells vs implied are always allowed.
+   */
   maxPriceDifference: number;
   minPositionUsdc: number;
   maxPositionUsdc: number;

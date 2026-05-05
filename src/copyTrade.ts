@@ -237,9 +237,13 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     return;
   }
 
-  if (Math.abs(currentPrice - implied) > cfg.maxPriceDifference) {
+  const drift =
+    digest.side === "buy"
+      ? currentPrice - implied
+      : implied - currentPrice;
+  if (drift > cfg.maxPriceDifference) {
     console.log(
-      `copy skip · price drift implied(on-chain)=${implied.toFixed(4)} clob=${currentPrice.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · tx=${txHash}`
+      `copy skip · price drift ${digest.side} · implied(on-chain)=${implied.toFixed(4)} clob=${currentPrice.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · tx=${txHash}`
     );
     return;
   }
