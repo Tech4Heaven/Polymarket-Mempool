@@ -1,4 +1,5 @@
 import {
+  AssetType,
   Chain,
   ClobClient,
   OrderType,
@@ -226,6 +227,7 @@ export async function ensureClobClient(cfg: CopyTradeConfig): Promise<ClobClient
  */
 export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest, txHash: string): Promise<void> {
   const implied = impliedPrice(digest.pusdRaw, digest.outcomeRaw);
+  const originPusd = parseFloat(formatUnits(digest.pusdRaw, 6));
   if (!Number.isFinite(implied) || implied <= 0) {
     await logCopySkip(`bad implied on-chain price · token=${digest.tokenId}`, digest, txHash);
     return;
@@ -263,16 +265,19 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     }
   }
 
-  const usdcNotional = parseFloat(formatUnits(digest.pusdRaw, 6)) * cfg.copyRatio;
-  if (usdcNotional < cfg.minPositionUsdc) {
-    await logCopySkip(
-      `pUSD ${usdcNotional.toFixed(6)} < MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
-      digest,
-      txHash
-    );
-    return;
+  let clippedUsdc: number | null = null;
+  if (digest.side === "buy") {
+    const usdcNotional = originPusd * cfg.copyRatio;
+    if (usdcNotional < cfg.minPositionUsdc) {
+      await logCopySkip(
+        `pUSD ${usdcNotional.toFixed(6)} < MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
+        digest,
+        txHash
+      );
+      return;
+    }
+    clippedUsdc = clamp(usdcNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
   }
-  const clippedUsdc = clamp(usdcNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
 
   let limitPrice: number;
   if (digest.side === "buy") {
@@ -291,8 +296,22 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     limitPrice = roundToTick(Math.min(currentPrice, bid), tickSize, "down");
   }
 
-  // Size using executable limit price so buy notional does not exceed clippedUsdc.
-  const orderShares = clippedUsdc / limitPrice;
+  // Buy: size from clipped notional. Sell: immediately liquidate full token balance.
+  let orderShares: number;
+  if (digest.side === "buy") {
+    orderShares = (clippedUsdc ?? 0) / limitPrice;
+  } else {
+    const bal = await client.getBalanceAllowance({
+      asset_type: AssetType.CONDITIONAL,
+      token_id: digest.tokenId,
+    });
+    const fullBalance = parseFloat(String(bal.balance));
+    if (!Number.isFinite(fullBalance) || fullBalance <= 0) {
+      await logCopySkip(`no balance to sell · token=${digest.tokenId}`, digest, txHash);
+      return;
+    }
+    orderShares = fullBalance;
+  }
 
   const minOrder = parseFloat(book.min_order_size);
   if (!Number.isNaN(minOrder) && orderShares < minOrder) {
@@ -304,8 +323,9 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
 
   if (cfg.dryRun) {
     const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
+    const pUsdForLog = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
     const msg =
-      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${clippedUsdc.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} · tx=${txHash}`;
+      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} · tx=${txHash}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg);
     return;
@@ -323,7 +343,8 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   );
 
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
-  const msg = `copy posted · ${digest.side} shares=${orderShares} pUSD=${clippedUsdc.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
+  const pUsdForLog = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
+  const msg = `copy posted · ${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg);
 }
