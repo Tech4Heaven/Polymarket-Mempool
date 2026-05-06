@@ -46,9 +46,9 @@ async function main() {
     }
   }
 
-  const { provider } = startMempoolWatcher(
+  startMempoolWatcher(
     config,
-    ({ tx, matchedTargets }) => {
+    ({ tx, provider, matchedTargets }) => {
       void logMinedTransfers(provider, tx.hash, matchedTargets, config.copyTrade);
     },
     (err, context) => {

@@ -9,6 +9,7 @@ import type { AppConfig } from "./env.js";
 
 export type TargetMatch = {
   tx: TransactionResponse;
+  provider: WebSocketProvider;
   decoded: DecodedExchangeCall;
   /** Which configured target(s) appear in taker/maker order maker or signer fields. */
   matchedTargets: string[];
@@ -30,8 +31,12 @@ export function startMempoolWatcher(
   onTargetMatch: (m: TargetMatch) => void,
   onError: (err: unknown, context: string) => void
 ): { provider: WebSocketProvider; stop: () => void } {
-  const provider = new WebSocketProvider(config.polygonWssUrl);
+  const makeProvider = () => new WebSocketProvider(config.polygonWssUrl);
+  let provider = makeProvider();
   const exSet = exchangeSet(config.exchangeAddresses);
+  let stopped = false;
+  let reconnecting = false;
+  let reconnectAttempt = 0;
 
   let active = 0;
   const queue: string[] = [];
@@ -63,7 +68,7 @@ export function startMempoolWatcher(
     if (matchedTargets.length === 0) {
       return;
     }
-    onTargetMatch({ tx, decoded, matchedTargets });
+    onTargetMatch({ tx, provider, decoded, matchedTargets });
   };
 
   const pump = () => {
@@ -87,9 +92,55 @@ export function startMempoolWatcher(
     pump();
   };
 
-  provider.on("pending", onPending);
+  const bindProvider = (p: WebSocketProvider) => {
+    p.on("pending", onPending);
+    p.on("error", (err) => {
+      onError(err, "provider error");
+      void reconnect("provider error");
+    });
+
+    const ws = (p as unknown as { websocket?: { on?: (evt: string, cb: (...args: unknown[]) => void) => void } })
+      .websocket;
+    ws?.on?.("error", (err: unknown) => {
+      onError(err, "websocket error");
+      void reconnect("websocket error");
+    });
+    ws?.on?.("close", (code: unknown) => {
+      onError(new Error(`websocket closed code=${String(code)}`), "websocket close");
+      void reconnect("websocket close");
+    });
+  };
+
+  const reconnect = async (reason: string) => {
+    if (stopped || reconnecting) {
+      return;
+    }
+    reconnecting = true;
+    reconnectAttempt += 1;
+    const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(5, reconnectAttempt - 1));
+    onError(new Error(`reconnecting websocket (${reason}) in ${delayMs}ms`), "watcher reconnect");
+    try {
+      provider.off("pending", onPending);
+      void provider.destroy();
+    } catch (e) {
+      onError(e, "destroy provider");
+    }
+
+    await new Promise((r) => setTimeout(r, delayMs));
+    if (stopped) {
+      reconnecting = false;
+      return;
+    }
+
+    provider = makeProvider();
+    bindProvider(provider);
+    reconnecting = false;
+  };
+
+  bindProvider(provider);
 
   const stop = () => {
+    stopped = true;
     provider.off("pending", onPending);
     void provider.destroy();
   };
