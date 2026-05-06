@@ -14,7 +14,7 @@ import { withSuppressedPolymarketClobConsole } from "./clobConsoleSuppress.js";
 import type { CopyTradeConfig } from "./env.js";
 import type { Ctf1155TransferRow } from "./ctf1155Inbound.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
-import { fetchPolymarketEventLabel } from "./gammaEventName.js";
+import { fetchPolymarketMarketLabels } from "./gammaEventName.js";
 
 function aggregateOutcomeByTokenId(rows: Ctf1155TransferRow[]): Map<string, bigint> {
   const m = new Map<string, bigint>();
@@ -118,8 +118,10 @@ function clamp(n: number, lo: number, hi: number): number {
 }
 
 async function logCopySkip(reasonDetail: string, digest: CopyDigest, txHash: string): Promise<void> {
-  const event = await fetchPolymarketEventLabel(digest.tokenId);
-  console.log(`copy skip · ${reasonDetail} · tx=${txHash} · event=${JSON.stringify(event)}`);
+  const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
+  const msg = `copy skip · ${reasonDetail} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tx=${txHash}`;
+  console.log(msg);
+  void appendCopyTradeSuccessLine(msg);
 }
 
 /** Parse CLOB midpoint / price API payloads to a number in (0,1). */
@@ -294,9 +296,9 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   const side = digest.side === "buy" ? Side.BUY : Side.SELL;
 
   if (cfg.dryRun) {
-    const eventLabel = await fetchPolymarketEventLabel(digest.tokenId);
+    const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
     const msg =
-      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${clippedUsdc.toFixed(6)} tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} clobMid~${currentPrice.toFixed(4)} · tx=${txHash} · event=${JSON.stringify(eventLabel)}`;
+      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${clippedUsdc.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} · tx=${txHash}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg);
     return;
@@ -313,8 +315,8 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     OrderType.GTC
   );
 
-  const eventLabel = await fetchPolymarketEventLabel(digest.tokenId);
-  const msg = `copy posted · ${digest.side} shares=${orderShares} pUSD=${clippedUsdc.toFixed(6)} limit=${limitPrice} mid~${currentPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)} · event=${JSON.stringify(eventLabel)}`;
+  const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
+  const msg = `copy posted · ${digest.side} shares=${orderShares} pUSD=${clippedUsdc.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg);
 }
