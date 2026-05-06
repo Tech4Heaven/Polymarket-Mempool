@@ -117,6 +117,13 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
 
+/** On-chain amounts from the copied wallet trade (USDC + outcome tokens, 6 decimals each). */
+function formatOriginTradeSizing(digest: CopyDigest): string {
+  const pUSD = parseFloat(formatUnits(digest.pusdRaw, 6)).toFixed(6);
+  const shares = parseFloat(formatUnits(digest.outcomeRaw, 6)).toFixed(6);
+  return `origin pUSD=${pUSD} shares=${shares}`;
+}
+
 async function logCopySkip(reasonDetail: string, digest: CopyDigest, txHash: string): Promise<void> {
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
   const msg = `copy skip · ${reasonDetail} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tx=${txHash}`;
@@ -248,7 +255,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     const drift = currentPrice - implied;
     if (drift > cfg.maxPriceDifference) {
       await logCopySkip(
-        `price drift buy · implied(on-chain)=${implied.toFixed(4)} clob=${currentPrice.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference}`,
+        `price drift buy · implied(on-chain)=${implied.toFixed(4)} clob=${currentPrice.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · ${formatOriginTradeSizing(digest)}`,
         digest,
         txHash
       );
