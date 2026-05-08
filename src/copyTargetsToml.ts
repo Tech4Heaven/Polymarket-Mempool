@@ -3,14 +3,7 @@ import { resolve } from "path";
 import { parse } from "@iarna/toml";
 import { getAddress, isAddress } from "ethers";
 
-export type TomlClobSection = {
-  enabled?: boolean;
-  dry_run?: boolean;
-  private_key?: string;
-  signature_type?: number;
-  funder_address?: string;
-  polygon_http_url?: string;
-  clob_host?: string;
+export type TomlDefaultsSection = {
   /** Defaults applied to each [[targets]] row when a field is omitted */
   copy_ratio?: number;
   max_price_difference?: number;
@@ -28,7 +21,7 @@ export type TomlTargetRow = {
 };
 
 export type ParsedCopyTargetsToml = {
-  clob: TomlClobSection | undefined;
+  defaults: TomlDefaultsSection | undefined;
   targets: TomlTargetRow[];
 };
 
@@ -55,13 +48,6 @@ function strOrUndef(k: string, o: Record<string, unknown>): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
-function boolOrUndef(k: string, o: Record<string, unknown>): boolean | undefined {
-  if (!(k in o)) {
-    return undefined;
-  }
-  return typeof o[k] === "boolean" ? o[k] : undefined;
-}
-
 export async function parseCopyTargetsTomlFile(filePath: string): Promise<ParsedCopyTargetsToml> {
   const abs = resolve(filePath);
   const raw = await readFile(abs, "utf8");
@@ -71,22 +57,16 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
     throw new Error(`copy targets TOML: expected table at root (${abs})`);
   }
 
-  let clob: TomlClobSection | undefined;
-  const clobRaw = root["clob"];
-  const clobTab = asRecord(clobRaw);
-  if (clobTab) {
-    clob = {
-      enabled: boolOrUndef("enabled", clobTab),
-      dry_run: boolOrUndef("dry_run", clobTab),
-      private_key: strOrUndef("private_key", clobTab),
-      signature_type: numOrUndef("signature_type", clobTab),
-      funder_address: strOrUndef("funder_address", clobTab),
-      polygon_http_url: strOrUndef("polygon_http_url", clobTab),
-      clob_host: strOrUndef("clob_host", clobTab),
-      copy_ratio: numOrUndef("copy_ratio", clobTab),
-      max_price_difference: numOrUndef("max_price_difference", clobTab),
-      min_position_usdc: numOrUndef("min_position_usdc", clobTab),
-      max_position_usdc: numOrUndef("max_position_usdc", clobTab),
+  let defaults: TomlDefaultsSection | undefined;
+  const defaultsTab = asRecord(root["defaults"]);
+  const legacyClobTab = asRecord(root["clob"]);
+  const src = defaultsTab ?? legacyClobTab;
+  if (src) {
+    defaults = {
+      copy_ratio: numOrUndef("copy_ratio", src),
+      max_price_difference: numOrUndef("max_price_difference", src),
+      min_position_usdc: numOrUndef("min_position_usdc", src),
+      max_position_usdc: numOrUndef("max_position_usdc", src),
     };
   }
 
@@ -119,5 +99,5 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
     throw new Error(`copy targets TOML: need at least one [[targets]] (${abs})`);
   }
 
-  return { clob, targets };
+  return { defaults, targets };
 }

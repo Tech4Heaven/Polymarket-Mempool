@@ -212,8 +212,9 @@ function loadRpcOnly(): Pick<
 }
 
 /**
- * Loads app config: optional `copy-targets.toml` (see `COPY_TARGETS_TOML`) for multi-target copy settings;
- * otherwise legacy `.env` (`TARGET_TRADER_ADDRESSES` + copy flags).
+ * Loads app config: optional `copy-targets.toml` (see `COPY_TARGETS_TOML`) for target list and per-target sizing.
+ * Shared CLOB settings are always loaded from `.env` (`COPY_*`, signature/funder, host URLs).
+ * Without TOML, legacy `.env` (`TARGET_TRADER_ADDRESSES` + global sizing) still works.
  */
 export async function loadAppConfig(): Promise<AppConfig> {
   const rpc = loadRpcOnly();
@@ -223,68 +224,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
 
   if (existsSync(tomlAbs)) {
     const parsed = await parseCopyTargetsTomlFile(tomlAbs);
-    const clob = parsed.clob ?? {};
-
-    const copyEnabled = clob.enabled !== false;
-    let shared: CopyTradeShared | null = null;
-    if (copyEnabled) {
-      const pkRaw = clob.private_key?.trim() || process.env["COPY_WALLET_PRIVATE_KEY"]?.trim();
-      if (!pkRaw) {
-        throw new Error(
-          `Copy trading enabled in ${tomlRel} but no private key: set [clob] private_key or COPY_WALLET_PRIVATE_KEY`
-        );
-      }
-      const pk = normalizeCopyWalletPrivateKey(pkRaw);
-
-      const sigFromToml = clob.signature_type;
-      const sigRaw =
-        sigFromToml !== undefined && Number.isFinite(sigFromToml)
-          ? sigFromToml
-          : parseInt(requireEnv("CLOB_SIGNATURE_TYPE"), 10);
-      if (!Number.isFinite(sigRaw) || sigRaw < 0 || sigRaw > 3) {
-        throw new Error(
-          `[clob] signature_type must be 0–3 (or set CLOB_SIGNATURE_TYPE) in ${tomlRel}`
-        );
-      }
-
-      const funderToml = clob.funder_address?.trim();
-      const funderEnv = process.env["FUNDER_ADDRESS"]?.trim();
-      let funderAddress: string | undefined;
-      const funderStr = funderToml || funderEnv;
-      if (funderStr) {
-        if (!isAddress(funderStr)) {
-          throw new Error(`Invalid funder address in TOML or FUNDER_ADDRESS`);
-        }
-        funderAddress = getAddress(funderStr);
-      } else if (sigRaw === 1 || sigRaw === 2) {
-        throw new Error(
-          `FUNDER_ADDRESS or [clob] funder_address required when signature_type is 1 or 2 (${tomlRel})`
-        );
-      }
-
-      const polygonHttpUrl =
-        clob.polygon_http_url?.trim() ||
-        process.env["POLYGON_HTTP_URL"]?.trim() ||
-        "https://polygon-bor.publicnode.com";
-      const clobHost =
-        clob.clob_host?.trim() ||
-        process.env["CLOB_HOST"]?.trim() ||
-        "https://clob.polymarket.com";
-
-      const dryRun =
-        clob.dry_run === true ||
-        process.env["COPY_TRADING_DRY_RUN"]?.trim().toLowerCase() === "true" ||
-        process.env["COPY_TRADING_DRY_RUN"]?.trim() === "1";
-
-      shared = {
-        privateKey: pk,
-        signatureType: sigRaw,
-        funderAddress,
-        polygonHttpUrl,
-        clobHost,
-        dryRun,
-      };
-    }
+    const defaults = parsed.defaults ?? {};
+    const shared = loadCopyTradeSharedFromEnv();
 
     const targetTraderAddresses = parsed.targets.map((t) => t.address);
     const targetCopyProfiles = new Map<string, TargetCopyParams>();
@@ -294,24 +235,20 @@ export async function loadAppConfig(): Promise<AppConfig> {
       await mkdir(logsDir, { recursive: true });
 
       for (const row of parsed.targets) {
-        const copyRatio = requireNum(
-          "copy_ratio",
-          row.copy_ratio ?? clob.copy_ratio,
-          `targets ${row.address}`
-        );
+        const copyRatio = requireNum("copy_ratio", row.copy_ratio ?? defaults.copy_ratio, `targets ${row.address}`);
         const maxPriceDifference = requireNum(
           "max_price_difference",
-          row.max_price_difference ?? clob.max_price_difference,
+          row.max_price_difference ?? defaults.max_price_difference,
           `targets ${row.address}`
         );
         const minPositionUsdc = requireNum(
           "min_position_usdc",
-          row.min_position_usdc ?? clob.min_position_usdc,
+          row.min_position_usdc ?? defaults.min_position_usdc,
           `targets ${row.address}`
         );
         const maxPositionUsdc = requireNum(
           "max_position_usdc",
-          row.max_position_usdc ?? clob.max_position_usdc,
+          row.max_position_usdc ?? defaults.max_position_usdc,
           `targets ${row.address}`
         );
         if (minPositionUsdc > maxPositionUsdc) {
