@@ -1,11 +1,25 @@
 import type { AbstractProvider } from "ethers";
 import { getAddress } from "ethers";
 import { buildCopyDigests, ensureClobClient, executeCopyTrade } from "./copyTrade.js";
+import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { extractCtf1155TransfersForTargets } from "./ctf1155Inbound.js";
 import type { AppConfig } from "./env.js";
 import { loadAppConfig, mergeCopyTradeConfig } from "./env.js";
 import { startMempoolWatcher } from "./mempool.js";
 import { aggregatePusdForTargets } from "./pusdTransfers.js";
+
+function formatLogErr(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** Fan-out pipeline lines (RPC / websocket / reconnect) to every target copy log when copy trading is on. */
+async function appendWatcherLineToAllTargetLogs(line: string, config: AppConfig): Promise<void> {
+  if (!config.copyTradeShared) {
+    return;
+  }
+  const paths = [...new Set([...config.targetCopyProfiles.values()].map((p) => p.copyTradeLogPath))];
+  await Promise.all(paths.map((fp) => appendCopyTradeSuccessLine(line, fp)));
+}
 
 async function logMinedTransfers(
   provider: AbstractProvider,
@@ -16,6 +30,21 @@ async function logMinedTransfers(
   try {
     const receipt = await provider.waitForTransaction(txHash);
     if (!receipt) {
+      if (config.copyTradeShared) {
+        for (const addrRaw of matchedTargets) {
+          let addrKey: string;
+          try {
+            addrKey = getAddress(addrRaw);
+          } catch {
+            continue;
+          }
+          const profile = config.targetCopyProfiles.get(addrKey);
+          if (!profile) {
+            continue;
+          }
+          void appendCopyTradeSuccessLine(`[mined] tx=${txHash} no receipt`, profile.copyTradeLogPath);
+        }
+      }
       return;
     }
 
@@ -40,14 +69,43 @@ async function logMinedTransfers(
       const { inbound, outbound } = extractCtf1155TransfersForTargets(receipt, [profile.address]);
 
       const digests = buildCopyDigests(received, sent, inbound, outbound);
+      if (digests.length === 0) {
+        void appendCopyTradeSuccessLine(
+          `[skip] tx=${txHash} no copy digest for target=${profile.address} ` +
+            `(buy needs sent PUSD + single inbound outcome token; sell needs received PUSD + single outbound outcome token); ` +
+            `received=${received} sent=${sent} ctfInbound=${inbound.length} ctfOutbound=${outbound.length}`,
+          profile.copyTradeLogPath
+        );
+        continue;
+      }
       for (const d of digests) {
         void executeCopyTrade(copyCfg, d, txHash).catch((e) => {
           console.error(`copy trade failed tx=${txHash} target=${profile.address} token=${d.tokenId}`, e);
+          void appendCopyTradeSuccessLine(
+            `[copy-error] tx=${txHash} token=${d.tokenId} ${formatLogErr(e)}`,
+            copyCfg.copyTradeLogPath
+          );
         });
       }
     }
   } catch (e) {
     console.error(`mined error tx=${txHash}`, e);
+    if (config.copyTradeShared) {
+      const msg = `[mined] tx=${txHash} error ${formatLogErr(e)}`;
+      for (const addrRaw of matchedTargets) {
+        let addrKey: string;
+        try {
+          addrKey = getAddress(addrRaw);
+        } catch {
+          continue;
+        }
+        const profile = config.targetCopyProfiles.get(addrKey);
+        if (!profile) {
+          continue;
+        }
+        void appendCopyTradeSuccessLine(msg, profile.copyTradeLogPath);
+      }
+    }
   }
 }
 
@@ -75,6 +133,7 @@ async function main() {
     },
     (err, context) => {
       console.error(`${context}:`, err);
+      void appendWatcherLineToAllTargetLogs(`[watcher] ${context}: ${formatLogErr(err)}`, config);
     }
   );
 }
