@@ -1,0 +1,29 @@
+# Copy this to `copy-targets.toml` (or set COPY_TARGETS_TOML to another path).
+# When this file exists, TARGET_TRADER_ADDRESSES / per-target COPY_* env vars are not used for sizing.
+# Keep secrets out of git: use [clob] private_key here only if the file is private, or set COPY_WALLET_PRIVATE_KEY in .env.
+
+[clob]
+enabled = true
+dry_run = false
+# private_key = "0x..."          # optional if COPY_WALLET_PRIVATE_KEY is set in .env
+signature_type = 2
+funder_address = "0x0000000000000000000000000000000000000000"
+# polygon_http_url = "https://..."
+# clob_host = "https://clob.polymarket.com"
+
+# Defaults for every [[targets]] row (each field can be overridden per target)
+copy_ratio = 1
+max_price_difference = 0.1
+min_position_usdc = 1
+max_position_usdc = 100
+
+[[targets]]
+address = "0xe71a099e3a4499458de60a1daba70ab649cd6944"
+# username = "MyLabel"            # optional; used in log filename; if omitted, resolved from Polymarket public-profile API
+
+[[targets]]
+address = "0x0000000000000000000000000000000000000001"
+copy_ratio = 0.5
+max_price_difference = 0.05
+
+# Mempool watcher still uses POLYGON_WSS_URL, EXCHANGE_ADDRESSES, MAX_CONCURRENT_TX_LOOKUPS from .env.

@@ -125,11 +125,16 @@ function formatOriginTradeSizing(digest: CopyDigest): string {
   return `origin pUSD=${pUSD} shares=${shares}`;
 }
 
-async function logCopySkip(reasonDetail: string, digest: CopyDigest, txHash: string): Promise<void> {
+async function logCopySkip(
+  reasonDetail: string,
+  digest: CopyDigest,
+  txHash: string,
+  cfg: CopyTradeConfig
+): Promise<void> {
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
   const msg = `copy skip · ${reasonDetail} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tx=${txHash}`;
   console.log(msg);
-  void appendCopyTradeSuccessLine(msg);
+  void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
 }
 
 /** Parse CLOB midpoint / price API payloads to a number in (0,1). */
@@ -229,7 +234,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   const implied = impliedPrice(digest.pusdRaw, digest.outcomeRaw);
   const originPusd = parseFloat(formatUnits(digest.pusdRaw, 6));
   if (!Number.isFinite(implied) || implied <= 0) {
-    await logCopySkip(`bad implied on-chain price · token=${digest.tokenId}`, digest, txHash);
+    await logCopySkip(`bad implied on-chain price · token=${digest.tokenId}`, digest, txHash, cfg);
     return;
   }
 
@@ -249,7 +254,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     currentPrice = parseClobPrice(pxRaw);
   }
   if (currentPrice === null) {
-    await logCopySkip(`could not parse CLOB price · token=${digest.tokenId}`, digest, txHash);
+    await logCopySkip(`could not parse CLOB price · token=${digest.tokenId}`, digest, txHash, cfg);
     return;
   }
 
@@ -259,7 +264,8 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       await logCopySkip(
         `price drift buy · implied(on-chain)=${implied.toFixed(4)} clob=${currentPrice.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · ${formatOriginTradeSizing(digest)}`,
         digest,
-        txHash
+        txHash,
+        cfg
       );
       return;
     }
@@ -272,7 +278,8 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       await logCopySkip(
         `pUSD ${usdcNotional.toFixed(6)} < MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
         digest,
-        txHash
+        txHash,
+        cfg
       );
       return;
     }
@@ -283,14 +290,14 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   if (digest.side === "buy") {
     const ask = bestAsk(book);
     if (ask === null) {
-      await logCopySkip("empty asks", digest, txHash);
+      await logCopySkip("empty asks", digest, txHash, cfg);
       return;
     }
     limitPrice = roundToTick(Math.max(currentPrice, ask), tickSize, "up");
   } else {
     const bid = bestBid(book);
     if (bid === null) {
-      await logCopySkip("empty bids", digest, txHash);
+      await logCopySkip("empty bids", digest, txHash, cfg);
       return;
     }
     limitPrice = roundToTick(Math.min(currentPrice, bid), tickSize, "down");
@@ -310,11 +317,11 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     try {
       fullBalance = parseFloat(formatUnits(BigInt(String(bal.balance)), 6));
     } catch {
-      await logCopySkip(`invalid balance response · token=${digest.tokenId}`, digest, txHash);
+      await logCopySkip(`invalid balance response · token=${digest.tokenId}`, digest, txHash, cfg);
       return;
     }
     if (!Number.isFinite(fullBalance) || fullBalance <= 0) {
-      await logCopySkip(`no balance to sell · token=${digest.tokenId}`, digest, txHash);
+      await logCopySkip(`no balance to sell · token=${digest.tokenId}`, digest, txHash, cfg);
       return;
     }
     orderShares = fullBalance;
@@ -322,7 +329,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
 
   const minOrder = parseFloat(book.min_order_size);
   if (!Number.isNaN(minOrder) && orderShares < minOrder) {
-    await logCopySkip(`size ${orderShares} < min_order_size ${book.min_order_size}`, digest, txHash);
+    await logCopySkip(`size ${orderShares} < min_order_size ${book.min_order_size}`, digest, txHash, cfg);
     return;
   }
 
@@ -334,7 +341,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     const msg =
       `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} · tx=${txHash}`;
     console.log(msg);
-    void appendCopyTradeSuccessLine(msg);
+    void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
     return;
   }
 
@@ -353,5 +360,5 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   const pUsdForLog = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
   const msg = `copy posted · ${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
   console.log(msg);
-  void appendCopyTradeSuccessLine(msg);
+  void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
 }

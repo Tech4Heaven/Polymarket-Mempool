@@ -13,6 +13,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@iarna/toml": "^2.2.5",
     "@polymarket/clob-client-v2": "^1.0.2",
     "dotenv": "^17.4.2",
     "ethers": "^6.16.0",

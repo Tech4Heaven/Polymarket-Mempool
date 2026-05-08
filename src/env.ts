@@ -1,6 +1,11 @@
 import "dotenv/config";
+import { existsSync } from "fs";
+import { mkdir } from "fs/promises";
+import { isAbsolute, resolve } from "path";
 import { getAddress, isAddress } from "ethers";
 import { EXCHANGE_V2_ADDRESSES } from "./contracts.js";
+import { parseCopyTargetsTomlFile } from "./copyTargetsToml.js";
+import { fetchPolymarketProfileLabel } from "./polymarketProfile.js";
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -25,39 +30,67 @@ function parseAddressList(raw: string): string[] {
   return out;
 }
 
-export type CopyTradeConfig = {
-  copyRatio: number;
-  /**
-   * Buy only: skip if `clob − implied > this` (would pay meaningfully above target’s on-chain entry).
-   * Sell copies ignore this guard and proceed (still subject to min size, book, etc.).
-   */
-  maxPriceDifference: number;
-  minPositionUsdc: number;
-  maxPositionUsdc: number;
+export type CopyTradeShared = {
   privateKey: `0x${string}`;
   /** 0 EOA, 1 POLY_PROXY, 2 GNOSIS_SAFE, 3 POLY_1271 */
   signatureType: number;
   funderAddress?: string;
   polygonHttpUrl: string;
   clobHost: string;
-  /** When true, runs CLOB checks and sizing but does not submit `createAndPostOrder`. */
   dryRun: boolean;
+};
+
+/** Per-target sizing and dedicated copy-trade log path (absolute). */
+export type TargetCopyParams = {
+  address: string;
+  copyRatio: number;
+  maxPriceDifference: number;
+  minPositionUsdc: number;
+  maxPositionUsdc: number;
+  copyTradeLogPath: string;
+};
+
+export type CopyTradeConfig = CopyTradeShared & {
+  copyRatio: number;
+  maxPriceDifference: number;
+  minPositionUsdc: number;
+  maxPositionUsdc: number;
+  /**
+   * When set, copy-trade lines go here; otherwise {@link appendCopyTradeSuccessLine} uses env / default file.
+   */
+  copyTradeLogPath?: string;
 };
 
 export type AppConfig = {
   /** WebSocket RPC URL (must support eth_subscribe pending). */
   polygonWssUrl: string;
-  /** One or more trader wallets/proxies to flag when they appear in orders. */
+  /** Trader wallets to watch in the mempool matcher. */
   targetTraderAddresses: string[];
-  /** Optional subset of exchange contracts; defaults to both V2 exchanges. */
+  /** Checksum address → sizing + log file; subset of targets that participate in copy trading. */
+  targetCopyProfiles: Map<string, TargetCopyParams>;
   exchangeAddresses: string[];
-  /** Max concurrent eth_getTransactionByHash calls while draining pending. */
   maxConcurrentTxLookups: number;
-  /** When set, posts copy trades after mined fills pass slip + size checks. */
-  copyTrade: CopyTradeConfig | null;
+  /** Shared CLOB wallet and endpoints; null disables posting copy orders. */
+  copyTradeShared: CopyTradeShared | null;
 };
 
-function parsePositiveFloat(name: string): number {
+export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParams): CopyTradeConfig {
+  return {
+    privateKey: shared.privateKey,
+    signatureType: shared.signatureType,
+    funderAddress: shared.funderAddress,
+    polygonHttpUrl: shared.polygonHttpUrl,
+    clobHost: shared.clobHost,
+    dryRun: shared.dryRun,
+    copyRatio: p.copyRatio,
+    maxPriceDifference: p.maxPriceDifference,
+    minPositionUsdc: p.minPositionUsdc,
+    maxPositionUsdc: p.maxPositionUsdc,
+    copyTradeLogPath: p.copyTradeLogPath,
+  };
+}
+
+function parsePositiveFloatEnv(name: string): number {
   const v = requireEnv(name);
   const n = parseFloat(v);
   if (!Number.isFinite(n) || n < 0) {
@@ -85,22 +118,17 @@ function normalizeCopyWalletPrivateKey(raw: string): `0x${string}` {
   return pk as `0x${string}`;
 }
 
-function loadCopyTradeConfig(): CopyTradeConfig | null {
+function copyTradingFlagFromEnv(): boolean {
   const flag = process.env["COPY_TRADING_ENABLED"]?.trim().toLowerCase();
-  if (!flag || flag === "0" || flag === "false") {
+  return flag === "true" || flag === "1";
+}
+
+function loadCopyTradeSharedFromEnv(): CopyTradeShared | null {
+  if (!copyTradingFlagFromEnv()) {
     return null;
   }
 
   const pk = normalizeCopyWalletPrivateKey(requireEnv("COPY_WALLET_PRIVATE_KEY"));
-
-  const copyRatio = parsePositiveFloat("COPY_RATIO");
-  const maxPriceDifference = parsePositiveFloat("MAX_PRICE_DIFFERENCE");
-  const minPositionUsdc = parsePositiveFloat("MIN_POSITION_USDC");
-  const maxPositionUsdc = parsePositiveFloat("MAX_POSITION_USDC");
-  if (minPositionUsdc > maxPositionUsdc) {
-    throw new Error("MIN_POSITION_USDC must be <= MAX_POSITION_USDC");
-  }
-
   const signatureType = parseInt(requireEnv("CLOB_SIGNATURE_TYPE"), 10);
   if (!Number.isFinite(signatureType) || signatureType < 0 || signatureType > 3) {
     throw new Error("CLOB_SIGNATURE_TYPE must be 0–3 (EOA, POLY_PROXY, GNOSIS_SAFE, POLY_1271)");
@@ -127,10 +155,6 @@ function loadCopyTradeConfig(): CopyTradeConfig | null {
   const dryRun = dryRaw === "true" || dryRaw === "1";
 
   return {
-    copyRatio,
-    maxPriceDifference,
-    minPositionUsdc,
-    maxPositionUsdc,
     privateKey: pk,
     signatureType,
     funderAddress,
@@ -140,10 +164,42 @@ function loadCopyTradeConfig(): CopyTradeConfig | null {
   };
 }
 
-export function loadConfig(): AppConfig {
-  const polygonWssUrl = requireEnv("POLYGON_WSS_URL");
-  const targetTraderAddresses = parseAddressList(requireEnv("TARGET_TRADER_ADDRESSES"));
+function requireNum(name: string, v: number | undefined, ctx: string): number {
+  if (v === undefined || !Number.isFinite(v) || v < 0) {
+    throw new Error(`${ctx}: ${name} must be a non-negative number`);
+  }
+  return v;
+}
 
+function sanitizeLogLabel(raw: string): string {
+  const s = raw
+    .trim()
+    .replace(/[\\/:*?"<>|\s]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "");
+  return s.slice(0, 80) || "unknown";
+}
+
+async function resolveLogBasename(
+  address: string,
+  usernameOverride: string | undefined
+): Promise<string> {
+  const addrLc = address.toLowerCase();
+  let label: string;
+  if (usernameOverride?.trim()) {
+    label = sanitizeLogLabel(usernameOverride);
+  } else {
+    const fromApi = await fetchPolymarketProfileLabel(address);
+    label = sanitizeLogLabel(fromApi ?? "unknown");
+  }
+  return `${label}_${addrLc}.log`;
+}
+
+function loadRpcOnly(): Pick<
+  AppConfig,
+  "polygonWssUrl" | "exchangeAddresses" | "maxConcurrentTxLookups"
+> {
+  const polygonWssUrl = requireEnv("POLYGON_WSS_URL");
   const rawExchanges = process.env["EXCHANGE_ADDRESSES"]?.trim();
   const exchangeAddresses = rawExchanges
     ? parseAddressList(rawExchanges)
@@ -152,13 +208,191 @@ export function loadConfig(): AppConfig {
   const maxRaw = process.env["MAX_CONCURRENT_TX_LOOKUPS"]?.trim();
   const maxConcurrentTxLookups = maxRaw ? Math.max(1, parseInt(maxRaw, 10) || 5) : 5;
 
-  const copyTrade = loadCopyTradeConfig();
+  return { polygonWssUrl, exchangeAddresses, maxConcurrentTxLookups };
+}
+
+/**
+ * Loads app config: optional `copy-targets.toml` (see `COPY_TARGETS_TOML`) for multi-target copy settings;
+ * otherwise legacy `.env` (`TARGET_TRADER_ADDRESSES` + copy flags).
+ */
+export async function loadAppConfig(): Promise<AppConfig> {
+  const rpc = loadRpcOnly();
+  const cwd = process.cwd();
+  const tomlRel = process.env["COPY_TARGETS_TOML"]?.trim() || "copy-targets.toml";
+  const tomlAbs = resolve(cwd, tomlRel);
+
+  if (existsSync(tomlAbs)) {
+    const parsed = await parseCopyTargetsTomlFile(tomlAbs);
+    const clob = parsed.clob ?? {};
+
+    const copyEnabled = clob.enabled !== false;
+    let shared: CopyTradeShared | null = null;
+    if (copyEnabled) {
+      const pkRaw = clob.private_key?.trim() || process.env["COPY_WALLET_PRIVATE_KEY"]?.trim();
+      if (!pkRaw) {
+        throw new Error(
+          `Copy trading enabled in ${tomlRel} but no private key: set [clob] private_key or COPY_WALLET_PRIVATE_KEY`
+        );
+      }
+      const pk = normalizeCopyWalletPrivateKey(pkRaw);
+
+      const sigFromToml = clob.signature_type;
+      const sigRaw =
+        sigFromToml !== undefined && Number.isFinite(sigFromToml)
+          ? sigFromToml
+          : parseInt(requireEnv("CLOB_SIGNATURE_TYPE"), 10);
+      if (!Number.isFinite(sigRaw) || sigRaw < 0 || sigRaw > 3) {
+        throw new Error(
+          `[clob] signature_type must be 0–3 (or set CLOB_SIGNATURE_TYPE) in ${tomlRel}`
+        );
+      }
+
+      const funderToml = clob.funder_address?.trim();
+      const funderEnv = process.env["FUNDER_ADDRESS"]?.trim();
+      let funderAddress: string | undefined;
+      const funderStr = funderToml || funderEnv;
+      if (funderStr) {
+        if (!isAddress(funderStr)) {
+          throw new Error(`Invalid funder address in TOML or FUNDER_ADDRESS`);
+        }
+        funderAddress = getAddress(funderStr);
+      } else if (sigRaw === 1 || sigRaw === 2) {
+        throw new Error(
+          `FUNDER_ADDRESS or [clob] funder_address required when signature_type is 1 or 2 (${tomlRel})`
+        );
+      }
+
+      const polygonHttpUrl =
+        clob.polygon_http_url?.trim() ||
+        process.env["POLYGON_HTTP_URL"]?.trim() ||
+        "https://polygon-bor.publicnode.com";
+      const clobHost =
+        clob.clob_host?.trim() ||
+        process.env["CLOB_HOST"]?.trim() ||
+        "https://clob.polymarket.com";
+
+      const dryRun =
+        clob.dry_run === true ||
+        process.env["COPY_TRADING_DRY_RUN"]?.trim().toLowerCase() === "true" ||
+        process.env["COPY_TRADING_DRY_RUN"]?.trim() === "1";
+
+      shared = {
+        privateKey: pk,
+        signatureType: sigRaw,
+        funderAddress,
+        polygonHttpUrl,
+        clobHost,
+        dryRun,
+      };
+    }
+
+    const targetTraderAddresses = parsed.targets.map((t) => t.address);
+    const targetCopyProfiles = new Map<string, TargetCopyParams>();
+
+    if (shared) {
+      const logsDir = resolve(cwd, "logs");
+      await mkdir(logsDir, { recursive: true });
+
+      for (const row of parsed.targets) {
+        const copyRatio = requireNum(
+          "copy_ratio",
+          row.copy_ratio ?? clob.copy_ratio,
+          `targets ${row.address}`
+        );
+        const maxPriceDifference = requireNum(
+          "max_price_difference",
+          row.max_price_difference ?? clob.max_price_difference,
+          `targets ${row.address}`
+        );
+        const minPositionUsdc = requireNum(
+          "min_position_usdc",
+          row.min_position_usdc ?? clob.min_position_usdc,
+          `targets ${row.address}`
+        );
+        const maxPositionUsdc = requireNum(
+          "max_position_usdc",
+          row.max_position_usdc ?? clob.max_position_usdc,
+          `targets ${row.address}`
+        );
+        if (minPositionUsdc > maxPositionUsdc) {
+          throw new Error(
+            `targets ${row.address}: min_position_usdc must be <= max_position_usdc (${tomlRel})`
+          );
+        }
+
+        const base = await resolveLogBasename(row.address, row.username);
+        const copyTradeLogPath = resolve(logsDir, base);
+
+        targetCopyProfiles.set(row.address, {
+          address: row.address,
+          copyRatio,
+          maxPriceDifference,
+          minPositionUsdc,
+          maxPositionUsdc,
+          copyTradeLogPath,
+        });
+      }
+    }
+
+    return {
+      ...rpc,
+      targetTraderAddresses,
+      targetCopyProfiles,
+      copyTradeShared: shared,
+    };
+  }
+
+  /** Legacy: env-only target list */
+  const targetTraderAddresses = parseAddressList(requireEnv("TARGET_TRADER_ADDRESSES"));
+  const shared = loadCopyTradeSharedFromEnv();
+  const targetCopyProfiles = new Map<string, TargetCopyParams>();
+
+  if (shared) {
+    const copyRatio = parsePositiveFloatEnv("COPY_RATIO");
+    const maxPriceDifference = parsePositiveFloatEnv("MAX_PRICE_DIFFERENCE");
+    const minPositionUsdc = parsePositiveFloatEnv("MIN_POSITION_USDC");
+    const maxPositionUsdc = parsePositiveFloatEnv("MAX_POSITION_USDC");
+    if (minPositionUsdc > maxPositionUsdc) {
+      throw new Error("MIN_POSITION_USDC must be <= MAX_POSITION_USDC");
+    }
+
+    if (targetTraderAddresses.length === 1) {
+      const addr = targetTraderAddresses[0]!;
+      const envLog = process.env["COPY_TRADE_LOG_PATH"]?.trim();
+      const copyTradeLogPath = envLog
+        ? isAbsolute(envLog)
+          ? envLog
+          : resolve(cwd, envLog)
+        : resolve(cwd, "copy-trades.log");
+      targetCopyProfiles.set(addr, {
+        address: addr,
+        copyRatio,
+        maxPriceDifference,
+        minPositionUsdc,
+        maxPositionUsdc,
+        copyTradeLogPath,
+      });
+    } else {
+      const logsDir = resolve(cwd, "logs");
+      await mkdir(logsDir, { recursive: true });
+      for (const addr of targetTraderAddresses) {
+        const base = await resolveLogBasename(addr, undefined);
+        targetCopyProfiles.set(addr, {
+          address: addr,
+          copyRatio,
+          maxPriceDifference,
+          minPositionUsdc,
+          maxPositionUsdc,
+          copyTradeLogPath: resolve(logsDir, base),
+        });
+      }
+    }
+  }
 
   return {
-    polygonWssUrl,
+    ...rpc,
     targetTraderAddresses,
-    exchangeAddresses,
-    maxConcurrentTxLookups,
-    copyTrade,
+    targetCopyProfiles,
+    copyTradeShared: shared,
   };
 }
