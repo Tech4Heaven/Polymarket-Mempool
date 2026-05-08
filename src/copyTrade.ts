@@ -305,7 +305,14 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       asset_type: AssetType.CONDITIONAL,
       token_id: digest.tokenId,
     });
-    const fullBalance = parseFloat(String(bal.balance));
+    /** CLOB returns conditional balance in raw 6-decimal units; `createAndPostOrder` size is decimal shares (same scale as buys). */
+    let fullBalance: number;
+    try {
+      fullBalance = parseFloat(formatUnits(BigInt(String(bal.balance)), 6));
+    } catch {
+      await logCopySkip(`invalid balance response · token=${digest.tokenId}`, digest, txHash);
+      return;
+    }
     if (!Number.isFinite(fullBalance) || fullBalance <= 0) {
       await logCopySkip(`no balance to sell · token=${digest.tokenId}`, digest, txHash);
       return;
