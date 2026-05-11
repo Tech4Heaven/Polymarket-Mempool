@@ -294,6 +294,25 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       return;
     }
     limitPrice = roundToTick(Math.max(currentPrice, ask), tickSize, "up");
+
+    if (cfg.buyPriceMin !== undefined && limitPrice < cfg.buyPriceMin) {
+      await logCopySkip(
+        `buy limitPrice=${limitPrice.toFixed(4)} below buy_price_min=${cfg.buyPriceMin} · ${formatOriginTradeSizing(digest)}`,
+        digest,
+        txHash,
+        cfg
+      );
+      return;
+    }
+    if (cfg.buyPriceMax !== undefined && limitPrice > cfg.buyPriceMax) {
+      await logCopySkip(
+        `buy limitPrice=${limitPrice.toFixed(4)} above buy_price_max=${cfg.buyPriceMax} · ${formatOriginTradeSizing(digest)}`,
+        digest,
+        txHash,
+        cfg
+      );
+      return;
+    }
   } else {
     const bid = bestBid(book);
     if (bid === null) {

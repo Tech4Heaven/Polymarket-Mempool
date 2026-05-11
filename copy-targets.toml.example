@@ -6,6 +6,9 @@
 # Defaults for every [[targets]] row (each field can be overridden per target)
 copy_ratio = 1
 max_price_difference = 0.1
+# Buy only: optional absolute outcome price bounds in [0, 1] (omit either side for no limit)
+# buy_price_min = 0.05
+# buy_price_max = 0.85
 min_position_usdc = 1
 max_position_usdc = 100
 

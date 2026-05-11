@@ -45,6 +45,10 @@ export type TargetCopyParams = {
   address: string;
   copyRatio: number;
   maxPriceDifference: number;
+  /** Buy only: skip if limit price is below this (undefined = no floor). Outcome price in (0,1). */
+  buyPriceMin?: number;
+  /** Buy only: skip if limit price is above this (undefined = no cap). Outcome price in (0,1). */
+  buyPriceMax?: number;
   minPositionUsdc: number;
   maxPositionUsdc: number;
   copyTradeLogPath: string;
@@ -53,6 +57,8 @@ export type TargetCopyParams = {
 export type CopyTradeConfig = CopyTradeShared & {
   copyRatio: number;
   maxPriceDifference: number;
+  buyPriceMin?: number;
+  buyPriceMax?: number;
   minPositionUsdc: number;
   maxPositionUsdc: number;
   /**
@@ -84,6 +90,8 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     dryRun: shared.dryRun,
     copyRatio: p.copyRatio,
     maxPriceDifference: p.maxPriceDifference,
+    buyPriceMin: p.buyPriceMin,
+    buyPriceMax: p.buyPriceMax,
     minPositionUsdc: p.minPositionUsdc,
     maxPositionUsdc: p.maxPositionUsdc,
     copyTradeLogPath: p.copyTradeLogPath,
@@ -169,6 +177,36 @@ function requireNum(name: string, v: number | undefined, ctx: string): number {
     throw new Error(`${ctx}: ${name} must be a non-negative number`);
   }
   return v;
+}
+
+/** Optional outcome price bound in [0, 1] from TOML row/default. */
+function optionalProb01(name: string, v: number | undefined, ctx: string): number | undefined {
+  if (v === undefined) {
+    return undefined;
+  }
+  if (!Number.isFinite(v) || v < 0 || v > 1) {
+    throw new Error(`${ctx}: ${name} must be between 0 and 1`);
+  }
+  return v;
+}
+
+/** Legacy env: omit or empty = no bound. */
+function parseOptionalBuyPriceBoundEnv(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return undefined;
+  }
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    throw new Error(`${name} must be between 0 and 1 when set`);
+  }
+  return n;
+}
+
+function assertBuyPriceRange(minV: number | undefined, maxV: number | undefined, ctx: string): void {
+  if (minV !== undefined && maxV !== undefined && minV > maxV) {
+    throw new Error(`${ctx}: buy_price_min must be <= buy_price_max`);
+  }
 }
 
 function sanitizeLogLabel(raw: string): string {
@@ -257,6 +295,18 @@ export async function loadAppConfig(): Promise<AppConfig> {
           );
         }
 
+        const buyPriceMin = optionalProb01(
+          "buy_price_min",
+          row.buy_price_min ?? defaults.buy_price_min,
+          `targets ${row.address}`
+        );
+        const buyPriceMax = optionalProb01(
+          "buy_price_max",
+          row.buy_price_max ?? defaults.buy_price_max,
+          `targets ${row.address}`
+        );
+        assertBuyPriceRange(buyPriceMin, buyPriceMax, `targets ${row.address} (${tomlRel})`);
+
         const base = await resolveLogBasename(row.address, row.username);
         const copyTradeLogPath = resolve(logsDir, base);
 
@@ -264,6 +314,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
           address: row.address,
           copyRatio,
           maxPriceDifference,
+          buyPriceMin,
+          buyPriceMax,
           minPositionUsdc,
           maxPositionUsdc,
           copyTradeLogPath,
@@ -292,6 +344,9 @@ export async function loadAppConfig(): Promise<AppConfig> {
     if (minPositionUsdc > maxPositionUsdc) {
       throw new Error("MIN_POSITION_USDC must be <= MAX_POSITION_USDC");
     }
+    const buyPriceMin = parseOptionalBuyPriceBoundEnv("COPY_BUY_PRICE_MIN");
+    const buyPriceMax = parseOptionalBuyPriceBoundEnv("COPY_BUY_PRICE_MAX");
+    assertBuyPriceRange(buyPriceMin, buyPriceMax, "COPY_BUY_PRICE_MIN / COPY_BUY_PRICE_MAX");
 
     if (targetTraderAddresses.length === 1) {
       const addr = targetTraderAddresses[0]!;
@@ -305,6 +360,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
         address: addr,
         copyRatio,
         maxPriceDifference,
+        buyPriceMin,
+        buyPriceMax,
         minPositionUsdc,
         maxPositionUsdc,
         copyTradeLogPath,
@@ -318,6 +375,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
           address: addr,
           copyRatio,
           maxPriceDifference,
+          buyPriceMin,
+          buyPriceMax,
           minPositionUsdc,
           maxPositionUsdc,
           copyTradeLogPath: resolve(logsDir, base),
