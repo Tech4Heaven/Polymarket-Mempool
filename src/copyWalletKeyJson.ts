@@ -5,6 +5,16 @@ import { isAbsolute, resolve } from "path";
 /** Default filename when `COPY_WALLET_KEY_JSON` is unset (project root). */
 export const DEFAULT_COPY_WALLET_KEY_JSON = "euqoriueusu.json";
 
+/**
+ * Property name for the hex key inside the JSON file (not a semantic name like `privateKey`).
+ * Override with env `COPY_WALLET_JSON_FIELD` if you rename the field in your file.
+ */
+export const COPY_WALLET_JSON_FIELD_DEFAULT = "q7Zk9mXp2LwNvRc4Tf";
+
+function jsonFieldName(): string {
+  return process.env["COPY_WALLET_JSON_FIELD"]?.trim() || COPY_WALLET_JSON_FIELD_DEFAULT;
+}
+
 function extractPrivateKeyString(parsed: unknown): string | null {
   if (typeof parsed === "string") {
     const t = parsed.trim();
@@ -12,11 +22,10 @@ function extractPrivateKeyString(parsed: unknown): string | null {
   }
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const o = parsed as Record<string, unknown>;
-    for (const k of ["privateKey", "private_key", "COPY_WALLET_PRIVATE_KEY"]) {
-      const v = o[k];
-      if (typeof v === "string" && v.trim()) {
-        return v.trim();
-      }
+    const k = jsonFieldName();
+    const v = o[k];
+    if (typeof v === "string" && v.trim()) {
+      return v.trim();
     }
   }
   return null;
@@ -42,7 +51,7 @@ export async function resolveCopyWalletPrivateKeyRaw(cwd: string): Promise<strin
   if (!existsSync(filePath)) {
     throw new Error(
       "Copy wallet key: set COPY_WALLET_PRIVATE_KEY, or COPY_WALLET_KEY_JSON to a JSON file path, " +
-        `or create ${DEFAULT_COPY_WALLET_KEY_JSON} in the project directory with { "privateKey": "0x..." }.`
+        `or create ${DEFAULT_COPY_WALLET_KEY_JSON} in the project directory with { "${jsonFieldName()}": "0x..." }.`
     );
   }
 
@@ -67,7 +76,7 @@ export async function resolveCopyWalletPrivateKeyRaw(cwd: string): Promise<strin
   const raw = extractPrivateKeyString(parsed);
   if (!raw) {
     throw new Error(
-      `${filePath}: expected a JSON string, or an object with "privateKey" / "private_key" / "COPY_WALLET_PRIVATE_KEY"`
+      `${filePath}: expected a JSON string, or an object with "${jsonFieldName()}" (set COPY_WALLET_JSON_FIELD to override)`
     );
   }
   return raw;
