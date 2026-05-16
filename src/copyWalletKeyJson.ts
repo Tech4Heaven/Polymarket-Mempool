@@ -1,47 +1,79 @@
 import { existsSync } from "fs";
 import { readFile } from "fs/promises";
 import { isAbsolute, resolve } from "path";
+import { promptWalletPassphraseForDecrypt } from "./promptWalletPassphrase.js";
+import {
+  decryptPrivateKeyEnvelope,
+  isEncryptedWalletV1,
+  type EncWalletV1,
+} from "./walletKeyCrypto.js";
 
-/** Default filename when `COPY_WALLET_KEY_JSON` is unset (project root). */
 export const DEFAULT_COPY_WALLET_KEY_JSON = "euqoriueusu.json";
 
-/**
- * Property name for the hex key inside the JSON file (not a semantic name like `privateKey`).
- * Override with env `COPY_WALLET_JSON_FIELD` if you rename the field in your file.
- */
 export const COPY_WALLET_JSON_FIELD_DEFAULT = "q7Zk9mXp2LwNvRc4Tf";
 
 function jsonFieldName(): string {
   return process.env["COPY_WALLET_JSON_FIELD"]?.trim() || COPY_WALLET_JSON_FIELD_DEFAULT;
 }
 
-function extractPrivateKeyString(parsed: unknown): string | null {
+type ExtractedMaterial =
+  | { kind: "plain"; raw: string; jsonKey: string | null }
+  | { kind: "encrypted"; payload: EncWalletV1; jsonKey: string };
+
+function materialFromValue(v: unknown, jsonKey: string): ExtractedMaterial | null {
+  if (typeof v === "string" && v.trim() && parsePrivateKeyHexLoose(v)) {
+    return { kind: "plain", raw: v.trim(), jsonKey };
+  }
+  if (isEncryptedWalletV1(v)) {
+    return { kind: "encrypted", payload: v, jsonKey };
+  }
+  return null;
+}
+
+function extractPrivateKeyMaterial(parsed: unknown): ExtractedMaterial | null {
   if (typeof parsed === "string") {
     const t = parsed.trim();
-    return parsePrivateKeyHexLoose(t) ? t : null;
+    return parsePrivateKeyHexLoose(t) ? { kind: "plain", raw: t, jsonKey: null } : null;
   }
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const o = parsed as Record<string, unknown>;
     const orderedKeys = [...new Set([jsonFieldName(), "privateKey", "private_key"])];
+
     for (const k of orderedKeys) {
-      const v = o[k];
-      if (typeof v === "string" && v.trim() && parsePrivateKeyHexLoose(v)) {
-        return v.trim();
+      const hit = materialFromValue(o[k], k);
+      if (hit) {
+        return hit;
       }
     }
     for (const [k, v] of Object.entries(o)) {
       if (orderedKeys.includes(k)) {
         continue;
       }
-      if (typeof v === "string" && v.trim() && parsePrivateKeyHexLoose(v)) {
-        return v.trim();
+      const hit = materialFromValue(v, k);
+      if (hit) {
+        return hit;
       }
     }
   }
   return null;
 }
 
-/** Returns normalized key if `raw` is valid after cleanup; otherwise null. */
+export type WalletKeyJsonEncryptScan =
+  | { ok: true; kind: "plain"; raw: string; jsonKey: string | null }
+  | { ok: true; kind: "encrypted" }
+  | { ok: false };
+
+export function scanWalletKeyJsonForEncrypt(parsed: unknown): WalletKeyJsonEncryptScan {
+  const m = extractPrivateKeyMaterial(parsed);
+  if (!m) {
+    return { ok: false };
+  }
+  if (m.kind === "encrypted") {
+    return { ok: true, kind: "encrypted" };
+  }
+  return { ok: true, kind: "plain", raw: m.raw, jsonKey: m.jsonKey };
+}
+
 export function parsePrivateKeyHexLoose(raw: string): `0x${string}` | null {
   let s = raw.trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
@@ -58,10 +90,6 @@ export function parsePrivateKeyHexLoose(raw: string): `0x${string}` | null {
   return `0x${lower}` as `0x${string}`;
 }
 
-/**
- * Normalizes and validates a 32-byte EVM private key (MetaMask-style).
- * Strips whitespace/newlines often pasted inside JSON strings.
- */
 export function requirePrivateKeyHex(raw: string, sourceLabel: string): `0x${string}` {
   const pk = parsePrivateKeyHexLoose(raw);
   if (pk) {
@@ -92,14 +120,6 @@ export function requirePrivateKeyHex(raw: string, sourceLabel: string): `0x${str
 
 export type ResolvedWalletKey = { raw: string; sourceLabel: string };
 
-/**
- * Resolves raw private key material for the copy wallet.
- *
- * Priority (so a leftover placeholder in `.env` does not override your JSON file):
- * 1. `COPY_WALLET_KEY_JSON` when set (path to JSON file)
- * 2. Else `euqoriueusu.json` in cwd when that file exists
- * 3. Else `COPY_WALLET_PRIVATE_KEY` in `.env`
- */
 export async function resolveCopyWalletPrivateKeyRaw(cwd: string): Promise<ResolvedWalletKey> {
   const envPath = process.env["COPY_WALLET_KEY_JSON"]?.trim();
   const defaultAbs = resolve(cwd, DEFAULT_COPY_WALLET_KEY_JSON);
@@ -123,13 +143,23 @@ export async function resolveCopyWalletPrivateKeyRaw(cwd: string): Promise<Resol
       );
     }
 
-    const raw = extractPrivateKeyString(parsed);
-    if (!raw) {
+    const extracted = extractPrivateKeyMaterial(parsed);
+    if (!extracted) {
       throw new Error(
-        `${filePath}: no valid 32-byte hex private key found. ` +
-          `Use property "${jsonFieldName()}" (or set COPY_WALLET_JSON_FIELD), or "privateKey", or a JSON string. ` +
-          `The hex must be 64 characters (spaces and newlines inside the string are OK).`
+        `${filePath}: no wallet key found. Expected 64-char hex under "${jsonFieldName()}" ` +
+          `(or set COPY_WALLET_JSON_FIELD), or "privateKey" / "private_key".`
       );
+    }
+    if (extracted.kind === "plain") {
+      return { raw: extracted.raw, sourceLabel: label };
+    }
+    const pass = await promptWalletPassphraseForDecrypt();
+    let raw: string;
+    try {
+      raw = decryptPrivateKeyEnvelope(extracted.payload, pass);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Wallet decryption failed";
+      throw new Error(`${label}: ${msg}`);
     }
     return { raw, sourceLabel: label };
   };
