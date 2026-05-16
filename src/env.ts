@@ -109,7 +109,7 @@ function parsePositiveFloatEnv(name: string): number {
 }
 
 /** MetaMask exports 64 hex chars without `0x`; viem expects `0x` + 32 bytes. */
-function normalizeCopyWalletPrivateKey(raw: string): `0x${string}` {
+function normalizeCopyWalletPrivateKey(raw: string, sourceLabel: string): `0x${string}` {
   let s = raw.trim();
   if (
     (s.startsWith('"') && s.endsWith('"')) ||
@@ -121,7 +121,7 @@ function normalizeCopyWalletPrivateKey(raw: string): `0x${string}` {
   const pk = `0x${lower}`;
   if (!/^0x[0-9a-f]{64}$/.test(pk)) {
     throw new Error(
-      "COPY_WALLET_PRIVATE_KEY must be 64 hex characters (32 bytes), with or without 0x — same as MetaMask private key export"
+      `${sourceLabel}: private key must be 64 hex characters (32 bytes), with or without 0x — same as MetaMask export`
     );
   }
   return pk as `0x${string}`;
@@ -137,8 +137,8 @@ async function loadCopyTradeSharedFromEnv(): Promise<CopyTradeShared | null> {
     return null;
   }
 
-  const rawPk = await resolveCopyWalletPrivateKeyRaw(process.cwd());
-  const pk = normalizeCopyWalletPrivateKey(rawPk);
+  const { raw: rawPk, sourceLabel } = await resolveCopyWalletPrivateKeyRaw(process.cwd());
+  const pk = normalizeCopyWalletPrivateKey(rawPk, sourceLabel);
   const signatureType = parseInt(requireEnv("CLOB_SIGNATURE_TYPE"), 10);
   if (!Number.isFinite(signatureType) || signatureType < 0 || signatureType > 3) {
     throw new Error("CLOB_SIGNATURE_TYPE must be 0–3 (EOA, POLY_PROXY, GNOSIS_SAFE, POLY_1271)");
