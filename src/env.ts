@@ -4,6 +4,7 @@ import { mkdir } from "fs/promises";
 import { isAbsolute, resolve } from "path";
 import { getAddress, isAddress } from "ethers";
 import { EXCHANGE_V2_ADDRESSES } from "./contracts.js";
+import { resolveCopyWalletPrivateKeyRaw } from "./copyWalletKeyJson.js";
 import { parseCopyTargetsTomlFile } from "./copyTargetsToml.js";
 import { fetchPolymarketProfileLabel } from "./polymarketProfile.js";
 
@@ -131,12 +132,13 @@ function copyTradingFlagFromEnv(): boolean {
   return flag === "true" || flag === "1";
 }
 
-function loadCopyTradeSharedFromEnv(): CopyTradeShared | null {
+async function loadCopyTradeSharedFromEnv(): Promise<CopyTradeShared | null> {
   if (!copyTradingFlagFromEnv()) {
     return null;
   }
 
-  const pk = normalizeCopyWalletPrivateKey(requireEnv("COPY_WALLET_PRIVATE_KEY"));
+  const rawPk = await resolveCopyWalletPrivateKeyRaw(process.cwd());
+  const pk = normalizeCopyWalletPrivateKey(rawPk);
   const signatureType = parseInt(requireEnv("CLOB_SIGNATURE_TYPE"), 10);
   if (!Number.isFinite(signatureType) || signatureType < 0 || signatureType > 3) {
     throw new Error("CLOB_SIGNATURE_TYPE must be 0–3 (EOA, POLY_PROXY, GNOSIS_SAFE, POLY_1271)");
@@ -263,7 +265,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
   if (existsSync(tomlAbs)) {
     const parsed = await parseCopyTargetsTomlFile(tomlAbs);
     const defaults = parsed.defaults ?? {};
-    const shared = loadCopyTradeSharedFromEnv();
+    const shared = await loadCopyTradeSharedFromEnv();
 
     const targetTraderAddresses = parsed.targets.map((t) => t.address);
     const targetCopyProfiles = new Map<string, TargetCopyParams>();
@@ -333,7 +335,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
 
   /** Legacy: env-only target list */
   const targetTraderAddresses = parseAddressList(requireEnv("TARGET_TRADER_ADDRESSES"));
-  const shared = loadCopyTradeSharedFromEnv();
+  const shared = await loadCopyTradeSharedFromEnv();
   const targetCopyProfiles = new Map<string, TargetCopyParams>();
 
   if (shared) {
