@@ -4,7 +4,7 @@ import { mkdir } from "fs/promises";
 import { isAbsolute, resolve } from "path";
 import { getAddress, isAddress } from "ethers";
 import { EXCHANGE_V2_ADDRESSES } from "./contracts.js";
-import { resolveCopyWalletPrivateKeyRaw } from "./copyWalletKeyJson.js";
+import { resolveCopyWalletPrivateKeyRaw, requirePrivateKeyHex } from "./copyWalletKeyJson.js";
 import { parseCopyTargetsTomlFile } from "./copyTargetsToml.js";
 import { fetchPolymarketProfileLabel } from "./polymarketProfile.js";
 
@@ -108,25 +108,6 @@ function parsePositiveFloatEnv(name: string): number {
   return n;
 }
 
-/** MetaMask exports 64 hex chars without `0x`; viem expects `0x` + 32 bytes. */
-function normalizeCopyWalletPrivateKey(raw: string, sourceLabel: string): `0x${string}` {
-  let s = raw.trim();
-  if (
-    (s.startsWith('"') && s.endsWith('"')) ||
-    (s.startsWith("'") && s.endsWith("'"))
-  ) {
-    s = s.slice(1, -1).trim();
-  }
-  const lower = s.startsWith("0x") || s.startsWith("0X") ? s.slice(2).toLowerCase() : s.toLowerCase();
-  const pk = `0x${lower}`;
-  if (!/^0x[0-9a-f]{64}$/.test(pk)) {
-    throw new Error(
-      `${sourceLabel}: private key must be 64 hex characters (32 bytes), with or without 0x — same as MetaMask export`
-    );
-  }
-  return pk as `0x${string}`;
-}
-
 function copyTradingFlagFromEnv(): boolean {
   const flag = process.env["COPY_TRADING_ENABLED"]?.trim().toLowerCase();
   return flag === "true" || flag === "1";
@@ -138,7 +119,7 @@ async function loadCopyTradeSharedFromEnv(): Promise<CopyTradeShared | null> {
   }
 
   const { raw: rawPk, sourceLabel } = await resolveCopyWalletPrivateKeyRaw(process.cwd());
-  const pk = normalizeCopyWalletPrivateKey(rawPk, sourceLabel);
+  const pk = requirePrivateKeyHex(rawPk, sourceLabel);
   const signatureType = parseInt(requireEnv("CLOB_SIGNATURE_TYPE"), 10);
   if (!Number.isFinite(signatureType) || signatureType < 0 || signatureType > 3) {
     throw new Error("CLOB_SIGNATURE_TYPE must be 0–3 (EOA, POLY_PROXY, GNOSIS_SAFE, POLY_1271)");
