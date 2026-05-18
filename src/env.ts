@@ -230,12 +230,6 @@ function loadRpcOnly(): Pick<
   "polygonWssUrl" | "polygonMempoolHttpUrl" | "exchangeAddresses" | "maxConcurrentTxLookups"
 > {
   const polygonWssUrl = requireEnv("POLYGON_WSS_URL");
-  if (!/alchemy\.com/i.test(polygonWssUrl)) {
-    console.warn(
-      "POLYGON_WSS_URL is not an Alchemy endpoint — `alchemy_pendingTransactions` filtering may not be supported, " +
-        "and the watcher will fall back to per-hash getTransaction (high RPC usage)."
-    );
-  }
   const polygonMempoolHttpUrl =
     process.env["POLYGON_MEMPOOL_HTTP_URL"]?.trim() ||
     process.env["POLYGON_HTTP_URL"]?.trim() ||

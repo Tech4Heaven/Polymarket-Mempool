@@ -128,8 +128,8 @@ async function main() {
 
   startMempoolWatcher(
     config,
-    ({ tx, provider, matchedTargets }) => {
-      void logMinedTransfers(provider, tx.hash, matchedTargets, config);
+    ({ txHash, provider, matchedTargets }) => {
+      void logMinedTransfers(provider, txHash, matchedTargets, config);
     },
     (err, context) => {
       console.error(`${context}:`, err);
