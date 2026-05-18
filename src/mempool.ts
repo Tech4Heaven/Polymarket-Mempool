@@ -45,7 +45,13 @@ class AlchemyPendingTxSubscriber extends SocketSubscriber {
     this.#onTx = onTx;
   }
 
-  async _emit(_provider: WebSocketProvider, message: unknown): Promise<void> {
+  /**
+   * The parent `_handleMessage` short-circuits when its private `#filterId` is null —
+   * and that field is *only* set inside the parent's `start()`. We deliberately don't call
+   * `start()` (so subscribe errors are awaitable in `subscribeFiltered`), which left every push
+   * silently dropped. Overriding here bypasses the stale guard and routes every message to onTx.
+   */
+  _handleMessage(message: unknown): void {
     this.#onTx(message);
   }
 }
@@ -150,8 +156,27 @@ export function startMempoolWatcher(
   let subscriber: AlchemyPendingTxSubscriber | null = null;
   let subscriptionId: string | null = null;
 
+  // Diagnostic counters so a silent "no matches" state is distinguishable from
+  // "no pushes at all" (subscription wired wrong) vs "pushes but no target matches" (just no activity).
+  let pushCount = 0;
+  let decodedCount = 0;
+  let nonMatchCount = 0;
+  setInterval(() => {
+    if (pushCount > 0 || decodedCount > 0) {
+      console.log(
+        `[mempool] pushes=${pushCount} decoded=${decodedCount} nonTargetMatches=${nonMatchCount}`
+      );
+    } else {
+      console.log("[mempool] no pushes received in the last minute — check Alchemy filter / activity");
+    }
+    pushCount = 0;
+    decodedCount = 0;
+    nonMatchCount = 0;
+  }, 60_000).unref();
+
   const processFullTx = (raw: Record<string, unknown>) => {
     try {
+      pushCount += 1;
       const to = (raw["to"] as string | null | undefined)?.toLowerCase();
       // Defensive: Alchemy already filtered by toAddress, but verify in case of misconfig.
       if (!to || !exSet.has(to)) {
@@ -162,12 +187,14 @@ export function startMempoolWatcher(
       if (!decoded) {
         return;
       }
+      decodedCount += 1;
       const participants = collectOrderParticipantAddresses(decoded);
       const matchedTargets = config.targetTraderAddresses.filter((t) => {
         const tl = t.toLowerCase();
         return participants.some((p) => p.toLowerCase() === tl);
       });
       if (matchedTargets.length === 0) {
+        nonMatchCount += 1;
         return;
       }
       const tx = wrapAsTransactionResponse(raw, httpProvider);
