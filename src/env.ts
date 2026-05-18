@@ -113,11 +113,11 @@ function copyTradingFlagFromEnv(): boolean {
   return flag === "true" || flag === "1";
 }
 
-async function loadCopyTradeSharedFromEnv(): Promise<CopyTradeShared | null> {
-  if (!copyTradingFlagFromEnv()) {
-    return null;
-  }
-
+/**
+ * Loads copy-wallet private key and shared CLOB settings from `.env` (same fields as copy trading).
+ * Does **not** require `COPY_TRADING_ENABLED` — intended for standalone scripts (e.g. CLOB smoke tests).
+ */
+export async function loadCopyTradeSharedCredentials(): Promise<CopyTradeShared> {
   const { raw: rawPk, sourceLabel } = await resolveCopyWalletPrivateKeyRaw(process.cwd());
   const pk = requirePrivateKeyHex(rawPk, sourceLabel);
   const signatureType = parseInt(requireEnv("CLOB_SIGNATURE_TYPE"), 10);
@@ -153,6 +153,13 @@ async function loadCopyTradeSharedFromEnv(): Promise<CopyTradeShared | null> {
     clobHost,
     dryRun,
   };
+}
+
+async function loadCopyTradeSharedFromEnv(): Promise<CopyTradeShared | null> {
+  if (!copyTradingFlagFromEnv()) {
+    return null;
+  }
+  return loadCopyTradeSharedCredentials();
 }
 
 function requireNum(name: string, v: number | undefined, ctx: string): number {
