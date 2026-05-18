@@ -69,8 +69,10 @@ export type CopyTradeConfig = CopyTradeShared & {
 };
 
 export type AppConfig = {
-  /** WebSocket RPC URL (must support eth_subscribe pending). */
+  /** WebSocket RPC URL — must be Alchemy (uses `alchemy_pendingTransactions` filtered subscription). */
   polygonWssUrl: string;
+  /** HTTP RPC URL used for receipt fetching (typically a cheaper provider like Chainstack). */
+  polygonMempoolHttpUrl: string;
   /** Trader wallets to watch in the mempool matcher. */
   targetTraderAddresses: string[];
   /** Checksum address → sizing + log file; subset of targets that participate in copy trading. */
@@ -225,9 +227,20 @@ async function resolveLogBasename(
 
 function loadRpcOnly(): Pick<
   AppConfig,
-  "polygonWssUrl" | "exchangeAddresses" | "maxConcurrentTxLookups"
+  "polygonWssUrl" | "polygonMempoolHttpUrl" | "exchangeAddresses" | "maxConcurrentTxLookups"
 > {
   const polygonWssUrl = requireEnv("POLYGON_WSS_URL");
+  if (!/alchemy\.com/i.test(polygonWssUrl)) {
+    console.warn(
+      "POLYGON_WSS_URL is not an Alchemy endpoint — `alchemy_pendingTransactions` filtering may not be supported, " +
+        "and the watcher will fall back to per-hash getTransaction (high RPC usage)."
+    );
+  }
+  const polygonMempoolHttpUrl =
+    process.env["POLYGON_MEMPOOL_HTTP_URL"]?.trim() ||
+    process.env["POLYGON_HTTP_URL"]?.trim() ||
+    "https://polygon-bor.publicnode.com";
+
   const rawExchanges = process.env["EXCHANGE_ADDRESSES"]?.trim();
   const exchangeAddresses = rawExchanges
     ? parseAddressList(rawExchanges)
@@ -236,7 +249,7 @@ function loadRpcOnly(): Pick<
   const maxRaw = process.env["MAX_CONCURRENT_TX_LOOKUPS"]?.trim();
   const maxConcurrentTxLookups = maxRaw ? Math.max(1, parseInt(maxRaw, 10) || 5) : 5;
 
-  return { polygonWssUrl, exchangeAddresses, maxConcurrentTxLookups };
+  return { polygonWssUrl, polygonMempoolHttpUrl, exchangeAddresses, maxConcurrentTxLookups };
 }
 
 /**
