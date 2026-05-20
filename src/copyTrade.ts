@@ -340,7 +340,12 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       return;
     }
     if (!Number.isFinite(fullBalance) || fullBalance <= 0) {
-      await logCopySkip(`no balance to sell · token=${digest.tokenId}`, digest, txHash, cfg);
+      await logCopySkip(
+        `no balance to sell · token=${digest.tokenId} · limit=${limitPrice} implied=${implied.toFixed(4)} clob=${currentPrice.toFixed(4)}`,
+        digest,
+        txHash,
+        cfg
+      );
       return;
     }
     orderShares = fullBalance;
