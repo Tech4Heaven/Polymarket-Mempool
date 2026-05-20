@@ -1,6 +1,6 @@
 # Copy this to `copy-targets.toml` (or set COPY_TARGETS_TOML to another path).
-# Shared CLOB settings (wallet key, signature type, funder, dry run, host URLs) live in `.env`.
-# This TOML only defines watched target wallets + per-target sizing.
+# Shared CLOB settings (wallet key, signature type, funder, host URLs) live in `.env`.
+# This TOML defines watched target wallets + per-target sizing + per-target dry-run flag.
 
 [defaults]
 # Defaults for every [[targets]] row (each field can be overridden per target)
@@ -11,6 +11,8 @@ max_price_difference = 0.1
 # buy_price_max = 0.85
 min_position_usdc = 1
 max_position_usdc = 100
+# When true, copy decisions are logged but no order is posted to CLOB. Default: false (live trading)
+# dry_run = false
 
 [[targets]]
 address = "0xe71a099e3a4499458de60a1daba70ab649cd6944"
@@ -20,5 +22,6 @@ address = "0xe71a099e3a4499458de60a1daba70ab649cd6944"
 address = "0x0000000000000000000000000000000000000001"
 copy_ratio = 0.5
 max_price_difference = 0.05
+dry_run = true                    # this target is in dry-run mode while you observe it
 
 # Mempool watcher and shared CLOB credentials still use `.env`.

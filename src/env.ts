@@ -38,7 +38,6 @@ export type CopyTradeShared = {
   funderAddress?: string;
   polygonHttpUrl: string;
   clobHost: string;
-  dryRun: boolean;
 };
 
 /** Per-target sizing and dedicated copy-trade log path (absolute). */
@@ -52,6 +51,8 @@ export type TargetCopyParams = {
   buyPriceMax?: number;
   minPositionUsdc: number;
   maxPositionUsdc: number;
+  /** When true, copy decisions are logged but no order is posted to CLOB. Per-target. */
+  dryRun: boolean;
   copyTradeLogPath: string;
 };
 
@@ -62,6 +63,8 @@ export type CopyTradeConfig = CopyTradeShared & {
   buyPriceMax?: number;
   minPositionUsdc: number;
   maxPositionUsdc: number;
+  /** Per-target dry-run flag (merged from TargetCopyParams). */
+  dryRun: boolean;
   /**
    * When set, copy-trade lines go here; otherwise {@link appendCopyTradeSuccessLine} uses env / default file.
    */
@@ -90,13 +93,13 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     funderAddress: shared.funderAddress,
     polygonHttpUrl: shared.polygonHttpUrl,
     clobHost: shared.clobHost,
-    dryRun: shared.dryRun,
     copyRatio: p.copyRatio,
     maxPriceDifference: p.maxPriceDifference,
     buyPriceMin: p.buyPriceMin,
     buyPriceMax: p.buyPriceMax,
     minPositionUsdc: p.minPositionUsdc,
     maxPositionUsdc: p.maxPositionUsdc,
+    dryRun: p.dryRun,
     copyTradeLogPath: p.copyTradeLogPath,
   };
 }
@@ -144,16 +147,12 @@ export async function loadCopyTradeSharedCredentials(): Promise<CopyTradeShared>
     process.env["POLYGON_HTTP_URL"]?.trim() || "https://polygon-bor.publicnode.com";
   const clobHost = process.env["CLOB_HOST"]?.trim() || "https://clob.polymarket.com";
 
-  const dryRaw = process.env["COPY_TRADING_DRY_RUN"]?.trim().toLowerCase();
-  const dryRun = dryRaw === "true" || dryRaw === "1";
-
   return {
     privateKey: pk,
     signatureType,
     funderAddress,
     polygonHttpUrl,
     clobHost,
-    dryRun,
   };
 }
 
@@ -307,6 +306,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
         const base = await resolveLogBasename(row.address, row.username);
         const copyTradeLogPath = resolve(logsDir, base);
 
+        const dryRun = row.dry_run ?? defaults.dry_run ?? false;
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -315,6 +316,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           buyPriceMax,
           minPositionUsdc,
           maxPositionUsdc,
+          dryRun,
           copyTradeLogPath,
         });
       }
@@ -353,6 +355,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           ? envLog
           : resolve(cwd, envLog)
         : resolve(cwd, "copy-trades.log");
+      // Legacy env-only path: dry_run lives in TOML now; default to live trading here.
       targetCopyProfiles.set(addr, {
         address: addr,
         copyRatio,
@@ -361,6 +364,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
         buyPriceMax,
         minPositionUsdc,
         maxPositionUsdc,
+        dryRun: false,
         copyTradeLogPath,
       });
     } else {
@@ -376,6 +380,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           buyPriceMax,
           minPositionUsdc,
           maxPositionUsdc,
+          dryRun: false,
           copyTradeLogPath: resolve(logsDir, base),
         });
       }

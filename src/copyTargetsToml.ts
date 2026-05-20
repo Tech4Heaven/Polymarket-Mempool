@@ -13,6 +13,8 @@ export type TomlDefaultsSection = {
   buy_price_max?: number;
   min_position_usdc?: number;
   max_position_usdc?: number;
+  /** When true, copy decisions are computed and logged but no order is posted to CLOB. */
+  dry_run?: boolean;
 };
 
 export type TomlTargetRow = {
@@ -24,6 +26,7 @@ export type TomlTargetRow = {
   buy_price_max?: number;
   min_position_usdc?: number;
   max_position_usdc?: number;
+  dry_run?: boolean;
 };
 
 export type ParsedCopyTargetsToml = {
@@ -54,6 +57,14 @@ function strOrUndef(k: string, o: Record<string, unknown>): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
+function boolOrUndef(k: string, o: Record<string, unknown>): boolean | undefined {
+  if (!(k in o)) {
+    return undefined;
+  }
+  const v = o[k];
+  return typeof v === "boolean" ? v : undefined;
+}
+
 export async function parseCopyTargetsTomlFile(filePath: string): Promise<ParsedCopyTargetsToml> {
   const abs = resolve(filePath);
   const raw = await readFile(abs, "utf8");
@@ -75,6 +86,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       buy_price_max: numOrUndef("buy_price_max", src),
       min_position_usdc: numOrUndef("min_position_usdc", src),
       max_position_usdc: numOrUndef("max_position_usdc", src),
+      dry_run: boolOrUndef("dry_run", src),
     };
   }
 
@@ -102,6 +114,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       buy_price_max: numOrUndef("buy_price_max", row),
       min_position_usdc: numOrUndef("min_position_usdc", row),
       max_position_usdc: numOrUndef("max_position_usdc", row),
+      dry_run: boolOrUndef("dry_run", row),
     });
   }
 

@@ -106,6 +106,26 @@ export function startMempoolWatcher(
     dupeCount = 0;
   }, 60_000).unref();
 
+  // Reset backoff only after the connection has been alive for STABILITY_MS.
+  // Resetting eagerly inside bindProvider caused a tight 1s retry loop when the WSS
+  // dropped immediately after handshake (provider rate-limited / blocked).
+  let stabilityTimer: ReturnType<typeof setTimeout> | null = null;
+  const STABILITY_MS = 30_000;
+  const clearStability = () => {
+    if (stabilityTimer) {
+      clearTimeout(stabilityTimer);
+      stabilityTimer = null;
+    }
+  };
+  const armStability = () => {
+    clearStability();
+    stabilityTimer = setTimeout(() => {
+      reconnectAttempt = 0;
+      stabilityTimer = null;
+    }, STABILITY_MS);
+    stabilityTimer.unref();
+  };
+
   const extractMatchedTarget = (log: Log): string | null => {
     // topic2 = maker, topic3 = taker. Whichever matches our targets, return the checksum address.
     for (const topicIdx of [2, 3]) {
@@ -161,9 +181,10 @@ export function startMempoolWatcher(
       onError(err, "subscribe filterTaker failed");
       void reconnect("subscribe failed");
     });
-    // Reset backoff after a successful (or attempted) bind — exact subscribe completion is async
-    // inside ethers, but if WS handshake succeeded we're in good shape.
-    reconnectAttempt = 0;
+    // Backoff only resets after the new connection has survived STABILITY_MS without
+    // erroring — proves the WSS is genuinely stable, not just initiating a handshake
+    // that the provider is about to drop.
+    armStability();
 
     p.on("error", (err) => {
       onError(err, "provider error");
@@ -187,6 +208,7 @@ export function startMempoolWatcher(
       return;
     }
     reconnecting = true;
+    clearStability();
     reconnectAttempt += 1;
     const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(5, reconnectAttempt - 1));
     onError(new Error(`reconnecting websocket (${reason}) in ${delayMs}ms`), "watcher reconnect");
@@ -212,6 +234,7 @@ export function startMempoolWatcher(
 
   const stop = () => {
     stopped = true;
+    clearStability();
     provider.removeAllListeners();
     void provider.destroy();
   };
