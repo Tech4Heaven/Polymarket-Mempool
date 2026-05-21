@@ -162,6 +162,33 @@ let authInFlight: Promise<ClobClient> | null = null;
 
 const MAX_AUTH_RETRIES = 5;
 
+/**
+ * tickSize and negRisk are immutable per market — cache them so we save 2 CLOB round-trips
+ * on every copy after the first one in a given market. Keyed by tokenId.
+ */
+const tickSizeByToken = new Map<string, TickSize>();
+const negRiskByToken = new Map<string, boolean>();
+
+async function getTickSizeCached(client: ClobClient, tokenId: string): Promise<TickSize> {
+  const cached = tickSizeByToken.get(tokenId);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const fresh = await client.getTickSize(tokenId);
+  tickSizeByToken.set(tokenId, fresh);
+  return fresh;
+}
+
+async function getNegRiskCached(client: ClobClient, tokenId: string): Promise<boolean> {
+  const cached = negRiskByToken.get(tokenId);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const fresh = await client.getNegRisk(tokenId);
+  negRiskByToken.set(tokenId, fresh);
+  return fresh;
+}
+
 function buildSigner(cfg: CopyTradeConfig) {
   const account = privateKeyToAccount(cfg.privateKey);
   return createWalletClient({
@@ -423,8 +450,8 @@ async function reconcileHedge(
   // Place new hedge.
   try {
     const [tickSize, negRisk] = await Promise.all([
-      client.getTickSize(ideal.tokenId),
-      client.getNegRisk(ideal.tokenId),
+      getTickSizeCached(client, ideal.tokenId),
+      getNegRiskCached(client, ideal.tokenId),
     ]);
     const resp = await client.createAndPostOrder(
       {
@@ -597,49 +624,9 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     return;
   }
 
-  const client = await ensureClobClient(cfg);
-
-  // Option-2 suppression: only suppress if our hedge actually filled. If hedge is unfilled,
-  // cancel it (to prevent double-hedge later) and continue copying the target's opposite-side buy.
-  if (cfg.hedgePrice !== undefined) {
-    const sup = await checkHedgeSuppression(cfg, client, digest, txHash);
-    if (sup.suppress) {
-      await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg);
-      return;
-    }
-  }
-
-  const [tickSize, negRisk, book, midRaw] = await Promise.all([
-    client.getTickSize(digest.tokenId),
-    client.getNegRisk(digest.tokenId),
-    client.getOrderBook(digest.tokenId),
-    client.getMidpoint(digest.tokenId),
-  ]);
-
-  let currentPrice = parseClobPrice(midRaw);
-  if (currentPrice === null) {
-    const sideStr = digest.side === "buy" ? Side.BUY : Side.SELL;
-    const pxRaw = await client.getPrice(digest.tokenId, sideStr);
-    currentPrice = parseClobPrice(pxRaw);
-  }
-  if (currentPrice === null) {
-    await logCopySkip(`could not parse CLOB price · token=${digest.tokenId}`, digest, txHash, cfg);
-    return;
-  }
-
-  if (digest.side === "buy") {
-    const drift = currentPrice - implied;
-    if (drift > cfg.maxPriceDifference) {
-      await logCopySkip(
-        `price drift buy · implied(on-chain)=${implied.toFixed(4)} clob=${currentPrice.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · ${formatOriginTradeSizing(digest)}`,
-        digest,
-        txHash,
-        cfg
-      );
-      return;
-    }
-  }
-
+  // ── Pre-CLOB cheap filters: fail fast before spending any API budget ──────────────────
+  // For BUY: notional sizing only depends on origin pUSD + copy_ratio + config thresholds.
+  // No need to fetch tick/negRisk/book/midpoint just to skip a $0.30 copy below min_position_usdc.
   let clippedUsdc: number | null = null;
   if (digest.side === "buy") {
     const usdcNotional = originPusd * cfg.copyRatio;
@@ -655,6 +642,37 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     clippedUsdc = clamp(usdcNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
   }
 
+  const client = await ensureClobClient(cfg);
+
+  // Option-2 suppression: only suppress if our hedge actually filled. If hedge is unfilled,
+  // cancel it (to prevent double-hedge later) and continue copying the target's opposite-side buy.
+  if (cfg.hedgePrice !== undefined) {
+    const sup = await checkHedgeSuppression(cfg, client, digest, txHash);
+    if (sup.suppress) {
+      await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg);
+      return;
+    }
+  }
+
+  // tickSize + negRisk are cached (immutable per market) — only fetched once per tokenId.
+  const [tickSize, negRisk, book, midRaw] = await Promise.all([
+    getTickSizeCached(client, digest.tokenId),
+    getNegRiskCached(client, digest.tokenId),
+    client.getOrderBook(digest.tokenId),
+    client.getMidpoint(digest.tokenId),
+  ]);
+
+  let currentPrice = parseClobPrice(midRaw);
+  if (currentPrice === null) {
+    const sideStr = digest.side === "buy" ? Side.BUY : Side.SELL;
+    const pxRaw = await client.getPrice(digest.tokenId, sideStr);
+    currentPrice = parseClobPrice(pxRaw);
+  }
+  if (currentPrice === null) {
+    await logCopySkip(`could not parse CLOB price · token=${digest.tokenId}`, digest, txHash, cfg);
+    return;
+  }
+
   let limitPrice: number;
   if (digest.side === "buy") {
     const ask = bestAsk(book);
@@ -662,7 +680,22 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       await logCopySkip("empty asks", digest, txHash, cfg);
       return;
     }
-    limitPrice = roundToTick(Math.max(currentPrice, ask), tickSize, "up");
+
+    // Option A drift check: compare the price we'd ACTUALLY pay (effectivePrice) against implied,
+    // not the midpoint. Catches wide-spread books where midpoint passes but ask is much higher.
+    const effectivePrice = Math.max(currentPrice, ask);
+    const drift = effectivePrice - implied;
+    if (drift > cfg.maxPriceDifference) {
+      await logCopySkip(
+        `price drift buy · implied(on-chain)=${implied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · ${formatOriginTradeSizing(digest)}`,
+        digest,
+        txHash,
+        cfg
+      );
+      return;
+    }
+
+    limitPrice = roundToTick(effectivePrice, tickSize, "up");
 
     if (cfg.buyPriceMin !== undefined && limitPrice < cfg.buyPriceMin) {
       await logCopySkip(
@@ -683,6 +716,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       return;
     }
   } else {
+    // Sells: no drift check (per design). Just price to top of book.
     const bid = bestBid(book);
     if (bid === null) {
       await logCopySkip("empty bids", digest, txHash, cfg);
