@@ -15,6 +15,12 @@ export type TomlDefaultsSection = {
   max_position_usdc?: number;
   /** When true, copy decisions are computed and logged but no order is posted to CLOB. */
   dry_run?: boolean;
+  /**
+   * If set (0,1), after each copy BUY we place a GTC limit BUY for the OPPOSITE outcome at this
+   * price, sized to our total holdings of the primary side in that condition. Acts as a passive
+   * pre-hedge. Subsequent target opposite-side BUYs are suppressed (we're already hedged).
+   */
+  hedge_price?: number;
 };
 
 export type TomlTargetRow = {
@@ -27,6 +33,7 @@ export type TomlTargetRow = {
   min_position_usdc?: number;
   max_position_usdc?: number;
   dry_run?: boolean;
+  hedge_price?: number;
 };
 
 export type ParsedCopyTargetsToml = {
@@ -87,6 +94,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       min_position_usdc: numOrUndef("min_position_usdc", src),
       max_position_usdc: numOrUndef("max_position_usdc", src),
       dry_run: boolOrUndef("dry_run", src),
+      hedge_price: numOrUndef("hedge_price", src),
     };
   }
 
@@ -115,6 +123,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       min_position_usdc: numOrUndef("min_position_usdc", row),
       max_position_usdc: numOrUndef("max_position_usdc", row),
       dry_run: boolOrUndef("dry_run", row),
+      hedge_price: numOrUndef("hedge_price", row),
     });
   }
 

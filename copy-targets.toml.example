@@ -13,6 +13,11 @@ min_position_usdc = 1
 max_position_usdc = 100
 # When true, copy decisions are logged but no order is posted to CLOB. Default: false (live trading)
 # dry_run = false
+# After each copy BUY, place a passive GTC limit BUY on the OPPOSITE outcome at this price (in [0,1]),
+# sized to total holdings of the primary side in that condition. Acts as a cheap pre-hedge.
+# When the target later buys the opposite side themselves, we suppress that copy (already hedged).
+# Omit = no hedging.
+# hedge_price = 0.10
 
 [[targets]]
 address = "0xe71a099e3a4499458de60a1daba70ab649cd6944"
@@ -23,5 +28,6 @@ address = "0x0000000000000000000000000000000000000001"
 copy_ratio = 0.5
 max_price_difference = 0.05
 dry_run = true                    # this target is in dry-run mode while you observe it
+hedge_price = 0.10                # pre-hedge opposite outcome at 10¢ after each copy BUY
 
 # Mempool watcher and shared CLOB credentials still use `.env`.

@@ -226,6 +226,365 @@ export async function ensureClobClient(cfg: CopyTradeConfig): Promise<ClobClient
   return authInFlight;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hedge module — per-target `hedge_price` strategy
+// ─────────────────────────────────────────────────────────────────────────────
+
+type HedgeRest = {
+  orderId: string;
+  tokenId: string;
+  price: number;
+  size: number;
+};
+
+type MarketHedgeState = {
+  conditionId: string;
+  tokenA: string;
+  tokenB: string;
+  /** Shares we hold per tokenId (in this condition). Updated on each copy buy AND on detected hedge fills. */
+  sharesByToken: Map<string, number>;
+  /** Currently-resting hedge order (or null if no resting hedge). */
+  hedge: HedgeRest | null;
+};
+
+/** Keyed by conditionId. Resets on process restart (5m markets resolve before restart gaps matter). */
+const hedgeStateByCondition = new Map<string, MarketHedgeState>();
+
+/** tokenId → { conditionId, [tokenId, oppositeTokenId] }. Cached after first gamma lookup. */
+const marketTokensCache = new Map<string, { conditionId: string; clobTokenIds: [string, string] }>();
+
+/**
+ * Resolves the conditionId and both outcome tokenIds for a given tokenId via Polymarket's gamma API.
+ * Cached aggressively because the relationship is immutable per market.
+ */
+async function resolveMarketTokens(
+  tokenId: string
+): Promise<{ conditionId: string; clobTokenIds: [string, string] } | null> {
+  const cached = marketTokensCache.get(tokenId);
+  if (cached) {
+    return cached;
+  }
+  try {
+    const url = new URL("https://gamma-api.polymarket.com/markets");
+    url.searchParams.set("clob_token_ids", tokenId);
+    const res = await fetch(url);
+    if (!res.ok) {
+      return null;
+    }
+    const arr = (await res.json()) as unknown;
+    if (!Array.isArray(arr) || arr.length === 0) {
+      return null;
+    }
+    const m = arr[0] as Record<string, unknown>;
+    const conditionId = typeof m["conditionId"] === "string" ? (m["conditionId"] as string) : null;
+    const tokensRaw = m["clobTokenIds"];
+    let tokens: string[] = [];
+    if (Array.isArray(tokensRaw)) {
+      tokens = tokensRaw.map(String);
+    } else if (typeof tokensRaw === "string") {
+      try {
+        tokens = JSON.parse(tokensRaw).map(String);
+      } catch {
+        tokens = [];
+      }
+    }
+    if (!conditionId || tokens.length !== 2) {
+      return null;
+    }
+    const entry = { conditionId, clobTokenIds: [tokens[0]!, tokens[1]!] as [string, string] };
+    // Cache against BOTH tokens so either side hits the same entry next time.
+    marketTokensCache.set(tokens[0]!, entry);
+    marketTokensCache.set(tokens[1]!, entry);
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns the opposite tokenId for a binary market. null if metadata can't be resolved.
+ */
+async function getOppositeTokenId(tokenId: string): Promise<{ conditionId: string; oppositeTokenId: string } | null> {
+  const info = await resolveMarketTokens(tokenId);
+  if (!info) {
+    return null;
+  }
+  const [a, b] = info.clobTokenIds;
+  const opposite = a === tokenId ? b : a;
+  if (opposite === tokenId) {
+    return null;
+  }
+  return { conditionId: info.conditionId, oppositeTokenId: opposite };
+}
+
+/**
+ * Returns the matched portion of an order. The "treat partial fills as fully done" policy
+ * means we use this number to decide whether the hedge effectively "filled" — even one share
+ * matched counts. Returns null if the order can't be read.
+ */
+async function readHedgeMatched(client: ClobClient, orderId: string): Promise<number | null> {
+  if (orderId === "DRY_RUN") {
+    return 0;
+  }
+  try {
+    const o = await client.getOrder(orderId);
+    const matched = parseFloat(o.size_matched ?? "0");
+    return Number.isFinite(matched) ? matched : 0;
+  } catch {
+    return null;
+  }
+}
+
+async function safeCancel(client: ClobClient, orderId: string, cfg: CopyTradeConfig, ctx: string): Promise<void> {
+  if (orderId === "DRY_RUN") {
+    return;
+  }
+  try {
+    await client.cancelOrder({ orderID: orderId });
+  } catch (e) {
+    const warn = `hedge · cancel ${orderId} failed (${ctx}): ${e instanceof Error ? e.message : String(e)}`;
+    console.warn(warn);
+    void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
+  }
+}
+
+/**
+ * Compute the ideal hedge for current holdings: GTC BUY on the smaller side at hedge_price,
+ * sized to the net imbalance. Returns null if the position is balanced (no hedge needed).
+ */
+function computeIdealHedge(state: MarketHedgeState, hedgePrice: number): HedgeRest | null {
+  const sharesA = state.sharesByToken.get(state.tokenA) ?? 0;
+  const sharesB = state.sharesByToken.get(state.tokenB) ?? 0;
+  const imbalance = Math.abs(sharesA - sharesB);
+  if (imbalance <= 0) {
+    return null;
+  }
+  const shortTokenId = sharesA > sharesB ? state.tokenB : state.tokenA;
+  return {
+    orderId: "",
+    tokenId: shortTokenId,
+    price: hedgePrice,
+    size: imbalance,
+  };
+}
+
+/**
+ * Cancel + replace the resting hedge so it always matches the ideal (size = net imbalance,
+ * side = the smaller of our two holdings). Invariant: at most one resting hedge per condition.
+ * Skips network calls in dry-run mode but still updates state so suppression logic works.
+ */
+async function reconcileHedge(
+  cfg: CopyTradeConfig,
+  client: ClobClient,
+  state: MarketHedgeState,
+  txHash: string
+): Promise<void> {
+  if (cfg.hedgePrice === undefined) {
+    return;
+  }
+  const ideal = computeIdealHedge(state, cfg.hedgePrice);
+
+  // If current hedge already matches ideal, nothing to do (avoids needless cancel/replace churn).
+  if (
+    state.hedge &&
+    ideal &&
+    state.hedge.tokenId === ideal.tokenId &&
+    Math.abs(state.hedge.size - ideal.size) < 1e-9 &&
+    state.hedge.price === ideal.price
+  ) {
+    return;
+  }
+
+  // Cancel current hedge if any.
+  if (state.hedge) {
+    const old = state.hedge;
+    await safeCancel(client, old.orderId, cfg, `reconcile condition=${state.conditionId}`);
+    state.hedge = null;
+    const msg = `hedge cancelled · condition=${state.conditionId} oldToken=${old.tokenId} oldSize=${old.size} oldPrice=${old.price} · tx=${txHash}`;
+    console.log(msg);
+    void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+  }
+
+  if (!ideal) {
+    const msg = `hedge none-needed · condition=${state.conditionId} sharesByToken=${JSON.stringify(Object.fromEntries(state.sharesByToken))} · tx=${txHash}`;
+    console.log(msg);
+    void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+    return;
+  }
+
+  if (cfg.dryRun) {
+    const msg = `[DRY RUN] would place hedge · condition=${state.conditionId} hedgeToken=${ideal.tokenId} price=${ideal.price} shares=${ideal.size} · tx=${txHash}`;
+    console.log(msg);
+    void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+    state.hedge = { ...ideal, orderId: "DRY_RUN" };
+    return;
+  }
+
+  // Place new hedge.
+  try {
+    const [tickSize, negRisk] = await Promise.all([
+      client.getTickSize(ideal.tokenId),
+      client.getNegRisk(ideal.tokenId),
+    ]);
+    const resp = await client.createAndPostOrder(
+      {
+        tokenID: ideal.tokenId,
+        price: ideal.price,
+        side: Side.BUY,
+        size: ideal.size,
+      },
+      { tickSize, negRisk },
+      OrderType.GTC
+    );
+    const orderId = (resp as { orderID?: string })?.orderID ?? null;
+    if (orderId) {
+      state.hedge = { ...ideal, orderId };
+    }
+    const msg = `hedge placed · condition=${state.conditionId} hedgeToken=${ideal.tokenId} price=${ideal.price} shares=${ideal.size} · tx=${txHash} · ${JSON.stringify(resp)}`;
+    console.log(msg);
+    void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+  } catch (e) {
+    const errMsg = `hedge · post failed: ${e instanceof Error ? e.message : String(e)} · condition=${state.conditionId} hedgeToken=${ideal.tokenId} · tx=${txHash}`;
+    console.error(errMsg);
+    void appendCopyTradeSuccessLine(errMsg, cfg.copyTradeLogPath);
+  }
+}
+
+/**
+ * Record a successful BUY copy in state (additive to sharesByToken) and reconcile the hedge.
+ * Idempotent w.r.t. existing state if same condition was already seen — accumulates shares correctly.
+ */
+async function recordCopyBuyAndReconcile(
+  cfg: CopyTradeConfig,
+  client: ClobClient,
+  primaryTokenId: string,
+  sharesAdded: number,
+  txHash: string
+): Promise<void> {
+  if (cfg.hedgePrice === undefined) {
+    return;
+  }
+  const opp = await getOppositeTokenId(primaryTokenId);
+  if (!opp) {
+    const warn = `hedge · could not resolve opposite token for tokenId=${primaryTokenId} · tx=${txHash}`;
+    console.warn(warn);
+    void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
+    return;
+  }
+
+  let state = hedgeStateByCondition.get(opp.conditionId);
+  if (!state) {
+    state = {
+      conditionId: opp.conditionId,
+      tokenA: primaryTokenId,
+      tokenB: opp.oppositeTokenId,
+      sharesByToken: new Map(),
+      hedge: null,
+    };
+    hedgeStateByCondition.set(opp.conditionId, state);
+  }
+  const current = state.sharesByToken.get(primaryTokenId) ?? 0;
+  state.sharesByToken.set(primaryTokenId, current + sharesAdded);
+
+  await reconcileHedge(cfg, client, state, txHash);
+}
+
+/**
+ * Option-2 suppression: only suppress if our hedge actually filled. If the hedge is resting
+ * unfilled, cancel it (to prevent double-hedge later when the cheap price might fill behind us)
+ * and don't suppress — let the bot copy the target's opposite-side buy at fair price instead.
+ *
+ * Per user preference, a partial fill counts as "fully done" — the matched portion is rolled into
+ * sharesByToken and the unfilled remainder is cancelled.
+ */
+async function checkHedgeSuppression(
+  cfg: CopyTradeConfig,
+  client: ClobClient,
+  digest: CopyDigest,
+  txHash: string
+): Promise<{ suppress: boolean; reason?: string }> {
+  if (digest.side !== "buy") {
+    return { suppress: false };
+  }
+  const info = await resolveMarketTokens(digest.tokenId);
+  if (!info) {
+    return { suppress: false };
+  }
+  const state = hedgeStateByCondition.get(info.conditionId);
+  if (!state || !state.hedge) {
+    return { suppress: false };
+  }
+  if (state.hedge.tokenId !== digest.tokenId) {
+    // Hedge is for some other side — not applicable.
+    return { suppress: false };
+  }
+
+  const hedge = state.hedge;
+
+  // Dry-run hedge orders never "fill" because they never exist on CLOB. Treat as resting.
+  if (hedge.orderId === "DRY_RUN") {
+    state.hedge = null; // discard so we don't keep "cancelling" forever
+    const msg = `[DRY RUN] discarding pretend-hedge for condition=${state.conditionId} hedgeToken=${hedge.tokenId} (target buying that side) · tx=${txHash}`;
+    console.log(msg);
+    void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+    return { suppress: false };
+  }
+
+  const matched = await readHedgeMatched(client, hedge.orderId);
+  if (matched !== null && matched > 0) {
+    // Treat as fully done: roll matched portion into held shares, cancel the unmatched remainder.
+    await safeCancel(client, hedge.orderId, cfg, "matched-but-cleanup-remainder");
+    const existing = state.sharesByToken.get(hedge.tokenId) ?? 0;
+    state.sharesByToken.set(hedge.tokenId, existing + matched);
+    state.hedge = null;
+    return {
+      suppress: true,
+      reason: `hedge filled (${matched} of ${hedge.size} shares matched at $${hedge.price})`,
+    };
+  }
+
+  // Not filled — cancel resting hedge to prevent later behind-our-back fill that would double-hedge.
+  await safeCancel(client, hedge.orderId, cfg, "diverting-to-copy-target-opposite");
+  const msg = `hedge cancelled (diverting to copy target's opposite-side buy) · condition=${state.conditionId} hedgeToken=${hedge.tokenId} price=${hedge.price} shares=${hedge.size} · tx=${txHash}`;
+  console.log(msg);
+  void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+  state.hedge = null;
+  return { suppress: false };
+}
+
+/**
+ * Startup-time cleanup: cancel any pre-existing GTC orders for this wallet. Prevents orphan
+ * hedges from a prior process from filling behind the bot's (now-empty) in-memory state.
+ *
+ * Caveat: if other systems share this wallet, their GTC orders will also be cancelled. The user
+ * was warned and opted in.
+ */
+export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig): Promise<void> {
+  try {
+    const client = await ensureClobClient(cfg);
+    const orders = await client.getOpenOrders();
+    if (!Array.isArray(orders) || orders.length === 0) {
+      console.log("startup: no pre-existing open orders to clean up");
+      return;
+    }
+    console.log(`startup: cancelling ${orders.length} pre-existing open order(s)`);
+    for (const o of orders) {
+      const id = (o as { id?: string }).id;
+      if (!id) {
+        continue;
+      }
+      try {
+        await client.cancelOrder({ orderID: id });
+      } catch (e) {
+        console.warn(`startup: cancel ${id} failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    console.log("startup: cleanup done");
+  } catch (e) {
+    console.warn(`startup: failed to list open orders: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 /**
  * Sizes with **shares = (pUSD_notional × COPY_RATIO, clipped) / currentPrice**, where `currentPrice` comes from
  * the CLOB (`getMidpoint`, then `getPrice` fallback). Posts a marketable GTC limit at/through the book.
@@ -239,6 +598,16 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   }
 
   const client = await ensureClobClient(cfg);
+
+  // Option-2 suppression: only suppress if our hedge actually filled. If hedge is unfilled,
+  // cancel it (to prevent double-hedge later) and continue copying the target's opposite-side buy.
+  if (cfg.hedgePrice !== undefined) {
+    const sup = await checkHedgeSuppression(cfg, client, digest, txHash);
+    if (sup.suppress) {
+      await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg);
+      return;
+    }
+  }
 
   const [tickSize, negRisk, book, midRaw] = await Promise.all([
     client.getTickSize(digest.tokenId),
@@ -366,6 +735,10 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} · tx=${txHash}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+    // Track the would-be position so suppression / reconcile logs reflect reality.
+    if (digest.side === "buy") {
+      await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash);
+    }
     return;
   }
 
@@ -385,4 +758,9 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   const msg = `copy posted · ${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+
+  // After a successful live BUY, update sharesByToken and reconcile the hedge to net imbalance.
+  if (digest.side === "buy") {
+    await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash);
+  }
 }

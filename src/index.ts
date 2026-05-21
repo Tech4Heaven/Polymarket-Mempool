@@ -1,6 +1,6 @@
 import type { AbstractProvider } from "ethers";
 import { getAddress } from "ethers";
-import { buildCopyDigests, ensureClobClient, executeCopyTrade } from "./copyTrade.js";
+import { buildCopyDigests, cancelAllStaleGtcOrders, ensureClobClient, executeCopyTrade } from "./copyTrade.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { extractCtf1155TransfersForTargets } from "./ctf1155Inbound.js";
 import type { AppConfig } from "./env.js";
@@ -117,11 +117,19 @@ async function main() {
     if (!probe) {
       console.error("CLOB: copy trading enabled but no target profiles — check copy-targets.toml / env.");
     } else {
+      const probeCfg = mergeCopyTradeConfig(config.copyTradeShared, probe);
       try {
-        await ensureClobClient(mergeCopyTradeConfig(config.copyTradeShared, probe));
+        await ensureClobClient(probeCfg);
         console.info("CLOB: createOrDeriveApiKey OK (L2 credentials derived from wallet).");
       } catch (e) {
         console.error("CLOB: createOrDeriveApiKey failed — copy trades will fail until auth succeeds:", e);
+      }
+      // Restart safety: cancel orphan GTC orders from a prior run so they can't fill behind
+      // the (now-empty) in-memory hedge state and create double-hedge / unexpected exposure.
+      // Only runs if any target uses hedging — otherwise the bot doesn't post GTC itself either.
+      const anyHedging = [...config.targetCopyProfiles.values()].some((p) => p.hedgePrice !== undefined);
+      if (anyHedging && !probeCfg.dryRun) {
+        await cancelAllStaleGtcOrders(probeCfg);
       }
     }
   }

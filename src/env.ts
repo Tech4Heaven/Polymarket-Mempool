@@ -53,6 +53,12 @@ export type TargetCopyParams = {
   maxPositionUsdc: number;
   /** When true, copy decisions are logged but no order is posted to CLOB. Per-target. */
   dryRun: boolean;
+  /**
+   * Pre-hedge price in (0,1). When set, after each copy BUY we place a GTC limit BUY for the
+   * opposite outcome at this price (size = our total holdings of the primary side in that
+   * condition). Per-target. Omit = no hedging.
+   */
+  hedgePrice?: number;
   copyTradeLogPath: string;
 };
 
@@ -65,6 +71,8 @@ export type CopyTradeConfig = CopyTradeShared & {
   maxPositionUsdc: number;
   /** Per-target dry-run flag (merged from TargetCopyParams). */
   dryRun: boolean;
+  /** Per-target hedge price (merged from TargetCopyParams). Omit = no hedging. */
+  hedgePrice?: number;
   /**
    * When set, copy-trade lines go here; otherwise {@link appendCopyTradeSuccessLine} uses env / default file.
    */
@@ -100,6 +108,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     minPositionUsdc: p.minPositionUsdc,
     maxPositionUsdc: p.maxPositionUsdc,
     dryRun: p.dryRun,
+    hedgePrice: p.hedgePrice,
     copyTradeLogPath: p.copyTradeLogPath,
   };
 }
@@ -308,6 +317,9 @@ export async function loadAppConfig(): Promise<AppConfig> {
 
         const dryRun = row.dry_run ?? defaults.dry_run ?? false;
 
+        const hedgePriceRaw = row.hedge_price ?? defaults.hedge_price;
+        const hedgePrice = optionalProb01("hedge_price", hedgePriceRaw, `targets ${row.address}`);
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -317,6 +329,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           minPositionUsdc,
           maxPositionUsdc,
           dryRun,
+          hedgePrice,
           copyTradeLogPath,
         });
       }
