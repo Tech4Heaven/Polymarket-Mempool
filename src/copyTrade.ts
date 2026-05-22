@@ -189,6 +189,61 @@ async function getNegRiskCached(client: ClobClient, tokenId: string): Promise<bo
   return fresh;
 }
 
+/**
+ * Per-target per-side spend tracker for `max_market_usdc`. Key = `${targetAddrLc}:${tokenId}`.
+ * Each tokenId is unique per market+side, so per-side semantics fall out naturally.
+ *
+ * Buys ADD to the bucket; full sells RESET it (current code exits positions completely on sell).
+ * Entries expire after SIDE_SPEND_TTL_MS of no activity so 5-minute markets don't accumulate
+ * stale entries forever — sweep runs every 5 minutes.
+ */
+type SideSpendEntry = { spent: number; lastUpdated: number };
+const sideSpendByTargetToken = new Map<string, SideSpendEntry>();
+const SIDE_SPEND_TTL_MS = 30 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, e] of sideSpendByTargetToken) {
+    if (now - e.lastUpdated > SIDE_SPEND_TTL_MS) {
+      sideSpendByTargetToken.delete(k);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+function sideSpendKey(targetAddress: string, tokenId: string): string {
+  return `${targetAddress.toLowerCase()}:${tokenId}`;
+}
+
+function getSideSpent(targetAddress: string, tokenId: string): number {
+  const e = sideSpendByTargetToken.get(sideSpendKey(targetAddress, tokenId));
+  if (!e) {
+    return 0;
+  }
+  if (Date.now() - e.lastUpdated > SIDE_SPEND_TTL_MS) {
+    sideSpendByTargetToken.delete(sideSpendKey(targetAddress, tokenId));
+    return 0;
+  }
+  return e.spent;
+}
+
+/**
+ * Adds (positive) or refunds (negative) USDC to a side's spend bucket. Refunds clamp at 0
+ * to avoid going negative when our internal accounting drifts from reality (e.g., a cancel
+ * races with a fill and we slightly over-refund).
+ */
+function addSideSpent(targetAddress: string, tokenId: string, usdcDelta: number): void {
+  const k = sideSpendKey(targetAddress, tokenId);
+  const e = sideSpendByTargetToken.get(k);
+  const newSpent = Math.max(0, (e?.spent ?? 0) + usdcDelta);
+  sideSpendByTargetToken.set(k, {
+    spent: newSpent,
+    lastUpdated: Date.now(),
+  });
+}
+
+function resetSideSpent(targetAddress: string, tokenId: string): void {
+  sideSpendByTargetToken.delete(sideSpendKey(targetAddress, tokenId));
+}
+
 function buildSigner(cfg: CopyTradeConfig) {
   const account = privateKeyToAccount(cfg.privateKey);
   return createWalletClient({
@@ -422,12 +477,15 @@ async function reconcileHedge(
     return;
   }
 
-  // Cancel current hedge if any.
+  // Cancel current hedge if any. Refund its full cost to the bucket — we assume the cancel
+  // succeeds before any fill. If it raced with a fill, our accounting will be slightly off
+  // until next reconcile (the addSideSpent clamp-at-zero prevents going negative).
   if (state.hedge) {
     const old = state.hedge;
     await safeCancel(client, old.orderId, cfg, `reconcile condition=${state.conditionId}`);
+    addSideSpent(cfg.targetAddress, old.tokenId, -(old.price * old.size));
     state.hedge = null;
-    const msg = `hedge cancelled · condition=${state.conditionId} oldToken=${old.tokenId} oldSize=${old.size} oldPrice=${old.price} · tx=${txHash}`;
+    const msg = `hedge cancelled · condition=${state.conditionId} oldToken=${old.tokenId} oldSize=${old.size} oldPrice=${old.price} refunded=$${(old.price * old.size).toFixed(4)} · tx=${txHash}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
   }
@@ -439,39 +497,66 @@ async function reconcileHedge(
     return;
   }
 
+  // Cap-aware sizing: clip the hedge to fit the opposite side's max_market_usdc bucket.
+  // If even one tick of hedge would overflow the bucket, we skip the hedge entirely.
+  let sizeToPlace = ideal.size;
+  if (cfg.maxMarketUsdc !== undefined) {
+    const alreadySpent = getSideSpent(cfg.targetAddress, ideal.tokenId);
+    const remaining = cfg.maxMarketUsdc - alreadySpent;
+    const desiredCost = ideal.price * ideal.size;
+    if (desiredCost > remaining) {
+      const maxAffordableSize = remaining / ideal.price;
+      if (maxAffordableSize <= 0) {
+        const skipMsg = `hedge skipped · max_market_usdc bucket full on opposite side · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} hedgeToken=${ideal.tokenId} · tx=${txHash}`;
+        console.log(skipMsg);
+        void appendCopyTradeSuccessLine(skipMsg, cfg.copyTradeLogPath);
+        return;
+      }
+      const clipMsg = `hedge clipped by max_market_usdc · desired=${ideal.size.toFixed(2)} sh → ${maxAffordableSize.toFixed(2)} sh · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} · tx=${txHash}`;
+      console.log(clipMsg);
+      void appendCopyTradeSuccessLine(clipMsg, cfg.copyTradeLogPath);
+      sizeToPlace = maxAffordableSize;
+    }
+  }
+
+  const finalHedge: HedgeRest = { ...ideal, size: sizeToPlace };
+  const finalCost = finalHedge.price * finalHedge.size;
+
   if (cfg.dryRun) {
-    const msg = `[DRY RUN] would place hedge · condition=${state.conditionId} hedgeToken=${ideal.tokenId} price=${ideal.price} shares=${ideal.size} · tx=${txHash}`;
+    const msg = `[DRY RUN] would place hedge · condition=${state.conditionId} hedgeToken=${finalHedge.tokenId} price=${finalHedge.price} shares=${finalHedge.size} cost=$${finalCost.toFixed(4)} · tx=${txHash}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
-    state.hedge = { ...ideal, orderId: "DRY_RUN" };
+    state.hedge = { ...finalHedge, orderId: "DRY_RUN" };
+    addSideSpent(cfg.targetAddress, finalHedge.tokenId, finalCost);
     return;
   }
 
   // Place new hedge.
   try {
     const [tickSize, negRisk] = await Promise.all([
-      getTickSizeCached(client, ideal.tokenId),
-      getNegRiskCached(client, ideal.tokenId),
+      getTickSizeCached(client, finalHedge.tokenId),
+      getNegRiskCached(client, finalHedge.tokenId),
     ]);
     const resp = await client.createAndPostOrder(
       {
-        tokenID: ideal.tokenId,
-        price: ideal.price,
+        tokenID: finalHedge.tokenId,
+        price: finalHedge.price,
         side: Side.BUY,
-        size: ideal.size,
+        size: finalHedge.size,
       },
       { tickSize, negRisk },
       OrderType.GTC
     );
     const orderId = (resp as { orderID?: string })?.orderID ?? null;
     if (orderId) {
-      state.hedge = { ...ideal, orderId };
+      state.hedge = { ...finalHedge, orderId };
+      addSideSpent(cfg.targetAddress, finalHedge.tokenId, finalCost);
     }
-    const msg = `hedge placed · condition=${state.conditionId} hedgeToken=${ideal.tokenId} price=${ideal.price} shares=${ideal.size} · tx=${txHash} · ${JSON.stringify(resp)}`;
+    const msg = `hedge placed · condition=${state.conditionId} hedgeToken=${finalHedge.tokenId} price=${finalHedge.price} shares=${finalHedge.size} cost=$${finalCost.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
   } catch (e) {
-    const errMsg = `hedge · post failed: ${e instanceof Error ? e.message : String(e)} · condition=${state.conditionId} hedgeToken=${ideal.tokenId} · tx=${txHash}`;
+    const errMsg = `hedge · post failed: ${e instanceof Error ? e.message : String(e)} · condition=${state.conditionId} hedgeToken=${finalHedge.tokenId} · tx=${txHash}`;
     console.error(errMsg);
     void appendCopyTradeSuccessLine(errMsg, cfg.copyTradeLogPath);
   }
@@ -560,7 +645,12 @@ async function checkHedgeSuppression(
   const matched = await readHedgeMatched(client, hedge.orderId);
   if (matched !== null && matched > 0) {
     // Treat as fully done: roll matched portion into held shares, cancel the unmatched remainder.
+    // The matched portion stays committed (now as shares); refund only the unmatched portion.
     await safeCancel(client, hedge.orderId, cfg, "matched-but-cleanup-remainder");
+    const unmatchedShares = Math.max(0, hedge.size - matched);
+    if (unmatchedShares > 0) {
+      addSideSpent(cfg.targetAddress, hedge.tokenId, -(unmatchedShares * hedge.price));
+    }
     const existing = state.sharesByToken.get(hedge.tokenId) ?? 0;
     state.sharesByToken.set(hedge.tokenId, existing + matched);
     state.hedge = null;
@@ -571,8 +661,10 @@ async function checkHedgeSuppression(
   }
 
   // Not filled — cancel resting hedge to prevent later behind-our-back fill that would double-hedge.
+  // Full refund of hedge cost to the bucket.
   await safeCancel(client, hedge.orderId, cfg, "diverting-to-copy-target-opposite");
-  const msg = `hedge cancelled (diverting to copy target's opposite-side buy) · condition=${state.conditionId} hedgeToken=${hedge.tokenId} price=${hedge.price} shares=${hedge.size} · tx=${txHash}`;
+  addSideSpent(cfg.targetAddress, hedge.tokenId, -(hedge.size * hedge.price));
+  const msg = `hedge cancelled (diverting to copy target's opposite-side buy) · condition=${state.conditionId} hedgeToken=${hedge.tokenId} price=${hedge.price} shares=${hedge.size} refunded=$${(hedge.size * hedge.price).toFixed(4)} · tx=${txHash}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
   state.hedge = null;
@@ -640,6 +732,34 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       return;
     }
     clippedUsdc = clamp(usdcNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
+
+    // Per-target per-side cap: clip down to remaining bucket capacity. Skip if remaining
+    // wouldn't satisfy min_position_usdc — we don't post sub-min orders.
+    if (cfg.maxMarketUsdc !== undefined) {
+      const alreadySpent = getSideSpent(cfg.targetAddress, digest.tokenId);
+      const remaining = cfg.maxMarketUsdc - alreadySpent;
+      if (remaining <= 0) {
+        await logCopySkip(
+          `max_market_usdc cap reached · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+          digest,
+          txHash,
+          cfg
+        );
+        return;
+      }
+      if (clippedUsdc > remaining) {
+        if (remaining < cfg.minPositionUsdc) {
+          await logCopySkip(
+            `max_market_usdc remaining $${remaining.toFixed(2)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+            digest,
+            txHash,
+            cfg
+          );
+          return;
+        }
+        clippedUsdc = remaining;
+      }
+    }
   }
 
   const client = await ensureClobClient(cfg);
@@ -769,9 +889,12 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} · tx=${txHash}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
-    // Track the would-be position so suppression / reconcile logs reflect reality.
+    // Track the would-be position so suppression / reconcile / max_market_usdc logs reflect reality.
     if (digest.side === "buy") {
+      addSideSpent(cfg.targetAddress, digest.tokenId, clippedUsdc ?? 0);
       await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash);
+    } else {
+      resetSideSpent(cfg.targetAddress, digest.tokenId);
     }
     return;
   }
@@ -793,8 +916,12 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
 
-  // After a successful live BUY, update sharesByToken and reconcile the hedge to net imbalance.
+  // After a successful live BUY, update sharesByToken, reconcile the hedge, and record spend.
+  // On a successful live SELL, reset the side's spend bucket (current code does full liquidation).
   if (digest.side === "buy") {
+    addSideSpent(cfg.targetAddress, digest.tokenId, clippedUsdc ?? 0);
     await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash);
+  } else {
+    resetSideSpent(cfg.targetAddress, digest.tokenId);
   }
 }

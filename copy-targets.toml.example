@@ -18,6 +18,10 @@ max_position_usdc = 100
 # When the target later buys the opposite side themselves, we suppress that copy (already hedged).
 # Omit = no hedging.
 # hedge_price = 0.10
+# Per-SIDE max USDC cap. The most USDC this target can cause us to commit to a single outcome
+# (Up and Down each get their own bucket — total per market can reach 2× this value).
+# Buys are clipped to fit; full sells reset the side. Omit = no cap.
+# max_market_usdc = 100
 
 [[targets]]
 address = "0xe71a099e3a4499458de60a1daba70ab649cd6944"

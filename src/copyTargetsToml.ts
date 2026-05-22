@@ -21,6 +21,13 @@ export type TomlDefaultsSection = {
    * pre-hedge. Subsequent target opposite-side BUYs are suppressed (we're already hedged).
    */
   hedge_price?: number;
+  /**
+   * Per-side max USDC cap: the most USDC we'll commit to copies of THIS target on a single
+   * outcome token. Applies independently per outcome (Up and Down each get their own bucket),
+   * so total committed in a binary market can reach up to 2× this value.
+   * Buys are clipped to fit; full sells reset the side's bucket. Omit = no cap.
+   */
+  max_market_usdc?: number;
 };
 
 export type TomlTargetRow = {
@@ -34,6 +41,7 @@ export type TomlTargetRow = {
   max_position_usdc?: number;
   dry_run?: boolean;
   hedge_price?: number;
+  max_market_usdc?: number;
 };
 
 export type ParsedCopyTargetsToml = {
@@ -95,6 +103,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       max_position_usdc: numOrUndef("max_position_usdc", src),
       dry_run: boolOrUndef("dry_run", src),
       hedge_price: numOrUndef("hedge_price", src),
+      max_market_usdc: numOrUndef("max_market_usdc", src),
     };
   }
 
@@ -124,6 +133,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       max_position_usdc: numOrUndef("max_position_usdc", row),
       dry_run: boolOrUndef("dry_run", row),
       hedge_price: numOrUndef("hedge_price", row),
+      max_market_usdc: numOrUndef("max_market_usdc", row),
     });
   }
 

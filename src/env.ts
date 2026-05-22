@@ -59,6 +59,12 @@ export type TargetCopyParams = {
    * condition). Per-target. Omit = no hedging.
    */
   hedgePrice?: number;
+  /**
+   * Per-side max USDC cap. The most USDC we'll commit to this target's copies on a single
+   * outcome token. Applied independently per outcome. Buys are clipped to fit; full sells
+   * reset the side's bucket. Omit = no cap.
+   */
+  maxMarketUsdc?: number;
   copyTradeLogPath: string;
 };
 
@@ -73,6 +79,13 @@ export type CopyTradeConfig = CopyTradeShared & {
   dryRun: boolean;
   /** Per-target hedge price (merged from TargetCopyParams). Omit = no hedging. */
   hedgePrice?: number;
+  /** Per-target per-side max USDC cap. Omit = no cap. */
+  maxMarketUsdc?: number;
+  /**
+   * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
+   * can attribute spend to the right target across the shared copy wallet.
+   */
+  targetAddress: string;
   /**
    * When set, copy-trade lines go here; otherwise {@link appendCopyTradeSuccessLine} uses env / default file.
    */
@@ -109,6 +122,8 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     maxPositionUsdc: p.maxPositionUsdc,
     dryRun: p.dryRun,
     hedgePrice: p.hedgePrice,
+    maxMarketUsdc: p.maxMarketUsdc,
+    targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
 }
@@ -320,6 +335,15 @@ export async function loadAppConfig(): Promise<AppConfig> {
         const hedgePriceRaw = row.hedge_price ?? defaults.hedge_price;
         const hedgePrice = optionalProb01("hedge_price", hedgePriceRaw, `targets ${row.address}`);
 
+        const maxMarketUsdcRaw = row.max_market_usdc ?? defaults.max_market_usdc;
+        let maxMarketUsdc: number | undefined;
+        if (maxMarketUsdcRaw !== undefined) {
+          if (!Number.isFinite(maxMarketUsdcRaw) || maxMarketUsdcRaw <= 0) {
+            throw new Error(`targets ${row.address}: max_market_usdc must be a positive number`);
+          }
+          maxMarketUsdc = maxMarketUsdcRaw;
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -330,6 +354,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           maxPositionUsdc,
           dryRun,
           hedgePrice,
+          maxMarketUsdc,
           copyTradeLogPath,
         });
       }
