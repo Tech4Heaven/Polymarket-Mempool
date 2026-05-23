@@ -323,14 +323,90 @@ type MarketHedgeState = {
   conditionId: string;
   tokenA: string;
   tokenB: string;
-  /** Shares we hold per tokenId (in this condition). Updated on each copy buy AND on detected hedge fills. */
+  /** Best estimate of shares we hold per tokenId. Fed by copy fills (takingAmount) and the balance poller. */
   sharesByToken: Map<string, number>;
   /** Currently-resting hedge order (or null if no resting hedge). */
   hedge: HedgeRest | null;
+  /** cfg of the most recent target to trade this condition — used by the poller for hedge_price/cap. */
+  cfg: CopyTradeConfig;
+  /** ms of last activity (copy or poll-detected change) — for TTL eviction from the poll set. */
+  lastActivityMs: number;
+  /** Per-condition async mutex (chained promise) so copy- and poll-triggered reconciles serialize. */
+  reconcileChain: Promise<void>;
 };
 
 /** Keyed by conditionId. Resets on process restart (5m markets resolve before restart gaps matter). */
 const hedgeStateByCondition = new Map<string, MarketHedgeState>();
+
+const HEDGE_POLL_INTERVAL_MS = 8_000;
+const HEDGE_STATE_TTL_MS = 15 * 60_000;
+
+/** Reads the wallet's actual conditional-token balance (filled shares) for a tokenId. */
+async function readConditionalBalance(client: ClobClient, tokenId: string): Promise<number> {
+  const bal = await client.getBalanceAllowance({
+    asset_type: AssetType.CONDITIONAL,
+    token_id: tokenId,
+  });
+  try {
+    const v = parseFloat(formatUnits(BigInt(String(bal.balance)), 6));
+    return Number.isFinite(v) ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Serializes reconciles for a condition so a copy-triggered and a poll-triggered reconcile can
+ * never run concurrently and place duplicate hedges. Chains onto the state's reconcileChain.
+ */
+function runExclusive(state: MarketHedgeState, fn: () => Promise<void>): Promise<void> {
+  const next = state.reconcileChain.then(fn, fn);
+  // Swallow errors on the chain so one failure doesn't poison subsequent reconciles.
+  state.reconcileChain = next.catch(() => undefined);
+  return next;
+}
+
+/**
+ * Background poller (Part 2-B): every HEDGE_POLL_INTERVAL_MS, walk active LIVE conditions, read
+ * real balances, merge into the share estimate, and reconcile. Catches late fills of resting copy
+ * orders (and hedge fills) that copy events alone would miss. Dry-run conditions are skipped — they
+ * have no real orders, so balance polling would wrongly zero their simulated holdings.
+ */
+setInterval(() => {
+  const now = Date.now();
+  for (const [condId, state] of hedgeStateByCondition) {
+    if (now - state.lastActivityMs > HEDGE_STATE_TTL_MS) {
+      hedgeStateByCondition.delete(condId);
+      continue;
+    }
+    if (state.cfg.dryRun || state.cfg.hedgePrice === undefined) {
+      continue;
+    }
+    void runExclusive(state, async () => {
+      const client = await ensureClobClient(state.cfg);
+      const balA = await readConditionalBalance(client, state.tokenA);
+      const balB = await readConditionalBalance(client, state.tokenB);
+      // max-merge: balance only grows vs estimate as resting orders settle. Settlement lag can
+      // make balance momentarily LOWER than a just-recorded fill — max() prevents falsely zeroing it.
+      const prevA = state.sharesByToken.get(state.tokenA) ?? 0;
+      const prevB = state.sharesByToken.get(state.tokenB) ?? 0;
+      const newA = Math.max(prevA, balA);
+      const newB = Math.max(prevB, balB);
+      if (newA === prevA && newB === prevB) {
+        return;
+      }
+      state.sharesByToken.set(state.tokenA, newA);
+      state.sharesByToken.set(state.tokenB, newB);
+      state.lastActivityMs = Date.now();
+      const poll = `hedge poll · condition=${condId} balances A=${newA} B=${newB} (was A=${prevA} B=${prevB}) · resting copy fill detected, reconciling`;
+      console.log(poll);
+      void appendCopyTradeSuccessLine(poll, state.cfg.copyTradeLogPath);
+      await reconcileHedge(state.cfg, client, state, "poller");
+    }).catch((e) => {
+      console.warn(`hedge poll error · condition=${condId}: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
+}, HEDGE_POLL_INTERVAL_MS).unref();
 
 /** tokenId → { conditionId, [tokenId, oppositeTokenId] }. Cached after first gamma lookup. */
 const marketTokensCache = new Map<string, { conditionId: string; clobTokenIds: [string, string] }>();
@@ -562,28 +638,15 @@ async function reconcileHedge(
   }
 }
 
-/**
- * Record a successful BUY copy in state (additive to sharesByToken) and reconcile the hedge.
- * Idempotent w.r.t. existing state if same condition was already seen — accumulates shares correctly.
- */
-async function recordCopyBuyAndReconcile(
+/** Gets an existing hedge state for a tokenId's condition or creates one, refreshing cfg + activity. */
+async function getOrCreateHedgeState(
   cfg: CopyTradeConfig,
-  client: ClobClient,
-  primaryTokenId: string,
-  sharesAdded: number,
-  txHash: string
-): Promise<void> {
-  if (cfg.hedgePrice === undefined) {
-    return;
-  }
+  primaryTokenId: string
+): Promise<MarketHedgeState | null> {
   const opp = await getOppositeTokenId(primaryTokenId);
   if (!opp) {
-    const warn = `hedge · could not resolve opposite token for tokenId=${primaryTokenId} · tx=${txHash}`;
-    console.warn(warn);
-    void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
-    return;
+    return null;
   }
-
   let state = hedgeStateByCondition.get(opp.conditionId);
   if (!state) {
     state = {
@@ -592,13 +655,47 @@ async function recordCopyBuyAndReconcile(
       tokenB: opp.oppositeTokenId,
       sharesByToken: new Map(),
       hedge: null,
+      cfg,
+      lastActivityMs: Date.now(),
+      reconcileChain: Promise.resolve(),
     };
     hedgeStateByCondition.set(opp.conditionId, state);
+  } else {
+    // Most-recent target's cfg wins (hedge_price / cap). Refresh activity so poller keeps it alive.
+    state.cfg = cfg;
+    state.lastActivityMs = Date.now();
   }
-  const current = state.sharesByToken.get(primaryTokenId) ?? 0;
-  state.sharesByToken.set(primaryTokenId, current + sharesAdded);
+  return state;
+}
 
-  await reconcileHedge(cfg, client, state, txHash);
+/**
+ * Record a successful BUY copy in state (additive to sharesByToken, using ACTUAL filled shares)
+ * and reconcile the hedge. Serialized per-condition via the mutex so it can't race the poller.
+ */
+async function recordCopyBuyAndReconcile(
+  cfg: CopyTradeConfig,
+  client: ClobClient,
+  primaryTokenId: string,
+  filledShares: number,
+  txHash: string
+): Promise<void> {
+  if (cfg.hedgePrice === undefined) {
+    return;
+  }
+  const state = await getOrCreateHedgeState(cfg, primaryTokenId);
+  if (!state) {
+    const warn = `hedge · could not resolve opposite token for tokenId=${primaryTokenId} · tx=${txHash}`;
+    console.warn(warn);
+    void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
+    return;
+  }
+
+  await runExclusive(state, async () => {
+    const current = state.sharesByToken.get(primaryTokenId) ?? 0;
+    state.sharesByToken.set(primaryTokenId, current + filledShares);
+    state.lastActivityMs = Date.now();
+    await reconcileHedge(cfg, client, state, txHash);
+  });
 }
 
 /**
@@ -631,44 +728,53 @@ async function checkHedgeSuppression(
     return { suppress: false };
   }
 
-  const hedge = state.hedge;
+  // Serialize with the poller: this mutates state.hedge (reads fill status + cancels), and a
+  // concurrent poll-triggered reconcile could otherwise place/cancel a competing hedge.
+  let result: { suppress: boolean; reason?: string } = { suppress: false };
+  await runExclusive(state, async () => {
+    const hedge = state.hedge;
+    if (!hedge || hedge.tokenId !== digest.tokenId) {
+      // State changed while we waited for the mutex — nothing to suppress against.
+      return;
+    }
+    state.lastActivityMs = Date.now();
 
-  // Dry-run hedge orders never "fill" because they never exist on CLOB. Treat as resting.
-  if (hedge.orderId === "DRY_RUN") {
-    state.hedge = null; // discard so we don't keep "cancelling" forever
-    const msg = `[DRY RUN] discarding pretend-hedge for condition=${state.conditionId} hedgeToken=${hedge.tokenId} (target buying that side) · tx=${txHash}`;
+    // Dry-run hedge orders never "fill" because they never exist on CLOB. Treat as resting.
+    if (hedge.orderId === "DRY_RUN") {
+      state.hedge = null;
+      const msg = `[DRY RUN] discarding pretend-hedge for condition=${state.conditionId} hedgeToken=${hedge.tokenId} (target buying that side) · tx=${txHash}`;
+      console.log(msg);
+      void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+      return;
+    }
+
+    const matched = await readHedgeMatched(client, hedge.orderId);
+    if (matched !== null && matched > 0) {
+      // Treat as fully done: roll matched portion into held shares, cancel the unmatched remainder.
+      await safeCancel(client, hedge.orderId, cfg, "matched-but-cleanup-remainder");
+      const unmatchedShares = Math.max(0, hedge.size - matched);
+      if (unmatchedShares > 0) {
+        addSideSpent(cfg.targetAddress, hedge.tokenId, -(unmatchedShares * hedge.price));
+      }
+      const existing = state.sharesByToken.get(hedge.tokenId) ?? 0;
+      state.sharesByToken.set(hedge.tokenId, existing + matched);
+      state.hedge = null;
+      result = {
+        suppress: true,
+        reason: `hedge filled (${matched} of ${hedge.size} shares matched at $${hedge.price})`,
+      };
+      return;
+    }
+
+    // Not filled — cancel resting hedge to prevent later behind-our-back fill that would double-hedge.
+    await safeCancel(client, hedge.orderId, cfg, "diverting-to-copy-target-opposite");
+    addSideSpent(cfg.targetAddress, hedge.tokenId, -(hedge.size * hedge.price));
+    const msg = `hedge cancelled (diverting to copy target's opposite-side buy) · condition=${state.conditionId} hedgeToken=${hedge.tokenId} price=${hedge.price} shares=${hedge.size} refunded=$${(hedge.size * hedge.price).toFixed(4)} · tx=${txHash}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
-    return { suppress: false };
-  }
-
-  const matched = await readHedgeMatched(client, hedge.orderId);
-  if (matched !== null && matched > 0) {
-    // Treat as fully done: roll matched portion into held shares, cancel the unmatched remainder.
-    // The matched portion stays committed (now as shares); refund only the unmatched portion.
-    await safeCancel(client, hedge.orderId, cfg, "matched-but-cleanup-remainder");
-    const unmatchedShares = Math.max(0, hedge.size - matched);
-    if (unmatchedShares > 0) {
-      addSideSpent(cfg.targetAddress, hedge.tokenId, -(unmatchedShares * hedge.price));
-    }
-    const existing = state.sharesByToken.get(hedge.tokenId) ?? 0;
-    state.sharesByToken.set(hedge.tokenId, existing + matched);
     state.hedge = null;
-    return {
-      suppress: true,
-      reason: `hedge filled (${matched} of ${hedge.size} shares matched at $${hedge.price})`,
-    };
-  }
-
-  // Not filled — cancel resting hedge to prevent later behind-our-back fill that would double-hedge.
-  // Full refund of hedge cost to the bucket.
-  await safeCancel(client, hedge.orderId, cfg, "diverting-to-copy-target-opposite");
-  addSideSpent(cfg.targetAddress, hedge.tokenId, -(hedge.size * hedge.price));
-  const msg = `hedge cancelled (diverting to copy target's opposite-side buy) · condition=${state.conditionId} hedgeToken=${hedge.tokenId} price=${hedge.price} shares=${hedge.size} refunded=$${(hedge.size * hedge.price).toFixed(4)} · tx=${txHash}`;
-  console.log(msg);
-  void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
-  state.hedge = null;
-  return { suppress: false };
+  });
+  return result;
 }
 
 /**
@@ -910,17 +1016,25 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     OrderType.GTC
   );
 
+  // Actual fill from the CLOB response — for a BUY: takingAmount=shares acquired, makingAmount=USDC paid.
+  // We size the hedge and accrue the spend bucket off ACTUAL fills, not the (often-larger) submitted
+  // order, because GTC limits only partially fill on thin books. The remaining resting shares are
+  // picked up later by the balance poller.
+  const respObj = resp as { takingAmount?: string; makingAmount?: string };
+  const filledShares = parseFloat(respObj.takingAmount ?? "0") || 0;
+  const filledUsdc = parseFloat(respObj.makingAmount ?? "0") || 0;
+
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
-  const pUsdForLog = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
-  const msg = `copy posted · ${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
+  const intendedPUsd = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
+  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
 
-  // After a successful live BUY, update sharesByToken, reconcile the hedge, and record spend.
-  // On a successful live SELL, reset the side's spend bucket (current code does full liquidation).
+  // After a successful live BUY, update sharesByToken from the ACTUAL fill, reconcile the hedge,
+  // and accrue the actual USDC spent. On a successful live SELL, reset the side's spend bucket.
   if (digest.side === "buy") {
-    addSideSpent(cfg.targetAddress, digest.tokenId, clippedUsdc ?? 0);
-    await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash);
+    addSideSpent(cfg.targetAddress, digest.tokenId, filledUsdc);
+    await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash);
   } else {
     resetSideSpent(cfg.targetAddress, digest.tokenId);
   }
