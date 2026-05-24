@@ -22,6 +22,9 @@ max_position_usdc = 100
 # (Up and Down each get their own bucket — total per market can reach 2× this value).
 # Buys are clipped to fit; full sells reset the side. Omit = no cap.
 # max_market_usdc = 100
+# Whether the withdrawal watcher polls this wallet for fund outflows (alerts if funds drain out —
+# a sign the trader may be rotating to a new address). Default false — opt in per target.
+# watch_withdrawals = true
 
 [[targets]]
 address = "0xe71a099e3a4499458de60a1daba70ab649cd6944"

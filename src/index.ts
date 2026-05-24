@@ -7,6 +7,7 @@ import type { AppConfig } from "./env.js";
 import { loadAppConfig, mergeCopyTradeConfig } from "./env.js";
 import { startMempoolWatcher } from "./mempool.js";
 import { aggregatePusdForTargets } from "./pusdTransfers.js";
+import { startWithdrawalWatcher } from "./withdrawalWatcher.js";
 
 function formatLogErr(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -144,6 +145,14 @@ async function main() {
       void appendWatcherLineToAllTargetLogs(`[watcher] ${context}: ${formatLogErr(err)}`, config);
     }
   );
+
+  // Watch enabled target wallets for fund withdrawals (funds leaving → trader may have rotated address).
+  startWithdrawalWatcher(config);
+  if (config.withdrawalWatchAddresses.length > 0) {
+    console.info(
+      `withdrawal watcher: polling ${config.withdrawalWatchAddresses.length} target(s) every ${config.withdrawalPollMinutes}m (alert threshold $${config.withdrawalAlertUsd})`
+    );
+  }
 }
 
 void main();

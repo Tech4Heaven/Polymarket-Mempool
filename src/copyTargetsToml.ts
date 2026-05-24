@@ -28,6 +28,8 @@ export type TomlDefaultsSection = {
    * Buys are clipped to fit; full sells reset the side's bucket. Omit = no cap.
    */
   max_market_usdc?: number;
+  /** Whether the withdrawal watcher polls this wallet for fund outflows. Default false (opt-in). */
+  watch_withdrawals?: boolean;
 };
 
 export type TomlTargetRow = {
@@ -42,6 +44,7 @@ export type TomlTargetRow = {
   dry_run?: boolean;
   hedge_price?: number;
   max_market_usdc?: number;
+  watch_withdrawals?: boolean;
 };
 
 export type ParsedCopyTargetsToml = {
@@ -104,6 +107,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       dry_run: boolOrUndef("dry_run", src),
       hedge_price: numOrUndef("hedge_price", src),
       max_market_usdc: numOrUndef("max_market_usdc", src),
+      watch_withdrawals: boolOrUndef("watch_withdrawals", src),
     };
   }
 
@@ -134,6 +138,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       dry_run: boolOrUndef("dry_run", row),
       hedge_price: numOrUndef("hedge_price", row),
       max_market_usdc: numOrUndef("max_market_usdc", row),
+      watch_withdrawals: boolOrUndef("watch_withdrawals", row),
     });
   }
 

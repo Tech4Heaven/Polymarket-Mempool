@@ -99,10 +99,16 @@ export type AppConfig = {
   polygonMempoolHttpUrl: string;
   /** Trader wallets to watch in the mempool matcher. */
   targetTraderAddresses: string[];
+  /** Subset of targets the withdrawal watcher polls (per-target `watch_withdrawals`, default false). */
+  withdrawalWatchAddresses: string[];
   /** Checksum address → sizing + log file; subset of targets that participate in copy trading. */
   targetCopyProfiles: Map<string, TargetCopyParams>;
   exchangeAddresses: string[];
   maxConcurrentTxLookups: number;
+  /** Withdrawal watcher poll interval (minutes). */
+  withdrawalPollMinutes: number;
+  /** Withdrawal watcher alert threshold (USDC) — net cash outflow above this triggers an alert. */
+  withdrawalAlertUsd: number;
   /** Shared CLOB wallet and endpoints; null disables posting copy orders. */
   copyTradeShared: CopyTradeShared | null;
 };
@@ -250,7 +256,12 @@ async function resolveLogBasename(
 
 function loadRpcOnly(): Pick<
   AppConfig,
-  "polygonWssUrl" | "polygonMempoolHttpUrl" | "exchangeAddresses" | "maxConcurrentTxLookups"
+  | "polygonWssUrl"
+  | "polygonMempoolHttpUrl"
+  | "exchangeAddresses"
+  | "maxConcurrentTxLookups"
+  | "withdrawalPollMinutes"
+  | "withdrawalAlertUsd"
 > {
   const polygonWssUrl = requireEnv("POLYGON_WSS_URL");
   const polygonMempoolHttpUrl =
@@ -266,7 +277,19 @@ function loadRpcOnly(): Pick<
   const maxRaw = process.env["MAX_CONCURRENT_TX_LOOKUPS"]?.trim();
   const maxConcurrentTxLookups = maxRaw ? Math.max(1, parseInt(maxRaw, 10) || 5) : 5;
 
-  return { polygonWssUrl, polygonMempoolHttpUrl, exchangeAddresses, maxConcurrentTxLookups };
+  const pollRaw = process.env["WITHDRAWAL_POLL_MINUTES"]?.trim();
+  const withdrawalPollMinutes = pollRaw ? Math.max(1, parseFloat(pollRaw) || 3) : 3;
+  const alertRaw = process.env["WITHDRAWAL_ALERT_USD"]?.trim();
+  const withdrawalAlertUsd = alertRaw ? Math.max(0, parseFloat(alertRaw) || 50) : 50;
+
+  return {
+    polygonWssUrl,
+    polygonMempoolHttpUrl,
+    exchangeAddresses,
+    maxConcurrentTxLookups,
+    withdrawalPollMinutes,
+    withdrawalAlertUsd,
+  };
 }
 
 /**
@@ -286,6 +309,11 @@ export async function loadAppConfig(): Promise<AppConfig> {
     const shared = await loadCopyTradeSharedFromEnv();
 
     const targetTraderAddresses = parsed.targets.map((t) => t.address);
+    // Withdrawal watch is independent of copy trading — built from the TOML flag (default false;
+    // opt in per target or via [defaults]). Works even when copy trading is disabled.
+    const withdrawalWatchAddresses = parsed.targets
+      .filter((t) => (t.watch_withdrawals ?? defaults.watch_withdrawals ?? false) === true)
+      .map((t) => t.address);
     const targetCopyProfiles = new Map<string, TargetCopyParams>();
 
     if (shared) {
@@ -363,6 +391,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
     return {
       ...rpc,
       targetTraderAddresses,
+      withdrawalWatchAddresses,
       targetCopyProfiles,
       copyTradeShared: shared,
     };
@@ -428,6 +457,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
   return {
     ...rpc,
     targetTraderAddresses,
+    // Legacy env-only path has no per-target watch flag — default off (use TOML to enable).
+    withdrawalWatchAddresses: [],
     targetCopyProfiles,
     copyTradeShared: shared,
   };
