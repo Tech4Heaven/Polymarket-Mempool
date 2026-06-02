@@ -699,6 +699,36 @@ async function recordCopyBuyAndReconcile(
 }
 
 /**
+ * Record a successful SELL copy in state (subtractive from sharesByToken, clamped at 0) and
+ * reconcile the hedge. Mirrors recordCopyBuyAndReconcile — when our held position shrinks, the
+ * existing hedge on the opposite side becomes oversized; reconcile resizes (or cancels) it
+ * immediately rather than waiting for the next poller tick.
+ */
+async function recordCopySellAndReconcile(
+  cfg: CopyTradeConfig,
+  client: ClobClient,
+  soldTokenId: string,
+  sharesSold: number,
+  txHash: string
+): Promise<void> {
+  if (cfg.hedgePrice === undefined) {
+    return;
+  }
+  const state = await getOrCreateHedgeState(cfg, soldTokenId);
+  if (!state) {
+    // No existing condition state means there was no hedge to adjust — nothing to do.
+    return;
+  }
+
+  await runExclusive(state, async () => {
+    const current = state.sharesByToken.get(soldTokenId) ?? 0;
+    state.sharesByToken.set(soldTokenId, Math.max(0, current - sharesSold));
+    state.lastActivityMs = Date.now();
+    await reconcileHedge(cfg, client, state, txHash);
+  });
+}
+
+/**
  * Option-2 suppression: only suppress if our hedge actually filled. If the hedge is resting
  * unfilled, cancel it (to prevent double-hedge later when the cheap price might fill behind us)
  * and don't suppress — let the bot copy the target's opposite-side buy at fair price instead.
@@ -1016,13 +1046,15 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     OrderType.GTC
   );
 
-  // Actual fill from the CLOB response — for a BUY: takingAmount=shares acquired, makingAmount=USDC paid.
-  // We size the hedge and accrue the spend bucket off ACTUAL fills, not the (often-larger) submitted
-  // order, because GTC limits only partially fill on thin books. The remaining resting shares are
-  // picked up later by the balance poller.
+  // Actual fill from the CLOB response. The labels flip by side:
+  //   BUY  → takingAmount = shares acquired, makingAmount = USDC paid
+  //   SELL → makingAmount = shares given,    takingAmount = USDC received
+  // (the order maker "makes" the asset they post and "takes" the asset they want).
   const respObj = resp as { takingAmount?: string; makingAmount?: string };
-  const filledShares = parseFloat(respObj.takingAmount ?? "0") || 0;
-  const filledUsdc = parseFloat(respObj.makingAmount ?? "0") || 0;
+  const taking = parseFloat(respObj.takingAmount ?? "0") || 0;
+  const making = parseFloat(respObj.makingAmount ?? "0") || 0;
+  const filledShares = digest.side === "buy" ? taking : making;
+  const filledUsdc = digest.side === "buy" ? making : taking;
 
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
   const intendedPUsd = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
@@ -1030,12 +1062,15 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
 
-  // After a successful live BUY, update sharesByToken from the ACTUAL fill, reconcile the hedge,
-  // and accrue the actual USDC spent. On a successful live SELL, reset the side's spend bucket.
+  // After a successful live BUY: add filled shares to sharesByToken and reconcile (hedge grows).
+  // After a successful live SELL: subtract filled shares from sharesByToken and reconcile so
+  //   the now-oversized hedge is resized or cancelled IMMEDIATELY (don't wait for the poller).
+  // Bucket: BUY accrues actual USDC spent; SELL resets the side's bucket (full-exit semantics).
   if (digest.side === "buy") {
     addSideSpent(cfg.targetAddress, digest.tokenId, filledUsdc);
     await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash);
   } else {
+    await recordCopySellAndReconcile(cfg, client, digest.tokenId, filledShares, txHash);
     resetSideSpent(cfg.targetAddress, digest.tokenId);
   }
 }
