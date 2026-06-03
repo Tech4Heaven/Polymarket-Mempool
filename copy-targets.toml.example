@@ -25,6 +25,15 @@ max_position_usdc = 100
 # Whether the withdrawal watcher polls this wallet for fund outflows (alerts if funds drain out —
 # a sign the trader may be rotating to a new address). Default false — opt in per target.
 # watch_withdrawals = true
+# If true, sub-min buys are accumulated per (target, tokenId) and a single combined order is posted
+# when the buffered total (plus the next incoming buy) crosses min_position_usdc. Default false.
+# Useful for targets that dribble in many tiny buys you'd otherwise drop. Buffer expires after 15
+# min idle; cleared if the target sells the same token (exit).
+# accumulate_below_min = true
+# Master enable/disable for the row. When false, the bot does NOTHING for this address — no copy,
+# no mempool match, no withdrawal poll. Default true. Handy to temporarily pause a target without
+# deleting its config.
+# enabled = false
 
 [[targets]]
 address = "0xe71a099e3a4499458de60a1daba70ab649cd6944"

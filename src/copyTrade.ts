@@ -118,11 +118,10 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
 
-/** On-chain amounts from the copied wallet trade (USDC + outcome tokens, 6 decimals each). */
-function formatOriginTradeSizing(digest: CopyDigest): string {
-  const pUSD = parseFloat(formatUnits(digest.pusdRaw, 6)).toFixed(6);
-  const shares = parseFloat(formatUnits(digest.outcomeRaw, 6)).toFixed(6);
-  return `origin pUSD=${pUSD} shares=${shares}`;
+/** On-chain amounts from the copied wallet trade (USDC + outcome tokens, 6 decimals each).
+ *  Takes numbers so accumulator-flushed copies can report combined origin sizing. */
+function formatOriginTradeSizing(originPusd: number, originShares: number): string {
+  return `origin pUSD=${originPusd.toFixed(6)} shares=${originShares.toFixed(6)}`;
 }
 
 async function logCopySkip(
@@ -242,6 +241,65 @@ function addSideSpent(targetAddress: string, tokenId: string, usdcDelta: number)
 
 function resetSideSpent(targetAddress: string, tokenId: string): void {
   sideSpendByTargetToken.delete(sideSpendKey(targetAddress, tokenId));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Below-min accumulator — buffer per (target, tokenId) for `accumulate_below_min`
+// ─────────────────────────────────────────────────────────────────────────────
+
+type BufferEntry = {
+  originPusd: number;
+  originShares: number;
+  notionalUsdc: number; // = originPusd × copy_ratio at skip time
+  impliedPrice: number; // for the weighted-avg implied check at flush
+  txHash: string;
+  timestamp: number;
+};
+
+type SkipBuffer = {
+  entries: BufferEntry[];
+  totalOriginPusd: number;
+  totalOriginShares: number;
+  totalNotionalUsdc: number;
+};
+
+const skipBufferByTargetToken = new Map<string, SkipBuffer>();
+const SKIP_BUFFER_TTL_MS = 15 * 60_000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, buf] of skipBufferByTargetToken) {
+    const oldest = buf.entries[0]?.timestamp ?? now;
+    if (now - oldest > SKIP_BUFFER_TTL_MS) {
+      skipBufferByTargetToken.delete(k);
+    }
+  }
+}, 5 * 60_000).unref();
+
+function skipBufferKey(targetAddress: string, tokenId: string): string {
+  return `${targetAddress.toLowerCase()}:${tokenId}`;
+}
+
+function getSkipBuffer(targetAddress: string, tokenId: string): SkipBuffer | undefined {
+  return skipBufferByTargetToken.get(skipBufferKey(targetAddress, tokenId));
+}
+
+function pushSkipBuffer(targetAddress: string, tokenId: string, entry: BufferEntry): SkipBuffer {
+  const k = skipBufferKey(targetAddress, tokenId);
+  let buf = skipBufferByTargetToken.get(k);
+  if (!buf) {
+    buf = { entries: [], totalOriginPusd: 0, totalOriginShares: 0, totalNotionalUsdc: 0 };
+    skipBufferByTargetToken.set(k, buf);
+  }
+  buf.entries.push(entry);
+  buf.totalOriginPusd += entry.originPusd;
+  buf.totalOriginShares += entry.originShares;
+  buf.totalNotionalUsdc += entry.notionalUsdc;
+  return buf;
+}
+
+function clearSkipBuffer(targetAddress: string, tokenId: string): void {
+  skipBufferByTargetToken.delete(skipBufferKey(targetAddress, tokenId));
 }
 
 function buildSigner(cfg: CopyTradeConfig) {
@@ -847,10 +905,19 @@ export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig): Promise<voi
 export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest, txHash: string): Promise<void> {
   const implied = impliedPrice(digest.pusdRaw, digest.outcomeRaw);
   const originPusd = parseFloat(formatUnits(digest.pusdRaw, 6));
+  const originShares = parseFloat(formatUnits(digest.outcomeRaw, 6));
   if (!Number.isFinite(implied) || implied <= 0) {
     await logCopySkip(`bad implied on-chain price · token=${digest.tokenId}`, digest, txHash, cfg);
     return;
   }
+
+  // Effective values — overwritten when the below-min accumulator combines this trade with
+  // previously-buffered sub-min trades. For drift checks and logging we want the COMBINED
+  // implied (weighted by origin USDC) and the COMBINED origin pUSD/shares.
+  let effectiveImplied = implied;
+  let effectiveOriginPusd = originPusd;
+  let effectiveOriginShares = originShares;
+  let flushedFromBufferCount = 0;
 
   // ── Pre-CLOB cheap filters: fail fast before spending any API budget ──────────────────
   // For BUY: notional sizing only depends on origin pUSD + copy_ratio + config thresholds.
@@ -858,7 +925,45 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   let clippedUsdc: number | null = null;
   if (digest.side === "buy") {
     const usdcNotional = originPusd * cfg.copyRatio;
-    if (usdcNotional < cfg.minPositionUsdc) {
+
+    // Combine with any existing accumulator buffer for this (target, tokenId), if the feature
+    // is enabled. The buffer holds prior sub-min trades whose combined notional is still < min.
+    let combinedNotional = usdcNotional;
+    if (cfg.accumulateBelowMin) {
+      const buf = getSkipBuffer(cfg.targetAddress, digest.tokenId);
+      if (buf) {
+        combinedNotional += buf.totalNotionalUsdc;
+        effectiveOriginPusd += buf.totalOriginPusd;
+        effectiveOriginShares += buf.totalOriginShares;
+        flushedFromBufferCount = buf.entries.length;
+        // Weighted-avg implied across all combined origin trades (sums-of-pUSD / sums-of-shares).
+        effectiveImplied = effectiveOriginShares > 0 ? effectiveOriginPusd / effectiveOriginShares : implied;
+      }
+    }
+
+    if (combinedNotional < cfg.minPositionUsdc) {
+      if (cfg.accumulateBelowMin) {
+        // Still below min after combining — append the current trade to the buffer (don't clear
+        // existing entries; they keep accumulating). Skip without posting; the buffer will be
+        // flushed on a future trade that pushes the combined total past min.
+        pushSkipBuffer(cfg.targetAddress, digest.tokenId, {
+          originPusd,
+          originShares,
+          notionalUsdc: usdcNotional,
+          impliedPrice: implied,
+          txHash,
+          timestamp: Date.now(),
+        });
+        const buf = getSkipBuffer(cfg.targetAddress, digest.tokenId)!;
+        await logCopySkip(
+          `accumulating below min · combined notional $${combinedNotional.toFixed(4)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · buffer entries=${buf.entries.length} totalOriginPusd=$${buf.totalOriginPusd.toFixed(4)} avgImplied=${(buf.totalOriginShares > 0 ? buf.totalOriginPusd / buf.totalOriginShares : 0).toFixed(4)}`,
+          digest,
+          txHash,
+          cfg
+        );
+        return;
+      }
+      // Original behavior: drop the trade.
       await logCopySkip(
         `pUSD ${usdcNotional.toFixed(6)} < MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
         digest,
@@ -867,7 +972,18 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       );
       return;
     }
-    clippedUsdc = clamp(usdcNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
+
+    // Combined >= min — we will attempt to post. Clear the buffer now. If later checks (drift,
+    // bounds, cap) fail, the buffer stays cleared on purpose: drift only widens as time passes,
+    // and re-buffering a failed combined trade just postpones a guaranteed-failing retry.
+    if (cfg.accumulateBelowMin && flushedFromBufferCount > 0) {
+      clearSkipBuffer(cfg.targetAddress, digest.tokenId);
+      const flushMsg = `accumulator flush · combined notional $${combinedNotional.toFixed(4)} from ${flushedFromBufferCount} buffered + current · weighted implied=${effectiveImplied.toFixed(4)} · token=${digest.tokenId}`;
+      console.log(flushMsg);
+      void appendCopyTradeSuccessLine(flushMsg, cfg.copyTradeLogPath);
+    }
+
+    clippedUsdc = clamp(combinedNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
 
     // Per-target per-side cap: clip down to remaining bucket capacity. Skip if remaining
     // wouldn't satisfy min_position_usdc — we don't post sub-min orders.
@@ -937,13 +1053,14 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       return;
     }
 
-    // Option A drift check: compare the price we'd ACTUALLY pay (effectivePrice) against implied,
-    // not the midpoint. Catches wide-spread books where midpoint passes but ask is much higher.
+    // Option A drift check: compare the price we'd ACTUALLY pay (effectivePrice) against the
+    // EFFECTIVE implied (weighted across any flushed buffer entries), not the midpoint. Catches
+    // wide-spread books where midpoint passes but ask is much higher.
     const effectivePrice = Math.max(currentPrice, ask);
-    const drift = effectivePrice - implied;
+    const drift = effectivePrice - effectiveImplied;
     if (drift > cfg.maxPriceDifference) {
       await logCopySkip(
-        `price drift buy · implied(on-chain)=${implied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · ${formatOriginTradeSizing(digest)}`,
+        `price drift buy · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
         digest,
         txHash,
         cfg
@@ -955,7 +1072,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
 
     if (cfg.buyPriceMin !== undefined && limitPrice < cfg.buyPriceMin) {
       await logCopySkip(
-        `buy limitPrice=${limitPrice.toFixed(4)} below buy_price_min=${cfg.buyPriceMin} · ${formatOriginTradeSizing(digest)}`,
+        `buy limitPrice=${limitPrice.toFixed(4)} below buy_price_min=${cfg.buyPriceMin} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}`,
         digest,
         txHash,
         cfg
@@ -964,7 +1081,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     }
     if (cfg.buyPriceMax !== undefined && limitPrice > cfg.buyPriceMax) {
       await logCopySkip(
-        `buy limitPrice=${limitPrice.toFixed(4)} above buy_price_max=${cfg.buyPriceMax} · ${formatOriginTradeSizing(digest)}`,
+        `buy limitPrice=${limitPrice.toFixed(4)} above buy_price_max=${cfg.buyPriceMax} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}`,
         digest,
         txHash,
         cfg
@@ -1021,8 +1138,9 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   if (cfg.dryRun) {
     const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
     const pUsdForLog = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
+    const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
     const msg =
-      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${implied.toFixed(4)} · tx=${txHash}`;
+      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${effectiveImplied.toFixed(4)} · tx=${txHash}${flushSuffix}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
     // Track the would-be position so suppression / reconcile / max_market_usdc logs reflect reality.
@@ -1031,6 +1149,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash);
     } else {
       resetSideSpent(cfg.targetAddress, digest.tokenId);
+      clearSkipBuffer(cfg.targetAddress, digest.tokenId);
     }
     return;
   }
@@ -1058,7 +1177,8 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
 
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
   const intendedPUsd = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
-  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${implied.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
+  const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
+  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)} · tx=${txHash}${flushSuffix} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
 
@@ -1072,5 +1192,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   } else {
     await recordCopySellAndReconcile(cfg, client, digest.tokenId, filledShares, txHash);
     resetSideSpent(cfg.targetAddress, digest.tokenId);
+    // Target exited this side — any pending below-min accumulator entries are now stale.
+    clearSkipBuffer(cfg.targetAddress, digest.tokenId);
   }
 }

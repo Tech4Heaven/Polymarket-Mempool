@@ -65,6 +65,8 @@ export type TargetCopyParams = {
    * reset the side's bucket. Omit = no cap.
    */
   maxMarketUsdc?: number;
+  /** If true, accumulate below-min buys per (target, tokenId) and post a combined order when their sum crosses min. */
+  accumulateBelowMin?: boolean;
   copyTradeLogPath: string;
 };
 
@@ -81,6 +83,8 @@ export type CopyTradeConfig = CopyTradeShared & {
   hedgePrice?: number;
   /** Per-target per-side max USDC cap. Omit = no cap. */
   maxMarketUsdc?: number;
+  /** Per-target below-min accumulator toggle. */
+  accumulateBelowMin?: boolean;
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -129,6 +133,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     dryRun: p.dryRun,
     hedgePrice: p.hedgePrice,
     maxMarketUsdc: p.maxMarketUsdc,
+    accumulateBelowMin: p.accumulateBelowMin,
     targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
@@ -308,10 +313,20 @@ export async function loadAppConfig(): Promise<AppConfig> {
     const defaults = parsed.defaults ?? {};
     const shared = await loadCopyTradeSharedFromEnv();
 
-    const targetTraderAddresses = parsed.targets.map((t) => t.address);
+    // Master gate: rows where `enabled = false` are dropped from EVERY downstream list — no copy,
+    // no mempool match, no withdrawal poll. Default true (preserves backward compat).
+    const activeTargets = parsed.targets.filter(
+      (t) => (t.enabled ?? defaults.enabled ?? true) === true
+    );
+    if (activeTargets.length < parsed.targets.length) {
+      const disabled = parsed.targets.length - activeTargets.length;
+      console.info(`copy-targets.toml: ${disabled} target(s) disabled via enabled=false — bot will ignore them entirely.`);
+    }
+
+    const targetTraderAddresses = activeTargets.map((t) => t.address);
     // Withdrawal watch is independent of copy trading — built from the TOML flag (default false;
     // opt in per target or via [defaults]). Works even when copy trading is disabled.
-    const withdrawalWatchAddresses = parsed.targets
+    const withdrawalWatchAddresses = activeTargets
       .filter((t) => (t.watch_withdrawals ?? defaults.watch_withdrawals ?? false) === true)
       .map((t) => t.address);
     const targetCopyProfiles = new Map<string, TargetCopyParams>();
@@ -320,7 +335,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
       const logsDir = resolve(cwd, "logs");
       await mkdir(logsDir, { recursive: true });
 
-      for (const row of parsed.targets) {
+      for (const row of activeTargets) {
         const copyRatio = requireNum("copy_ratio", row.copy_ratio ?? defaults.copy_ratio, `targets ${row.address}`);
         const maxPriceDifference = requireNum(
           "max_price_difference",
@@ -372,6 +387,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
           maxMarketUsdc = maxMarketUsdcRaw;
         }
 
+        const accumulateBelowMin = row.accumulate_below_min ?? defaults.accumulate_below_min ?? false;
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -383,6 +400,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           dryRun,
           hedgePrice,
           maxMarketUsdc,
+          accumulateBelowMin,
           copyTradeLogPath,
         });
       }

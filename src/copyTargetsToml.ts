@@ -30,6 +30,17 @@ export type TomlDefaultsSection = {
   max_market_usdc?: number;
   /** Whether the withdrawal watcher polls this wallet for fund outflows. Default false (opt-in). */
   watch_withdrawals?: boolean;
+  /**
+   * If true, buys whose post-ratio notional is below `min_position_usdc` are accumulated per market
+   * side. The bot posts ONE combined order as soon as the accumulator (plus the next incoming buy)
+   * crosses the threshold. Default false (original behavior — drop sub-min trades).
+   */
+  accumulate_below_min?: boolean;
+  /**
+   * Master enable/disable for this target. When false, the bot does NOTHING for the address —
+   * not copy trading, not withdrawal watching, not mempool event matching. Default true.
+   */
+  enabled?: boolean;
 };
 
 export type TomlTargetRow = {
@@ -45,6 +56,8 @@ export type TomlTargetRow = {
   hedge_price?: number;
   max_market_usdc?: number;
   watch_withdrawals?: boolean;
+  accumulate_below_min?: boolean;
+  enabled?: boolean;
 };
 
 export type ParsedCopyTargetsToml = {
@@ -108,6 +121,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       hedge_price: numOrUndef("hedge_price", src),
       max_market_usdc: numOrUndef("max_market_usdc", src),
       watch_withdrawals: boolOrUndef("watch_withdrawals", src),
+      accumulate_below_min: boolOrUndef("accumulate_below_min", src),
+      enabled: boolOrUndef("enabled", src),
     };
   }
 
@@ -139,6 +154,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       hedge_price: numOrUndef("hedge_price", row),
       max_market_usdc: numOrUndef("max_market_usdc", row),
       watch_withdrawals: boolOrUndef("watch_withdrawals", row),
+      accumulate_below_min: boolOrUndef("accumulate_below_min", row),
+      enabled: boolOrUndef("enabled", row),
     });
   }
 
