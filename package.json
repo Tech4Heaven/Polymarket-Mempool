@@ -9,6 +9,7 @@
     "encrypt-wallet": "tsx scripts/encryptWalletJson.ts",
     "check-wallet": "tsx scripts/checkWalletJson.ts",
     "test-clob-btc-5m": "tsx scripts/testClobBtc5mCheapBuy.ts",
+    "find-thresholds": "tsx scripts/findThresholds.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
