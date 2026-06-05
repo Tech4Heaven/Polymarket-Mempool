@@ -1056,11 +1056,23 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     // Option A drift check: compare the price we'd ACTUALLY pay (effectivePrice) against the
     // EFFECTIVE implied (weighted across any flushed buffer entries), not the midpoint. Catches
     // wide-spread books where midpoint passes but ask is much higher.
+    // Overbid (effective > implied): skip when drift > max_price_difference (market moved up,
+    // we'd pay too much vs target). Underbid (effective < implied): skip when drift below
+    // -max_underbid_difference (market moved down too much, signals target's bet is going wrong).
     const effectivePrice = Math.max(currentPrice, ask);
     const drift = effectivePrice - effectiveImplied;
     if (drift > cfg.maxPriceDifference) {
       await logCopySkip(
         `price drift buy · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
+        digest,
+        txHash,
+        cfg
+      );
+      return;
+    }
+    if (cfg.maxUnderbidDifference !== undefined && -drift > cfg.maxUnderbidDifference) {
+      await logCopySkip(
+        `underbid skip · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} underbid=${(-drift).toFixed(4)} maxUnderbid=${cfg.maxUnderbidDifference} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
         digest,
         txHash,
         cfg

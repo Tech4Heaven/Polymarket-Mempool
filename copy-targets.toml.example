@@ -5,7 +5,13 @@
 [defaults]
 # Defaults for every [[targets]] row (each field can be overridden per target)
 copy_ratio = 1
+# Overbid skip: when effective ask > target's implied by more than this, skip the copy
+# (market moved up faster than us — we'd pay too much).
 max_price_difference = 0.1
+# Underbid skip (optional): when effective ask < target's implied by more than this, skip the copy
+# (market re-priced AWAY from target's side in the gap between their fill and ours — strong
+# signal the target's read is wrong). Omit = no underbid skip (mirror at the cheaper price).
+# max_underbid_difference = 0.15
 # Buy only: optional absolute outcome price bounds in [0, 1] (omit either side for no limit)
 # buy_price_min = 0.05
 # buy_price_max = 0.85

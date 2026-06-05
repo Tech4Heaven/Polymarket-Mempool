@@ -45,6 +45,8 @@ export type TargetCopyParams = {
   address: string;
   copyRatio: number;
   maxPriceDifference: number;
+  /** Buy only: skip if (implied - effectivePrice) > this. Undefined = no underbid skip. */
+  maxUnderbidDifference?: number;
   /** Buy only: skip if limit price is below this (undefined = no floor). Outcome price in (0,1). */
   buyPriceMin?: number;
   /** Buy only: skip if limit price is above this (undefined = no cap). Outcome price in (0,1). */
@@ -73,6 +75,7 @@ export type TargetCopyParams = {
 export type CopyTradeConfig = CopyTradeShared & {
   copyRatio: number;
   maxPriceDifference: number;
+  maxUnderbidDifference?: number;
   buyPriceMin?: number;
   buyPriceMax?: number;
   minPositionUsdc: number;
@@ -126,6 +129,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     clobHost: shared.clobHost,
     copyRatio: p.copyRatio,
     maxPriceDifference: p.maxPriceDifference,
+    maxUnderbidDifference: p.maxUnderbidDifference,
     buyPriceMin: p.buyPriceMin,
     buyPriceMax: p.buyPriceMax,
     minPositionUsdc: p.minPositionUsdc,
@@ -342,6 +346,17 @@ export async function loadAppConfig(): Promise<AppConfig> {
           row.max_price_difference ?? defaults.max_price_difference,
           `targets ${row.address}`
         );
+        const maxUnderbidDifferenceRaw =
+          row.max_underbid_difference ?? defaults.max_underbid_difference;
+        let maxUnderbidDifference: number | undefined;
+        if (maxUnderbidDifferenceRaw !== undefined) {
+          if (!Number.isFinite(maxUnderbidDifferenceRaw) || maxUnderbidDifferenceRaw < 0) {
+            throw new Error(
+              `targets ${row.address}: max_underbid_difference must be a non-negative number`
+            );
+          }
+          maxUnderbidDifference = maxUnderbidDifferenceRaw;
+        }
         const minPositionUsdc = requireNum(
           "min_position_usdc",
           row.min_position_usdc ?? defaults.min_position_usdc,
@@ -393,6 +408,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           address: row.address,
           copyRatio,
           maxPriceDifference,
+          maxUnderbidDifference,
           buyPriceMin,
           buyPriceMax,
           minPositionUsdc,
@@ -423,6 +439,15 @@ export async function loadAppConfig(): Promise<AppConfig> {
   if (shared) {
     const copyRatio = parsePositiveFloatEnv("COPY_RATIO");
     const maxPriceDifference = parsePositiveFloatEnv("MAX_PRICE_DIFFERENCE");
+    const maxUnderbidRaw = process.env["MAX_UNDERBID_DIFFERENCE"]?.trim();
+    let maxUnderbidDifference: number | undefined;
+    if (maxUnderbidRaw) {
+      const n = parseFloat(maxUnderbidRaw);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new Error("MAX_UNDERBID_DIFFERENCE must be a non-negative number when set");
+      }
+      maxUnderbidDifference = n;
+    }
     const minPositionUsdc = parsePositiveFloatEnv("MIN_POSITION_USDC");
     const maxPositionUsdc = parsePositiveFloatEnv("MAX_POSITION_USDC");
     if (minPositionUsdc > maxPositionUsdc) {
@@ -445,6 +470,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
         address: addr,
         copyRatio,
         maxPriceDifference,
+        maxUnderbidDifference,
         buyPriceMin,
         buyPriceMax,
         minPositionUsdc,

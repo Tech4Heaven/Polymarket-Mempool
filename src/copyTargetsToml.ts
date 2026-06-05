@@ -7,6 +7,8 @@ export type TomlDefaultsSection = {
   /** Defaults applied to each [[targets]] row when a field is omitted */
   copy_ratio?: number;
   max_price_difference?: number;
+  /** Buy only: skip when (implied - effectivePrice) > this. Omit for no underbid skip. */
+  max_underbid_difference?: number;
   /** Buy only: outcome price in [0,1]; omit for no floor */
   buy_price_min?: number;
   /** Buy only: outcome price in [0,1]; omit for no ceiling */
@@ -48,6 +50,7 @@ export type TomlTargetRow = {
   username?: string;
   copy_ratio?: number;
   max_price_difference?: number;
+  max_underbid_difference?: number;
   buy_price_min?: number;
   buy_price_max?: number;
   min_position_usdc?: number;
@@ -113,6 +116,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
     defaults = {
       copy_ratio: numOrUndef("copy_ratio", src),
       max_price_difference: numOrUndef("max_price_difference", src),
+      max_underbid_difference: numOrUndef("max_underbid_difference", src),
       buy_price_min: numOrUndef("buy_price_min", src),
       buy_price_max: numOrUndef("buy_price_max", src),
       min_position_usdc: numOrUndef("min_position_usdc", src),
@@ -146,6 +150,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       username: strOrUndef("username", row),
       copy_ratio: numOrUndef("copy_ratio", row),
       max_price_difference: numOrUndef("max_price_difference", row),
+      max_underbid_difference: numOrUndef("max_underbid_difference", row),
       buy_price_min: numOrUndef("buy_price_min", row),
       buy_price_max: numOrUndef("buy_price_max", row),
       min_position_usdc: numOrUndef("min_position_usdc", row),
