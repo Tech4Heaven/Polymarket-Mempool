@@ -4,3 +4,6 @@ dist/
 *.log
 copy-targets.toml
 euqoriueusu.json
+.claude/settings.local.json
+temp/
+json/
