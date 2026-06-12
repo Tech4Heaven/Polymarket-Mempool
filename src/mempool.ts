@@ -171,16 +171,34 @@ export function startMempoolWatcher(
   };
 
   const bindProvider = (p: WebSocketProvider) => {
+    // Capture whether this bind is a reconnect (vs. the initial startup bind). We log a success
+    // line only on reconnect so the user can tell when the bot is back online after a drop.
+    const wasReconnect = reconnectAttempt > 0;
+    const attemptAtBind = reconnectAttempt;
+
     // ethers handles eth_subscribe internally for log filters via SocketEventSubscriber.
     // Two listeners — one for maker-side fills, one for taker-side. Same processLog handles both.
-    p.on(filterMaker, processLog).catch?.((err: unknown) => {
+    const subMaker = p.on(filterMaker, processLog);
+    const subTaker = p.on(filterTaker, processLog);
+    subMaker.catch?.((err: unknown) => {
       onError(err, "subscribe filterMaker failed");
       void reconnect("subscribe failed");
     });
-    p.on(filterTaker, processLog).catch?.((err: unknown) => {
+    subTaker.catch?.((err: unknown) => {
       onError(err, "subscribe filterTaker failed");
       void reconnect("subscribe failed");
     });
+    // Log when both subscribes resolve — proves WSS handshake + eth_subscribe both succeeded.
+    Promise.all([subMaker, subTaker])
+      .then(() => {
+        if (wasReconnect) {
+          console.log(
+            `[watcher] reconnected · subscriptions re-armed after ${attemptAtBind} attempt(s)`
+          );
+        }
+      })
+      .catch(() => undefined); // individual catches above already handle the error/reconnect path
+
     // Backoff only resets after the new connection has survived STABILITY_MS without
     // erroring — proves the WSS is genuinely stable, not just initiating a handshake
     // that the provider is about to drop.
