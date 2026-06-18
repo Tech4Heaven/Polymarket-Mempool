@@ -1,0 +1,45 @@
+/**
+ * PM2 config for the copy bot.
+ *
+ * Wallet passphrase comes from process.env.COPY_WALLET_KEY_PASSPHRASE — set transiently
+ * by ./start-bot.sh (interactively-entered, never stored on disk). The bot reads it via
+ * src/promptWalletPassphrase.ts at startup instead of prompting.
+ *
+ * Start:        ./start-bot.sh
+ * Logs:         pm2 logs bot
+ * Stop:         pm2 stop bot
+ * Restart:      pm2 restart bot   (reuses cached env; no re-prompt needed)
+ * Delete:       pm2 delete bot    (next start needs ./start-bot.sh again)
+ */
+
+const path = require("path");
+const cwd = __dirname;
+
+module.exports = {
+  apps: [
+    {
+      name: "bot",
+      script: path.join(cwd, "node_modules", "tsx", "dist", "cli.mjs"),
+      args: "src/index.ts",
+      cwd,
+      interpreter: "node",
+      instances: 1,
+      exec_mode: "fork",
+      max_restarts: 50,
+      restart_delay: 5_000,
+      min_uptime: "30s",
+      out_file: path.join(cwd, "logs", "pm2-out.log"),
+      error_file: path.join(cwd, "logs", "pm2-err.log"),
+      merge_logs: true,
+      time: true,
+      max_memory_restart: "2G",
+      env: {
+        NODE_ENV: "production",
+        // Path to encrypted wallet JSON, relative to cwd. Override to a different file if
+        // your wallet has a different name; defaults inside the bot use euqoriueusu.json.
+        // COPY_WALLET_KEY_JSON: "euqoriueusu.json",
+        COPY_WALLET_KEY_PASSPHRASE: process.env.COPY_WALLET_KEY_PASSPHRASE,
+      },
+    },
+  ],
+};
