@@ -7,3 +7,4 @@ euqoriueusu.json
 .claude/settings.local.json
 temp/
 json/
+/ecosystem.config.cjs
