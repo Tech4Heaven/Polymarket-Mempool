@@ -141,8 +141,18 @@ async function main() {
       void logMinedTransfers(provider, txHash, matchedTargets, config);
     },
     (err, context) => {
-      console.error(`${context}:`, err);
-      void appendWatcherLineToAllTargetLogs(`[watcher] ${context}: ${formatLogErr(err)}`, config);
+      // One-line message only; stack traces are noise for recoverable network churn (1006s,
+      // 502s, reconnects). The reconnect/recovery path already handles them.
+      const msg = formatLogErr(err);
+      // Use console.warn for "watcher" / "websocket" / "reconnect" events (routine, recoverable),
+      // and console.error only for genuinely unexpected stuff (subscribe failed, processLog, etc.).
+      const isRoutine = /watcher reconnect|websocket (close|error)|provider error|destroy provider/i.test(context);
+      if (isRoutine) {
+        console.warn(`${context}: ${msg}`);
+      } else {
+        console.error(`${context}: ${msg}`);
+      }
+      void appendWatcherLineToAllTargetLogs(`[watcher] ${context}: ${msg}`, config);
     }
   );
 
