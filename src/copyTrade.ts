@@ -391,6 +391,14 @@ type MarketHedgeState = {
   lastActivityMs: number;
   /** Per-condition async mutex (chained promise) so copy- and poll-triggered reconciles serialize. */
   reconcileChain: Promise<void>;
+  /**
+   * Per-target "already-absorbed" marker: key = target address (lowercase), value = tokenId of the
+   * side that was absorbed via a matched hedge fill. Survives `state.hedge = null`. Subsequent
+   * target buys on that side are suppressed PER-TARGET — Target A's hedge absorption can't falsely
+   * suppress Target B's independent same-side trade. Cleared on TTL eviction or on a sell of that
+   * token by the matching target.
+   */
+  absorbedSideByTarget: Map<string, string>;
 };
 
 /** Keyed by conditionId. Resets on process restart (5m markets resolve before restart gaps matter). */
@@ -716,6 +724,7 @@ async function getOrCreateHedgeState(
       cfg,
       lastActivityMs: Date.now(),
       reconcileChain: Promise.resolve(),
+      absorbedSideByTarget: new Map(),
     };
     hedgeStateByCondition.set(opp.conditionId, state);
   } else {
@@ -782,19 +791,62 @@ async function recordCopySellAndReconcile(
     const current = state.sharesByToken.get(soldTokenId) ?? 0;
     state.sharesByToken.set(soldTokenId, Math.max(0, current - sharesSold));
     state.lastActivityMs = Date.now();
+    // If THIS target sold the side we were considering "already absorbed" for them, clear THEIR
+    // marker so a future re-entry on that side by them is copied normally. Other targets'
+    // markers are untouched.
+    const targetKey = cfg.targetAddress.toLowerCase();
+    if (state.absorbedSideByTarget.get(targetKey) === soldTokenId) {
+      state.absorbedSideByTarget.delete(targetKey);
+    }
     await reconcileHedge(cfg, client, state, txHash);
   });
 }
 
 /**
- * Option-2 suppression: only suppress if our hedge actually filled. If the hedge is resting
- * unfilled, cancel it (to prevent double-hedge later when the cheap price might fill behind us)
- * and don't suppress — let the bot copy the target's opposite-side buy at fair price instead.
- *
- * Per user preference, a partial fill counts as "fully done" — the matched portion is rolled into
- * sharesByToken and the unfilled remainder is cancelled.
+ * EARLY suppression check (Case 15 fix, part 1): pure local marker lookup. No CLOB calls.
+ * Suppresses target buys on a side this target already absorbed a hedge fill for, even if all
+ * downstream checks would otherwise let the copy through. Runs FIRST so we don't waste CLOB
+ * calls evaluating a trade we'll suppress anyway.
  */
-async function checkHedgeSuppression(
+async function checkAbsorbedSuppression(
+  cfg: CopyTradeConfig,
+  digest: CopyDigest
+): Promise<{ suppress: boolean; reason?: string }> {
+  if (digest.side !== "buy") {
+    return { suppress: false };
+  }
+  const info = await resolveMarketTokens(digest.tokenId);
+  if (!info) {
+    return { suppress: false };
+  }
+  const state = hedgeStateByCondition.get(info.conditionId);
+  if (!state) {
+    return { suppress: false };
+  }
+  // Per-target "we already absorbed a hedge on this side" marker. Survives state.hedge=null
+  // after a matched-fill consumption; per-target so Target A's absorption can't falsely block
+  // Target B's independent trade on the same condition.
+  const targetKey = cfg.targetAddress.toLowerCase();
+  if (state.absorbedSideByTarget.get(targetKey) === digest.tokenId) {
+    state.lastActivityMs = Date.now();
+    return {
+      suppress: true,
+      reason: `hedge already absorbed earlier for this side · token=${digest.tokenId}`,
+    };
+  }
+  return { suppress: false };
+}
+
+/**
+ * LATE suppression check (Case 15 fix, part 2): handles the resting hedge order. Runs AFTER all
+ * downstream checks (drift, buy_bounds, min_order_size) have passed and we're committed to
+ * posting the copy. This way, if any downstream check would have failed, we never touch the
+ * hedge — eliminating the "cancel-then-fail-to-copy → unhedged" window.
+ *
+ * Per user preference, a partial hedge fill counts as "fully done" — the matched portion is
+ * rolled into sharesByToken and the unfilled remainder is cancelled.
+ */
+async function checkRestingHedgeSuppression(
   cfg: CopyTradeConfig,
   client: ClobClient,
   digest: CopyDigest,
@@ -846,6 +898,8 @@ async function checkHedgeSuppression(
       }
       const existing = state.sharesByToken.get(hedge.tokenId) ?? 0;
       state.sharesByToken.set(hedge.tokenId, existing + matched);
+      // Per-target marker so subsequent buys from THIS target on this side stay suppressed.
+      state.absorbedSideByTarget.set(cfg.targetAddress.toLowerCase(), hedge.tokenId);
       state.hedge = null;
       result = {
         suppress: true,
@@ -854,7 +908,8 @@ async function checkHedgeSuppression(
       return;
     }
 
-    // Not filled — cancel resting hedge to prevent later behind-our-back fill that would double-hedge.
+    // Not filled — cancel resting hedge. SAFE NOW: all downstream checks have passed, caller is
+    // about to post the copy. We won't end up hedge-cancelled-without-copy (Case 15).
     await safeCancel(client, hedge.orderId, cfg, "diverting-to-copy-target-opposite");
     addSideSpent(cfg.targetAddress, hedge.tokenId, -(hedge.size * hedge.price));
     const msg = `hedge cancelled (diverting to copy target's opposite-side buy) · condition=${state.conditionId} hedgeToken=${hedge.tokenId} price=${hedge.price} shares=${hedge.size} refunded=$${(hedge.size * hedge.price).toFixed(4)} · tx=${txHash}`;
@@ -1016,10 +1071,11 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
 
   const client = await ensureClobClient(cfg);
 
-  // Option-2 suppression: only suppress if our hedge actually filled. If hedge is unfilled,
-  // cancel it (to prevent double-hedge later) and continue copying the target's opposite-side buy.
+  // EARLY suppression: cheap local absorbedSide check only. The resting-hedge interaction is
+  // deferred to LATE (just before createAndPostOrder) so we don't cancel a hedge for a copy
+  // that's about to fail a downstream check (drift / buy_bounds / min_order_size).
   if (cfg.hedgePrice !== undefined) {
-    const sup = await checkHedgeSuppression(cfg, client, digest, txHash);
+    const sup = await checkAbsorbedSuppression(cfg, digest);
     if (sup.suppress) {
       await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg);
       return;
@@ -1143,6 +1199,17 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   if (!Number.isNaN(minOrder) && orderShares < minOrder) {
     await logCopySkip(`size ${orderShares} < min_order_size ${book.min_order_size}`, digest, txHash, cfg);
     return;
+  }
+
+  // LATE suppression (Case 15 fix): now that ALL downstream checks have passed and we're
+  // committed to posting, it's safe to cancel a resting hedge or detect a fill. Before this,
+  // any check could have failed and left us hedge-cancelled-without-copy.
+  if (cfg.hedgePrice !== undefined && digest.side === "buy") {
+    const sup = await checkRestingHedgeSuppression(cfg, client, digest, txHash);
+    if (sup.suppress) {
+      await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg);
+      return;
+    }
   }
 
   const side = digest.side === "buy" ? Side.BUY : Side.SELL;
