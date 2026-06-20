@@ -39,6 +39,10 @@ function makeWebSocket(url: string): WebSocket {
   });
 }
 
+/** Heartbeat tuning: ping the WSS this often, terminate if no pong within the timeout. */
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_TIMEOUT_MS = 10_000;
+
 /**
  * Subscribes to `OrderFilled` logs on the CTF Exchange V2 contracts, filtered SERVER-SIDE
  * by maker/taker topic so the provider only pushes events where one of our configured target
@@ -209,13 +213,70 @@ export function startMempoolWatcher(
       void reconnect("provider error");
     });
 
-    const ws = (p as unknown as { websocket?: { on?: (evt: string, cb: (...args: unknown[]) => void) => void } })
-      .websocket;
+    const ws = (
+      p as unknown as {
+        websocket?: {
+          on?: (evt: string, cb: (...args: unknown[]) => void) => void;
+          ping?: (data?: unknown, mask?: boolean, cb?: (err?: Error) => void) => void;
+          terminate?: () => void;
+          readyState?: number;
+        };
+      }
+    ).websocket;
     ws?.on?.("error", (err: unknown) => {
       onError(err, "websocket error");
       void reconnect("websocket error");
     });
+
+    // Heartbeat: send a ws-level ping every HEARTBEAT_INTERVAL_MS. If no pong arrives within
+    // HEARTBEAT_TIMEOUT_MS, terminate the socket — that fires `close` and the existing reconnect
+    // path kicks in. Catches "zombie" connections where TCP appears alive (no FIN/RST received)
+    // but no frames are flowing, which is the failure mode that caused us to silently miss the
+    // target's 8:50PM ET BTC trade on June 19/20.
+    let awaitingPong = false;
+    let pongTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearPongTimer = () => {
+      if (pongTimer) {
+        clearTimeout(pongTimer);
+        pongTimer = null;
+      }
+    };
+    const pingInterval = setInterval(() => {
+      if (!ws || ws.readyState !== 1 /* OPEN */) {
+        return;
+      }
+      clearPongTimer();
+      awaitingPong = true;
+      try {
+        ws.ping?.();
+      } catch {
+        // ignore — if ping throws, the next close/error path will handle reconnect
+      }
+      pongTimer = setTimeout(() => {
+        if (awaitingPong) {
+          console.warn(
+            `[watcher] heartbeat timeout — no pong in ${HEARTBEAT_TIMEOUT_MS / 1000}s; terminating zombie connection`
+          );
+          try {
+            ws.terminate?.();
+          } catch {
+            // terminate is best-effort; close handler will still recover
+          }
+        }
+      }, HEARTBEAT_TIMEOUT_MS);
+      pongTimer.unref();
+    }, HEARTBEAT_INTERVAL_MS);
+    pingInterval.unref();
+    ws?.on?.("pong", () => {
+      awaitingPong = false;
+      clearPongTimer();
+    });
+
     ws?.on?.("close", (code: unknown) => {
+      // Stop pinging the dead socket; the reconnect path will create a fresh ws with fresh timers.
+      clearInterval(pingInterval);
+      clearPongTimer();
+      awaitingPong = false;
       onError(new Error(`websocket closed code=${String(code)}`), "websocket close");
       void reconnect("websocket close");
     });
