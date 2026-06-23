@@ -997,45 +997,16 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     }
 
     if (combinedNotional < cfg.minPositionUsdc) {
-      if (cfg.accumulateBelowMin) {
-        // Still below min after combining — append the current trade to the buffer (don't clear
-        // existing entries; they keep accumulating). Skip without posting; the buffer will be
-        // flushed on a future trade that pushes the combined total past min.
-        pushSkipBuffer(cfg.targetAddress, digest.tokenId, {
-          originPusd,
-          originShares,
-          notionalUsdc: usdcNotional,
-          impliedPrice: implied,
-          txHash,
-          timestamp: Date.now(),
-        });
-        const buf = getSkipBuffer(cfg.targetAddress, digest.tokenId)!;
-        await logCopySkip(
-          `accumulating below min · combined notional $${combinedNotional.toFixed(4)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · buffer entries=${buf.entries.length} totalOriginPusd=$${buf.totalOriginPusd.toFixed(4)} avgImplied=${(buf.totalOriginShares > 0 ? buf.totalOriginPusd / buf.totalOriginShares : 0).toFixed(4)}`,
-          digest,
-          txHash,
-          cfg
-        );
-        return;
-      }
-      // Original behavior: drop the trade.
+      // min_position_usdc is a hard floor. Set it to 0 in copy-targets.toml to disable; the
+      // accumulator now targets `min_order_size` (the CLOB's share-count floor) instead, since
+      // share-count is the actual CLOB-imposed minimum that matters for thin-share trades.
       await logCopySkip(
-        `pUSD ${usdcNotional.toFixed(6)} < MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
+        `pUSD ${combinedNotional.toFixed(6)} < MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
         digest,
         txHash,
         cfg
       );
       return;
-    }
-
-    // Combined >= min — we will attempt to post. Clear the buffer now. If later checks (drift,
-    // bounds, cap) fail, the buffer stays cleared on purpose: drift only widens as time passes,
-    // and re-buffering a failed combined trade just postpones a guaranteed-failing retry.
-    if (cfg.accumulateBelowMin && flushedFromBufferCount > 0) {
-      clearSkipBuffer(cfg.targetAddress, digest.tokenId);
-      const flushMsg = `accumulator flush · combined notional $${combinedNotional.toFixed(4)} from ${flushedFromBufferCount} buffered + current · weighted implied=${effectiveImplied.toFixed(4)} · token=${digest.tokenId}`;
-      console.log(flushMsg);
-      void appendCopyTradeSuccessLine(flushMsg, cfg.copyTradeLogPath);
     }
 
     clippedUsdc = clamp(combinedNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
@@ -1197,8 +1168,40 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
 
   const minOrder = parseFloat(book.min_order_size);
   if (!Number.isNaN(minOrder) && orderShares < minOrder) {
+    // Accumulator: if enabled and this is a BUY, buffer the current trade so a future buy on the
+    // same (target, tokenId) can combine with it and cross the CLOB's share-count floor in one
+    // posted order. The buffer's pUSD/shares are read at the top of this function via
+    // `getSkipBuffer` and folded into `combinedNotional` / `effectiveImplied` for sizing.
+    if (digest.side === "buy" && cfg.accumulateBelowMin) {
+      pushSkipBuffer(cfg.targetAddress, digest.tokenId, {
+        originPusd,
+        originShares,
+        notionalUsdc: originPusd * cfg.copyRatio,
+        impliedPrice: implied,
+        txHash,
+        timestamp: Date.now(),
+      });
+      const buf = getSkipBuffer(cfg.targetAddress, digest.tokenId)!;
+      await logCopySkip(
+        `accumulating below min_order_size · combined shares=${orderShares.toFixed(4)} < min_order_size ${minOrder} · buffer entries=${buf.entries.length} totalOriginPusd=$${buf.totalOriginPusd.toFixed(4)} avgImplied=${(buf.totalOriginShares > 0 ? buf.totalOriginPusd / buf.totalOriginShares : 0).toFixed(4)}`,
+        digest,
+        txHash,
+        cfg
+      );
+      return;
+    }
     await logCopySkip(`size ${orderShares} < min_order_size ${book.min_order_size}`, digest, txHash, cfg);
     return;
+  }
+
+  // Past min_order_size: we're committed to posting. Clear the buffer (if any flush is in
+  // progress) and log the flush. From here, any later failure (CLOB error) just leaves us
+  // unbuffered for next time — drift only widens, so re-buffering wouldn't help anyway.
+  if (digest.side === "buy" && cfg.accumulateBelowMin && flushedFromBufferCount > 0) {
+    clearSkipBuffer(cfg.targetAddress, digest.tokenId);
+    const flushMsg = `accumulator flush · combined notional $${(clippedUsdc ?? 0).toFixed(4)} from ${flushedFromBufferCount} buffered + current · orderShares=${orderShares.toFixed(2)} >= min_order_size ${minOrder} · token=${digest.tokenId}`;
+    console.log(flushMsg);
+    void appendCopyTradeSuccessLine(flushMsg, cfg.copyTradeLogPath);
   }
 
   // LATE suppression (Case 15 fix): now that ALL downstream checks have passed and we're

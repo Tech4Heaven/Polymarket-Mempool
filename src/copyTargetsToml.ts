@@ -33,9 +33,10 @@ export type TomlDefaultsSection = {
   /** Whether the withdrawal watcher polls this wallet for fund outflows. Default false (opt-in). */
   watch_withdrawals?: boolean;
   /**
-   * If true, buys whose post-ratio notional is below `min_position_usdc` are accumulated per market
-   * side. The bot posts ONE combined order as soon as the accumulator (plus the next incoming buy)
-   * crosses the threshold. Default false (original behavior — drop sub-min trades).
+   * If true, buys that would be skipped by the CLOB's per-market `min_order_size` are accumulated
+   * per (target, tokenId). The bot posts ONE combined order as soon as a later buy on the same side
+   * pushes the combined share count above `min_order_size`. Default false.
+   * Does NOT buffer `min_position_usdc` skips — set min_position_usdc = 0 to rely on min_order_size.
    */
   accumulate_below_min?: boolean;
   /**

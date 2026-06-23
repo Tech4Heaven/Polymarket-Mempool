@@ -31,10 +31,13 @@ max_position_usdc = 100
 # Whether the withdrawal watcher polls this wallet for fund outflows (alerts if funds drain out —
 # a sign the trader may be rotating to a new address). Default false — opt in per target.
 # watch_withdrawals = true
-# If true, sub-min buys are accumulated per (target, tokenId) and a single combined order is posted
-# when the buffered total (plus the next incoming buy) crosses min_position_usdc. Default false.
-# Useful for targets that dribble in many tiny buys you'd otherwise drop. Buffer expires after 15
-# min idle; cleared if the target sells the same token (exit).
+# If true, buys that would be skipped by the CLOB's per-market `min_order_size` (typically 5 shares)
+# are accumulated per (target, tokenId). The bot posts ONE combined order when the next buy on the
+# same side brings the combined share count above min_order_size. Default false.
+# Useful for targets that trade in tiny share counts you'd otherwise drop. Buffer expires after 15
+# min idle; cleared on a sell of the same token (target exit) and on a successful flush.
+# Note: this does NOT buffer min_position_usdc skips — set min_position_usdc = 0 if you want to
+# rely solely on min_order_size as the floor.
 # accumulate_below_min = true
 # Master enable/disable for the row. When false, the bot does NOTHING for this address — no copy,
 # no mempool match, no withdrawal poll. Default true. Handy to temporarily pause a target without
