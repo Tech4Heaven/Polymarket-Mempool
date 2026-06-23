@@ -132,6 +132,14 @@ async function main() {
       if (anyHedging && !probeCfg.dryRun) {
         await cancelAllStaleGtcOrders(probeCfg);
       }
+      // Mark the boot in every per-target log. Without this, a restart looks identical to
+      // continuous operation when reading a per-target file later — and lost in-memory state
+      // (absorbed-side markers, accumulator buffers, hedge tracking) looks like a code bug.
+      const gtcNote = anyHedging && !probeCfg.dryRun ? "ran" : "skipped (no hedging or dry-run)";
+      await appendWatcherLineToAllTargetLogs(
+        `bot started · pid=${process.pid} · in-memory state cleared (hedge tracking, absorbed-side markers, accumulator buffers all empty) · GTC cleanup ${gtcNote}`,
+        config
+      );
     }
   }
 
