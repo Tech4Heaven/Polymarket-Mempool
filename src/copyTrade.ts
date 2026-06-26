@@ -136,25 +136,6 @@ async function logCopySkip(
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
 }
 
-/** Parse CLOB midpoint / price API payloads to a number in (0,1). */
-function parseClobPrice(raw: unknown): number | null {
-  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
-    return raw;
-  }
-  if (raw && typeof raw === "object") {
-    const o = raw as Record<string, unknown>;
-    for (const k of ["mid", "price", "p"]) {
-      if (k in o && o[k] != null) {
-        const n = parseFloat(String(o[k]));
-        if (Number.isFinite(n) && n > 0) {
-          return n;
-        }
-      }
-    }
-  }
-  return null;
-}
-
 let cachedClient: ClobClient | null = null;
 let cachedCfgKey = "";
 let authInFlight: Promise<ClobClient> | null = null;
@@ -954,8 +935,8 @@ export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig): Promise<voi
 }
 
 /**
- * Sizes with **shares = (pUSD_notional × COPY_RATIO, clipped) / currentPrice**, where `currentPrice` comes from
- * the CLOB (`getMidpoint`, then `getPrice` fallback). Posts a marketable GTC limit at/through the book.
+ * Sizes with **shares = (pUSD_notional × COPY_RATIO, clipped) / currentPrice**, where `currentPrice` is the
+ * order-book midpoint derived locally from best bid/ask. Posts a marketable GTC limit at/through the book.
  */
 export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest, txHash: string): Promise<void> {
   const implied = impliedPrice(digest.pusdRaw, digest.outcomeRaw);
@@ -1054,21 +1035,28 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   }
 
   // tickSize + negRisk are cached (immutable per market) — only fetched once per tokenId.
-  const [tickSize, negRisk, book, midRaw] = await Promise.all([
+  // Midpoint is derived locally from the order book instead of a separate getMidpoint call: the
+  // book already carries both sides, and currentPrice is only ever used as max(mid,ask) for buys
+  // / min(mid,bid) for sells — both collapse to the book's ask/bid. Saves one CLOB request per
+  // copy and removes the sequential getPrice fallback.
+  const [tickSize, negRisk, book] = await Promise.all([
     getTickSizeCached(client, digest.tokenId),
     getNegRiskCached(client, digest.tokenId),
     client.getOrderBook(digest.tokenId),
-    client.getMidpoint(digest.tokenId),
   ]);
 
-  let currentPrice = parseClobPrice(midRaw);
-  if (currentPrice === null) {
-    const sideStr = digest.side === "buy" ? Side.BUY : Side.SELL;
-    const pxRaw = await client.getPrice(digest.tokenId, sideStr);
-    currentPrice = parseClobPrice(pxRaw);
+  const topBid = bestBid(book);
+  const topAsk = bestAsk(book);
+  // Both sides → true midpoint. One-sided book → use the side that exists; the side-specific
+  // empty asks/bids checks below still gate a buy/sell that needs the missing side.
+  let currentPrice: number | null;
+  if (topBid !== null && topAsk !== null) {
+    currentPrice = (topBid + topAsk) / 2;
+  } else {
+    currentPrice = topAsk ?? topBid;
   }
-  if (currentPrice === null) {
-    await logCopySkip(`could not parse CLOB price · token=${digest.tokenId}`, digest, txHash, cfg);
+  if (currentPrice === null || !Number.isFinite(currentPrice) || currentPrice <= 0) {
+    await logCopySkip(`empty/invalid order book · token=${digest.tokenId}`, digest, txHash, cfg);
     return;
   }
 
@@ -1267,9 +1255,23 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   // After a successful live BUY: add filled shares to sharesByToken and reconcile (hedge grows).
   // After a successful live SELL: subtract filled shares from sharesByToken and reconcile so
   //   the now-oversized hedge is resized or cancelled IMMEDIATELY (don't wait for the poller).
-  // Bucket: BUY accrues actual USDC spent; SELL resets the side's bucket (full-exit semantics).
+  // Bucket: BUY reserves the POSTED notional (clippedUsdc), not the fill — so resting/unfilled
+  //   orders still count against max_market_usdc and a burst of copies can't overshoot the cap
+  //   while their limit orders sit on the book. SELL resets the side's bucket: the bot fully
+  //   exits the side on any target sell (partial or full), so the reservation is released whole.
   if (digest.side === "buy") {
-    addSideSpent(cfg.targetAddress, digest.tokenId, filledUsdc);
+    addSideSpent(cfg.targetAddress, digest.tokenId, clippedUsdc ?? 0);
+    // Observability only: if the post-reserve total exceeds the cap, two same-side copies raced
+    // the cap check (dispatch is fire-and-forget, so the check→reserve gap isn't atomic). Cheap
+    // log, no serialization — tells us whether the race ever actually bites in production.
+    if (cfg.maxMarketUsdc !== undefined) {
+      const spent = getSideSpent(cfg.targetAddress, digest.tokenId);
+      if (spent > cfg.maxMarketUsdc + 1e-9) {
+        const warn = `max_market_usdc overshoot · spent=$${spent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId} (concurrent same-side copies raced the cap check) · tx=${txHash}`;
+        console.warn(warn);
+        void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
+      }
+    }
     await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash);
   } else {
     await recordCopySellAndReconcile(cfg, client, digest.tokenId, filledShares, txHash);
