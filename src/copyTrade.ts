@@ -118,20 +118,42 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
 
-/** On-chain amounts from the copied wallet trade (USDC + outcome tokens, 6 decimals each).
- *  Takes numbers so accumulator-flushed copies can report combined origin sizing. */
-function formatOriginTradeSizing(originPusd: number, originShares: number): string {
-  return `origin pUSD=${originPusd.toFixed(6)} shares=${originShares.toFixed(6)}`;
+/**
+ * Uniform sizing block appended to EVERY copy-skip line so all skips carry the same four fields
+ * in the same place, regardless of where in the flow the skip fires. `copyUSD`/`shares` are OUR
+ * copy sizing (origin pUSD × copy_ratio, clipped) — not the target's origin trade. Fields not yet
+ * computed at the skip point (e.g. `limit` on pre-order-book skips) render as `n/a`. When `shares`
+ * isn't supplied it's derived from `copyUSD ÷ (limit ?? implied)`.
+ */
+type SkipSizing = {
+  copyUsd?: number;
+  shares?: number;
+  limitPrice?: number;
+  implied?: number;
+};
+
+function formatSkipSizing(s: SkipSizing): string {
+  const fmt = (n: number | undefined, d: number) =>
+    n !== undefined && Number.isFinite(n) ? n.toFixed(d) : "n/a";
+  let shares = s.shares;
+  if (shares === undefined && s.copyUsd !== undefined) {
+    const basis = s.limitPrice ?? s.implied;
+    if (basis !== undefined && basis > 0) {
+      shares = s.copyUsd / basis;
+    }
+  }
+  return `copyUSD=${fmt(s.copyUsd, 6)} shares=${fmt(shares, 4)} limit=${fmt(s.limitPrice, 4)} implied=${fmt(s.implied, 4)}`;
 }
 
 async function logCopySkip(
   reasonDetail: string,
   digest: CopyDigest,
   txHash: string,
-  cfg: CopyTradeConfig
+  cfg: CopyTradeConfig,
+  sizing: SkipSizing = {}
 ): Promise<void> {
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
-  const msg = `copy skip · ${reasonDetail} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tx=${txHash}`;
+  const msg = `copy skip · ${reasonDetail} · ${formatSkipSizing(sizing)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tx=${txHash}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
 }
@@ -982,10 +1004,11 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       // accumulator now targets `min_order_size` (the CLOB's share-count floor) instead, since
       // share-count is the actual CLOB-imposed minimum that matters for thin-share trades.
       await logCopySkip(
-        `pUSD ${combinedNotional.toFixed(6)} < MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
+        `below MIN_POSITION_USDC ${cfg.minPositionUsdc}`,
         digest,
         txHash,
-        cfg
+        cfg,
+        { copyUsd: combinedNotional, implied: effectiveImplied }
       );
       return;
     }
@@ -1002,7 +1025,8 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
           `max_market_usdc cap reached · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
           digest,
           txHash,
-          cfg
+          cfg,
+          { copyUsd: clippedUsdc ?? undefined, implied: effectiveImplied }
         );
         return;
       }
@@ -1012,7 +1036,8 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
             `max_market_usdc remaining $${remaining.toFixed(2)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
             digest,
             txHash,
-            cfg
+            cfg,
+            { copyUsd: clippedUsdc ?? undefined, implied: effectiveImplied }
           );
           return;
         }
@@ -1029,7 +1054,10 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   if (cfg.hedgePrice !== undefined) {
     const sup = await checkAbsorbedSuppression(cfg, digest);
     if (sup.suppress) {
-      await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg);
+      await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg, {
+        copyUsd: clippedUsdc ?? undefined,
+        implied: effectiveImplied,
+      });
       return;
     }
   }
@@ -1056,7 +1084,10 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     currentPrice = topAsk ?? topBid;
   }
   if (currentPrice === null || !Number.isFinite(currentPrice) || currentPrice <= 0) {
-    await logCopySkip(`empty/invalid order book · token=${digest.tokenId}`, digest, txHash, cfg);
+    await logCopySkip(`empty/invalid order book · token=${digest.tokenId}`, digest, txHash, cfg, {
+      copyUsd: clippedUsdc ?? undefined,
+      implied: effectiveImplied,
+    });
     return;
   }
 
@@ -1064,7 +1095,10 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   if (digest.side === "buy") {
     const ask = bestAsk(book);
     if (ask === null) {
-      await logCopySkip("empty asks", digest, txHash, cfg);
+      await logCopySkip("empty asks", digest, txHash, cfg, {
+        copyUsd: clippedUsdc ?? undefined,
+        implied: effectiveImplied,
+      });
       return;
     }
 
@@ -1078,19 +1112,21 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     const drift = effectivePrice - effectiveImplied;
     if (drift > cfg.maxPriceDifference) {
       await logCopySkip(
-        `price drift buy · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
+        `price drift buy · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
         digest,
         txHash,
-        cfg
+        cfg,
+        { copyUsd: clippedUsdc ?? undefined, implied: effectiveImplied }
       );
       return;
     }
     if (cfg.maxUnderbidDifference !== undefined && -drift > cfg.maxUnderbidDifference) {
       await logCopySkip(
-        `underbid skip · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} underbid=${(-drift).toFixed(4)} maxUnderbid=${cfg.maxUnderbidDifference} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
+        `underbid skip · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} underbid=${(-drift).toFixed(4)} maxUnderbid=${cfg.maxUnderbidDifference}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
         digest,
         txHash,
-        cfg
+        cfg,
+        { copyUsd: clippedUsdc ?? undefined, implied: effectiveImplied }
       );
       return;
     }
@@ -1099,19 +1135,21 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
 
     if (cfg.buyPriceMin !== undefined && limitPrice < cfg.buyPriceMin) {
       await logCopySkip(
-        `buy limitPrice=${limitPrice.toFixed(4)} below buy_price_min=${cfg.buyPriceMin} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}`,
+        `buy limitPrice=${limitPrice.toFixed(4)} below buy_price_min=${cfg.buyPriceMin}`,
         digest,
         txHash,
-        cfg
+        cfg,
+        { copyUsd: clippedUsdc ?? undefined, limitPrice, implied: effectiveImplied }
       );
       return;
     }
     if (cfg.buyPriceMax !== undefined && limitPrice > cfg.buyPriceMax) {
       await logCopySkip(
-        `buy limitPrice=${limitPrice.toFixed(4)} above buy_price_max=${cfg.buyPriceMax} · ${formatOriginTradeSizing(effectiveOriginPusd, effectiveOriginShares)}`,
+        `buy limitPrice=${limitPrice.toFixed(4)} above buy_price_max=${cfg.buyPriceMax}`,
         digest,
         txHash,
-        cfg
+        cfg,
+        { copyUsd: clippedUsdc ?? undefined, limitPrice, implied: effectiveImplied }
       );
       return;
     }
@@ -1119,7 +1157,7 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     // Sells: no drift check (per design). Just price to top of book.
     const bid = bestBid(book);
     if (bid === null) {
-      await logCopySkip("empty bids", digest, txHash, cfg);
+      await logCopySkip("empty bids", digest, txHash, cfg, { implied: effectiveImplied });
       return;
     }
     limitPrice = roundToTick(Math.min(currentPrice, bid), tickSize, "down");
@@ -1139,15 +1177,19 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     try {
       fullBalance = parseFloat(formatUnits(BigInt(String(bal.balance)), 6));
     } catch {
-      await logCopySkip(`invalid balance response · token=${digest.tokenId}`, digest, txHash, cfg);
+      await logCopySkip(`invalid balance response · token=${digest.tokenId}`, digest, txHash, cfg, {
+        limitPrice,
+        implied: effectiveImplied,
+      });
       return;
     }
     if (!Number.isFinite(fullBalance) || fullBalance <= 0) {
       await logCopySkip(
-        `no balance to sell · token=${digest.tokenId} · limit=${limitPrice} implied=${implied.toFixed(4)} clob=${currentPrice.toFixed(4)}`,
+        `no balance to sell · token=${digest.tokenId} · clob=${currentPrice.toFixed(4)}`,
         digest,
         txHash,
-        cfg
+        cfg,
+        { limitPrice, implied: effectiveImplied }
       );
       return;
     }
@@ -1174,11 +1216,17 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
         `accumulating below min_order_size · combined shares=${orderShares.toFixed(4)} < min_order_size ${minOrder} · buffer entries=${buf.entries.length} totalOriginPusd=$${buf.totalOriginPusd.toFixed(4)} avgImplied=${(buf.totalOriginShares > 0 ? buf.totalOriginPusd / buf.totalOriginShares : 0).toFixed(4)}`,
         digest,
         txHash,
-        cfg
+        cfg,
+        { copyUsd: clippedUsdc ?? undefined, shares: orderShares, limitPrice, implied: effectiveImplied }
       );
       return;
     }
-    await logCopySkip(`size ${orderShares} < min_order_size ${book.min_order_size}`, digest, txHash, cfg);
+    await logCopySkip(`size ${orderShares} < min_order_size ${book.min_order_size}`, digest, txHash, cfg, {
+      copyUsd: clippedUsdc ?? undefined,
+      shares: orderShares,
+      limitPrice,
+      implied: effectiveImplied,
+    });
     return;
   }
 
@@ -1198,12 +1246,69 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   if (cfg.hedgePrice !== undefined && digest.side === "buy") {
     const sup = await checkRestingHedgeSuppression(cfg, client, digest, txHash);
     if (sup.suppress) {
-      await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg);
+      await logCopySkip(`already hedged · ${sup.reason ?? ""} · token=${digest.tokenId}`, digest, txHash, cfg, {
+        copyUsd: clippedUsdc ?? undefined,
+        shares: orderShares,
+        limitPrice,
+        implied: effectiveImplied,
+      });
       return;
     }
   }
 
   const side = digest.side === "buy" ? Side.BUY : Side.SELL;
+
+  // ── ATOMIC max_market_usdc reservation ────────────────────────────────────────────────
+  // Re-read the bucket and reserve the posted notional in ONE synchronous block (no await
+  // between the read and the write), immediately before posting. Because Node is single-
+  // threaded, no other fire-and-forget copy can interleave between the read and the write —
+  // the first to arrive reserves, every later one sees it and clips or skips. This is the
+  // AUTHORITATIVE cap gate; the pre-book check above is only a cheap fast-fail. Zero added
+  // latency (in-memory map ops), so a burst of concurrent same-side copies can no longer
+  // collectively exceed the cap. Only reached after all skip checks, so a copy that bails
+  // earlier never reserves; the sole refund path is a post that throws (below).
+  let reservedUsdc = 0;
+  if (digest.side === "buy" && cfg.maxMarketUsdc !== undefined) {
+    const alreadySpent = getSideSpent(cfg.targetAddress, digest.tokenId);
+    const remaining = cfg.maxMarketUsdc - alreadySpent;
+    if (remaining <= 0) {
+      await logCopySkip(
+        `max_market_usdc cap reached · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+        digest,
+        txHash,
+        cfg,
+        { copyUsd: clippedUsdc ?? undefined, limitPrice, implied: effectiveImplied }
+      );
+      return;
+    }
+    if ((clippedUsdc ?? 0) > remaining) {
+      if (remaining < cfg.minPositionUsdc) {
+        await logCopySkip(
+          `max_market_usdc remaining $${remaining.toFixed(2)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+          digest,
+          txHash,
+          cfg,
+          { copyUsd: clippedUsdc ?? undefined, limitPrice, implied: effectiveImplied }
+        );
+        return;
+      }
+      clippedUsdc = remaining;
+      orderShares = clippedUsdc / limitPrice;
+      if (orderShares < minOrder) {
+        await logCopySkip(
+          `max_market_usdc clip → size ${orderShares.toFixed(4)} < min_order_size ${minOrder} · remaining $${remaining.toFixed(2)} spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+          digest,
+          txHash,
+          cfg,
+          { copyUsd: clippedUsdc, shares: orderShares, limitPrice, implied: effectiveImplied }
+        );
+        return;
+      }
+    }
+    // Commit the reservation — atomic w.r.t. the getSideSpent read above (no await between).
+    addSideSpent(cfg.targetAddress, digest.tokenId, clippedUsdc ?? 0);
+    reservedUsdc = clippedUsdc ?? 0;
+  }
 
   if (cfg.dryRun) {
     const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
@@ -1213,9 +1318,8 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
       `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${effectiveImplied.toFixed(4)} · tx=${txHash}${flushSuffix}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
-    // Track the would-be position so suppression / reconcile / max_market_usdc logs reflect reality.
+    // Reservation for buys was already committed atomically above (max_market_usdc block).
     if (digest.side === "buy") {
-      addSideSpent(cfg.targetAddress, digest.tokenId, clippedUsdc ?? 0);
       await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash);
     } else {
       resetSideSpent(cfg.targetAddress, digest.tokenId);
@@ -1224,16 +1328,26 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     return;
   }
 
-  const resp = await client.createAndPostOrder(
-    {
-      tokenID: digest.tokenId,
-      price: limitPrice,
-      side,
-      size: orderShares,
-    },
-    { tickSize, negRisk },
-    OrderType.GTC
-  );
+  let resp;
+  try {
+    resp = await client.createAndPostOrder(
+      {
+        tokenID: digest.tokenId,
+        price: limitPrice,
+        side,
+        size: orderShares,
+      },
+      { tickSize, negRisk },
+      OrderType.GTC
+    );
+  } catch (e) {
+    // Post failed after we reserved — release the reservation so a failed order doesn't
+    // permanently consume max_market_usdc capacity. This is the only refund path.
+    if (reservedUsdc > 0) {
+      addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
+    }
+    throw e;
+  }
 
   // Actual fill from the CLOB response. The labels flip by side:
   //   BUY  → takingAmount = shares acquired, makingAmount = USDC paid
@@ -1260,14 +1374,13 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
   //   while their limit orders sit on the book. SELL resets the side's bucket: the bot fully
   //   exits the side on any target sell (partial or full), so the reservation is released whole.
   if (digest.side === "buy") {
-    addSideSpent(cfg.targetAddress, digest.tokenId, clippedUsdc ?? 0);
-    // Observability only: if the post-reserve total exceeds the cap, two same-side copies raced
-    // the cap check (dispatch is fire-and-forget, so the check→reserve gap isn't atomic). Cheap
-    // log, no serialization — tells us whether the race ever actually bites in production.
+    // Reservation was committed atomically before the post (max_market_usdc block). Canary:
+    // with the atomic read-modify-write this invariant must never trip; if it does, the
+    // reservation logic has regressed. Cheap check, no serialization.
     if (cfg.maxMarketUsdc !== undefined) {
       const spent = getSideSpent(cfg.targetAddress, digest.tokenId);
       if (spent > cfg.maxMarketUsdc + 1e-9) {
-        const warn = `max_market_usdc overshoot · spent=$${spent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId} (concurrent same-side copies raced the cap check) · tx=${txHash}`;
+        const warn = `max_market_usdc overshoot · spent=$${spent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId} (atomic reserve invariant violated) · tx=${txHash}`;
         console.warn(warn);
         void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
       }
