@@ -39,6 +39,18 @@ max_position_usdc = 100
 # Note: this does NOT buffer min_position_usdc skips — set min_position_usdc = 0 if you want to
 # rely solely on min_order_size as the floor.
 # accumulate_below_min = true
+# When a BUY is skipped for "price drift buy" (CLOB moved above the target's on-chain implied by
+# more than max_price_difference), keep watching that market for this many seconds and REPOST the
+# buy if the price falls back to within max_price_difference. Each skipped order reposts when the
+# price returns to within maxΔ of its own target implied. Default 120. Set 0 to disable re-watching.
+# Only affects the overbid drift skip — never the underbid skip. Polls the book every ~1s.
+# drift_rewatch_seconds = 120
+# Ceiling on the drift (effective - implied) at skip time for a skip to be re-watched at all. A drift
+# far above max_price_difference means the market repriced hard; if it snaps back it's usually a new
+# regime, not the original signal, so we drop it instead of chasing. Must exceed max_price_difference.
+# Example: max_price_difference = 0.1, drift_rewatch_max = 0.2 → re-watch skips with drift in (0.1, 0.2];
+# a skip at drift 0.15 is re-watched, a skip at 0.3 is dropped. Default 0.2.
+# drift_rewatch_max = 0.2
 # Master enable/disable for the row. When false, the bot does NOTHING for this address — no copy,
 # no mempool match, no withdrawal poll. Default true. Handy to temporarily pause a target without
 # deleting its config.

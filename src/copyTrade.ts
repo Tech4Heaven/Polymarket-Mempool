@@ -305,6 +305,119 @@ function clearSkipBuffer(targetAddress: string, tokenId: string): void {
   skipBufferByTargetToken.delete(skipBufferKey(targetAddress, tokenId));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Drift re-watch — repost buys skipped for `price drift buy` once the CLOB price
+// returns to within max_price_difference of the target's on-chain implied. Applies
+// only to the OVERBID drift skip (not underbid — that signals the target's bet is
+// going wrong). Per (target, tokenId); each buffered digest keeps the implied from
+// its own skip, so digests with different target prices each repost when THEIR gate
+// opens. Bounded by a per-target deadline (drift_rewatch_seconds) — these markets
+// resolve fast, so watching past the window is pointless/risky.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type DriftWatchEntry = { digest: CopyDigest; txHash: string; implied: number };
+type DriftWatch = {
+  cfg: CopyTradeConfig;
+  tokenId: string;
+  entries: DriftWatchEntry[];
+  deadline: number; // Date.now() ms; the whole watch is dropped after this
+};
+
+const driftWatchByTargetToken = new Map<string, DriftWatch>();
+
+/** Fallback drift ceiling if a config somehow omits it (env always sets driftRewatchMax). */
+const DEFAULT_DRIFT_REWATCH_MAX = 0.2;
+
+function driftWatchKey(targetAddress: string, tokenId: string): string {
+  return `${targetAddress.toLowerCase()}:${tokenId}`;
+}
+
+/** Register a drift-skipped BUY for re-watch. No-op when disabled (seconds <= 0) or not a buy. */
+function registerDriftWatch(cfg: CopyTradeConfig, digest: CopyDigest, txHash: string, implied: number): void {
+  const seconds = cfg.driftRewatchSeconds ?? 0;
+  if (seconds <= 0 || digest.side !== "buy") {
+    return;
+  }
+  const k = driftWatchKey(cfg.targetAddress, digest.tokenId);
+  const existing = driftWatchByTargetToken.get(k);
+  if (existing) {
+    // Keep the original (bounded) deadline; just add this skip to the same watch.
+    existing.entries.push({ digest, txHash, implied });
+  } else {
+    driftWatchByTargetToken.set(k, {
+      cfg,
+      tokenId: digest.tokenId,
+      entries: [{ digest, txHash, implied }],
+      deadline: Date.now() + seconds * 1000,
+    });
+  }
+}
+
+const DRIFT_REWATCH_POLL_MS = 1000;
+let driftRewatchPolling = false;
+
+setInterval(() => {
+  if (driftRewatchPolling || driftWatchByTargetToken.size === 0) {
+    return;
+  }
+  driftRewatchPolling = true;
+  void (async () => {
+    try {
+      for (const [k, watch] of [...driftWatchByTargetToken]) {
+        try {
+          if (Date.now() >= watch.deadline) {
+            driftWatchByTargetToken.delete(k);
+            void appendCopyTradeSuccessLine(
+              `drift rewatch expired · ${watch.entries.length} order(s) dropped · token=${watch.tokenId}`,
+              watch.cfg.copyTradeLogPath
+            );
+            continue;
+          }
+          const client = await ensureClobClient(watch.cfg);
+          const book = await client.getOrderBook(watch.tokenId);
+          const ask = bestAsk(book);
+          if (ask === null) {
+            continue; // one-sided/empty book — wait for asks to reappear (deadline still bounds this)
+          }
+          const bid = bestBid(book);
+          const mid = bid !== null ? (bid + ask) / 2 : ask;
+          const effectivePrice = Math.max(mid, ask);
+          // Each entry fires when the price has returned to within maxΔ of ITS target implied.
+          const ready = watch.entries.filter((e) => effectivePrice - e.implied <= watch.cfg.maxPriceDifference);
+          if (ready.length === 0) {
+            continue;
+          }
+          // Remove the ready entries BEFORE reposting so the next tick can't double-post them.
+          watch.entries = watch.entries.filter((e) => !ready.includes(e));
+          if (watch.entries.length === 0) {
+            driftWatchByTargetToken.delete(k);
+          }
+          void appendCopyTradeSuccessLine(
+            `drift rewatch fired · price returned effective=${effectivePrice.toFixed(4)} maxΔ=${watch.cfg.maxPriceDifference} · reposting ${ready.length} order(s) · token=${watch.tokenId}`,
+            watch.cfg.copyTradeLogPath
+          );
+          for (const e of ready) {
+            try {
+              // fromRewatch: true → executeCopyTrade re-runs ALL gates but won't re-register on a
+              // repeat drift skip (avoids unbounded re-queueing beyond the deadline).
+              await executeCopyTrade(watch.cfg, e.digest, e.txHash, { fromRewatch: true });
+            } catch (err) {
+              void appendCopyTradeSuccessLine(
+                `drift rewatch repost error · token=${watch.tokenId} · ${err instanceof Error ? err.message : String(err)} · tx=${e.txHash}`,
+                watch.cfg.copyTradeLogPath
+              );
+            }
+          }
+        } catch {
+          // transient per-watch error (book fetch / client) — retry next tick until deadline
+        }
+      }
+    } finally {
+      driftRewatchPolling = false;
+    }
+  })();
+}, DRIFT_REWATCH_POLL_MS).unref();
+
 function buildSigner(cfg: CopyTradeConfig) {
   const account = privateKeyToAccount(cfg.privateKey);
   return createWalletClient({
@@ -960,7 +1073,12 @@ export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig): Promise<voi
  * Sizes with **shares = (pUSD_notional × COPY_RATIO, clipped) / currentPrice**, where `currentPrice` is the
  * order-book midpoint derived locally from best bid/ask. Posts a marketable GTC limit at/through the book.
  */
-export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest, txHash: string): Promise<void> {
+export async function executeCopyTrade(
+  cfg: CopyTradeConfig,
+  digest: CopyDigest,
+  txHash: string,
+  opts?: { fromRewatch?: boolean }
+): Promise<void> {
   const implied = impliedPrice(digest.pusdRaw, digest.outcomeRaw);
   const originPusd = parseFloat(formatUnits(digest.pusdRaw, 6));
   const originShares = parseFloat(formatUnits(digest.outcomeRaw, 6));
@@ -1111,13 +1229,27 @@ export async function executeCopyTrade(cfg: CopyTradeConfig, digest: CopyDigest,
     const effectivePrice = Math.max(currentPrice, ask);
     const drift = effectivePrice - effectiveImplied;
     if (drift > cfg.maxPriceDifference) {
+      // Re-watch only MODEST drifts. A drift far above max_price_difference means the market
+      // repriced hard; if it later snaps back it's usually a new regime, not the original signal
+      // — so past drift_rewatch_max we drop it permanently instead of chasing a stale entry.
+      const rewatchEnabled = !opts?.fromRewatch && (cfg.driftRewatchSeconds ?? 0) > 0;
+      const rewatchMax = cfg.driftRewatchMax ?? DEFAULT_DRIFT_REWATCH_MAX;
+      const rewatchOn = rewatchEnabled && drift <= rewatchMax;
+      const rewatchNote = rewatchOn
+        ? ` · rewatch=${cfg.driftRewatchSeconds}s`
+        : rewatchEnabled
+          ? ` · no rewatch (drift>${rewatchMax})`
+          : "";
       await logCopySkip(
-        `price drift buy · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
+        `price drift buy · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference}${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}${rewatchNote}`,
         digest,
         txHash,
         cfg,
         { copyUsd: clippedUsdc ?? undefined, implied: effectiveImplied }
       );
+      if (rewatchOn) {
+        registerDriftWatch(cfg, digest, txHash, effectiveImplied);
+      }
       return;
     }
     if (cfg.maxUnderbidDifference !== undefined && -drift > cfg.maxUnderbidDifference) {

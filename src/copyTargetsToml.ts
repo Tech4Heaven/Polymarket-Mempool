@@ -40,6 +40,19 @@ export type TomlDefaultsSection = {
    */
   accumulate_below_min?: boolean;
   /**
+   * When a BUY is skipped for `price drift buy` (CLOB moved above the target's implied by more than
+   * max_price_difference), keep watching the market for this many seconds and repost the order if the
+   * price returns to within max_price_difference. Default 120. Set 0 to disable re-watching.
+   */
+  drift_rewatch_seconds?: number;
+  /**
+   * Upper bound on the drift (effective − implied) at skip time for a `price drift buy` to still be
+   * re-watched. Skips with a larger drift are dropped permanently (the market moved too far; a later
+   * return is a new regime, not the original signal). Must sit above max_price_difference to have any
+   * effect. Default 0.2.
+   */
+  drift_rewatch_max?: number;
+  /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
    */
@@ -61,6 +74,8 @@ export type TomlTargetRow = {
   max_market_usdc?: number;
   watch_withdrawals?: boolean;
   accumulate_below_min?: boolean;
+  drift_rewatch_seconds?: number;
+  drift_rewatch_max?: number;
   enabled?: boolean;
 };
 
@@ -127,6 +142,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       max_market_usdc: numOrUndef("max_market_usdc", src),
       watch_withdrawals: boolOrUndef("watch_withdrawals", src),
       accumulate_below_min: boolOrUndef("accumulate_below_min", src),
+      drift_rewatch_seconds: numOrUndef("drift_rewatch_seconds", src),
+      drift_rewatch_max: numOrUndef("drift_rewatch_max", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -161,6 +178,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       max_market_usdc: numOrUndef("max_market_usdc", row),
       watch_withdrawals: boolOrUndef("watch_withdrawals", row),
       accumulate_below_min: boolOrUndef("accumulate_below_min", row),
+      drift_rewatch_seconds: numOrUndef("drift_rewatch_seconds", row),
+      drift_rewatch_max: numOrUndef("drift_rewatch_max", row),
       enabled: boolOrUndef("enabled", row),
     });
   }

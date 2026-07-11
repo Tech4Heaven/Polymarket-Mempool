@@ -69,6 +69,16 @@ export type TargetCopyParams = {
   maxMarketUsdc?: number;
   /** If true, accumulate below-min buys per (target, tokenId) and post a combined order when their sum crosses min. */
   accumulateBelowMin?: boolean;
+  /**
+   * Seconds to keep watching a market after a `price drift buy` skip and repost the buy if the CLOB
+   * price returns to within max_price_difference. Default 120. 0 disables re-watching.
+   */
+  driftRewatchSeconds?: number;
+  /**
+   * Max drift (effective − implied) at skip time for a `price drift buy` to still be re-watched.
+   * Larger drifts are dropped permanently. Should exceed max_price_difference. Default 0.2.
+   */
+  driftRewatchMax?: number;
   copyTradeLogPath: string;
 };
 
@@ -88,6 +98,10 @@ export type CopyTradeConfig = CopyTradeShared & {
   maxMarketUsdc?: number;
   /** Per-target below-min accumulator toggle. */
   accumulateBelowMin?: boolean;
+  /** Per-target drift re-watch window in seconds (default 120, 0 = disabled). */
+  driftRewatchSeconds?: number;
+  /** Per-target max drift at skip time still eligible for re-watch (default 0.2). */
+  driftRewatchMax?: number;
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -138,6 +152,8 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     hedgePrice: p.hedgePrice,
     maxMarketUsdc: p.maxMarketUsdc,
     accumulateBelowMin: p.accumulateBelowMin,
+    driftRewatchSeconds: p.driftRewatchSeconds,
+    driftRewatchMax: p.driftRewatchMax,
     targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
@@ -404,6 +420,22 @@ export async function loadAppConfig(): Promise<AppConfig> {
 
         const accumulateBelowMin = row.accumulate_below_min ?? defaults.accumulate_below_min ?? false;
 
+        const driftRewatchSeconds = row.drift_rewatch_seconds ?? defaults.drift_rewatch_seconds ?? 120;
+        if (!Number.isFinite(driftRewatchSeconds) || driftRewatchSeconds < 0) {
+          throw new Error(`targets ${row.address}: drift_rewatch_seconds must be a non-negative number`);
+        }
+
+        const driftRewatchMax = row.drift_rewatch_max ?? defaults.drift_rewatch_max ?? 0.2;
+        if (!Number.isFinite(driftRewatchMax) || driftRewatchMax < 0 || driftRewatchMax > 1) {
+          throw new Error(`targets ${row.address}: drift_rewatch_max must be a number in [0, 1]`);
+        }
+        if (driftRewatchSeconds > 0 && driftRewatchMax <= maxPriceDifference) {
+          console.warn(
+            `[config] targets ${row.address}: drift_rewatch_max (${driftRewatchMax}) <= max_price_difference ` +
+              `(${maxPriceDifference}) — no drift skip can qualify, so re-watch is effectively off`
+          );
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -417,6 +449,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
           hedgePrice,
           maxMarketUsdc,
           accumulateBelowMin,
+          driftRewatchSeconds,
+          driftRewatchMax,
           copyTradeLogPath,
         });
       }
@@ -476,6 +510,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
         minPositionUsdc,
         maxPositionUsdc,
         dryRun: false,
+        driftRewatchSeconds: 120,
+        driftRewatchMax: 0.2,
         copyTradeLogPath,
       });
     } else {
