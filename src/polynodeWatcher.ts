@@ -5,11 +5,14 @@ import { matchedMakerTargets, type SettlementData, type SettlementMessage } from
 /**
  * PolyNode pending-settlement watcher.
  *
- * Subscribes to the PolyNode `settlements` WebSocket filtered to our target wallets and emits a
- * match for every PENDING settlement (decoded from mempool calldata, ~3–5s before on-chain
- * confirmation). This replaces the ~2-blocktime `waitForTransaction` receipt wait on the copy path.
+ * Subscribes to the PolyNode `settlements` WebSocket as a FULL PENDING FIREHOSE (no `wallets`
+ * filter) and matches our target wallets LOCALLY, so PolyNode is never told which wallets we copy.
+ * Emits a match for every PENDING settlement involving a target (decoded from mempool calldata,
+ * ~3–5s before on-chain confirmation) — replacing the ~2-blocktime `waitForTransaction` receipt wait.
  *
  * Design notes:
+ *  - Firehose privacy: no wallet filter leaves this machine; local match-first drops non-target
+ *    settlements immediately (one Set lookup) to keep the read loop cheap and avoid backpressure.
  *  - We deliberately do NOT replay a snapshot (`snapshot_count: 0`). Snapshot events are historical;
  *    acting on them would copy trades that already happened (fatal on 5-minute markets). Gap coverage
  *    during a disconnect is provided by the on-chain OrderFilled fallback in `both` mode.
@@ -103,6 +106,14 @@ export function startPolynodeWatcher(
     if (data.status !== "pending" || !data.tx_hash) {
       return;
     }
+    // Firehose: match our targets locally BEFORE any other work. Non-target settlements (the vast
+    // majority of the stream) are dropped here with a single Set lookup — nothing else touches them.
+    // This keeps the dedupe map and logs holding ONLY our targets, and keeps the read loop cheap
+    // enough that we don't create backpressure and miss (get dropped) target settlements.
+    const matched = matchedMakerTargets(data, targetsLower);
+    if (matched.length === 0) {
+      return;
+    }
     const detectedAt = data.detected_at ?? msgTs ?? Date.now();
     const age = Date.now() - detectedAt;
     if (age > MAX_SETTLEMENT_AGE_MS) {
@@ -112,10 +123,6 @@ export function startPolynodeWatcher(
       return;
     }
     if (dedupe(data.tx_hash)) {
-      return;
-    }
-    const matched = matchedMakerTargets(data, targetsLower);
-    if (matched.length === 0) {
       return;
     }
     onMatch({ txHash: data.tx_hash, detectedAt, matchedTargets: matched, data });
@@ -160,14 +167,16 @@ export function startPolynodeWatcher(
     };
 
     socket.on("open", () => {
-      // Subscribe filtered to our targets. status:"pending" only, no snapshot replay.
+      // Full pending-settlement FIREHOSE — deliberately NO `wallets` filter, so PolyNode never
+      // learns which wallets we copy. We match our targets locally in handleSettlement. status:pending
+      // only, event_types settlement only (drops status_updates to cut volume), no snapshot replay.
       socket.send(
         JSON.stringify({
           action: "subscribe",
           type: "settlements",
           filters: {
-            wallets: [...targetsLower],
             status: "pending",
+            event_types: ["settlement"],
             snapshot_count: 0,
           },
         })
@@ -176,7 +185,7 @@ export function startPolynodeWatcher(
       if (wasReconnect) {
         console.log(`[polynode] reconnected · resubscribed after ${attemptAtBind} attempt(s)`);
       } else {
-        console.log(`[polynode] connected · watching ${targetsLower.size} target(s) for pending settlements`);
+        console.log(`[polynode] connected · pending-settlement firehose · filtering ${targetsLower.size} target(s) locally`);
       }
     });
 
