@@ -11,7 +11,7 @@
     "test-clob-btc-5m": "tsx scripts/testClobBtc5mCheapBuy.ts",
     "find-thresholds": "tsx scripts/findThresholds.ts",
     "analyze-target": "tsx scripts/analyzeTargetLog.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test src/settlementDigest.test.ts"
   },
   "keywords": [],
   "author": "",

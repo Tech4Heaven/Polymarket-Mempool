@@ -113,11 +113,23 @@ export type CopyTradeConfig = CopyTradeShared & {
   copyTradeLogPath?: string;
 };
 
+/**
+ * Where target trades are detected from:
+ *  - `polynode`: PolyNode pending-settlement mempool feed only (~3–5s pre-confirmation).
+ *  - `onchain`:  legacy OrderFilled log subscription + receipt (post-mining).
+ *  - `both`:     PolyNode primary + on-chain fallback, deduped by (tx, target). Default.
+ */
+export type DetectionSource = "polynode" | "onchain" | "both";
+
 export type AppConfig = {
-  /** WebSocket RPC URL — must be Alchemy (uses `alchemy_pendingTransactions` filtered subscription). */
+  /** WebSocket RPC URL — Polygon node used for the on-chain OrderFilled subscription. */
   polygonWssUrl: string;
   /** HTTP RPC URL used for receipt fetching (typically a cheaper provider like Chainstack). */
   polygonMempoolHttpUrl: string;
+  /** Detection strategy (default `both`). */
+  detectionSource: DetectionSource;
+  /** PolyNode API key (`pn_live_...`); required when detectionSource includes PolyNode. */
+  polynodeApiKey?: string;
   /** Trader wallets to watch in the mempool matcher. */
   targetTraderAddresses: string[];
   /** Subset of targets the withdrawal watcher polls (per-target `watch_withdrawals`, default false). */
@@ -279,16 +291,38 @@ async function resolveLogBasename(
   return `${label}_${addrLc}.log`;
 }
 
+function parseDetectionSource(): DetectionSource {
+  const raw = process.env["DETECTION_SOURCE"]?.trim().toLowerCase();
+  if (raw === "polynode" || raw === "onchain" || raw === "both") {
+    return raw;
+  }
+  if (raw) {
+    throw new Error(`DETECTION_SOURCE must be one of polynode|onchain|both (got "${raw}")`);
+  }
+  return "both";
+}
+
 function loadRpcOnly(): Pick<
   AppConfig,
   | "polygonWssUrl"
   | "polygonMempoolHttpUrl"
+  | "detectionSource"
+  | "polynodeApiKey"
   | "exchangeAddresses"
   | "maxConcurrentTxLookups"
   | "withdrawalPollMinutes"
   | "withdrawalAlertUsd"
 > {
-  const polygonWssUrl = requireEnv("POLYGON_WSS_URL");
+  const detectionSource = parseDetectionSource();
+  const polynodeApiKey = process.env["POLYNODE_API_KEY"]?.trim() || undefined;
+  if ((detectionSource === "polynode" || detectionSource === "both") && !polynodeApiKey) {
+    throw new Error(
+      `DETECTION_SOURCE=${detectionSource} requires POLYNODE_API_KEY (pn_live_...) in the environment`
+    );
+  }
+  // On-chain-only deployments don't need a Polygon WSS at all; require it otherwise.
+  const polygonWssUrl =
+    detectionSource === "polynode" ? (process.env["POLYGON_WSS_URL"]?.trim() ?? "") : requireEnv("POLYGON_WSS_URL");
   const polygonMempoolHttpUrl =
     process.env["POLYGON_MEMPOOL_HTTP_URL"]?.trim() ||
     process.env["POLYGON_HTTP_URL"]?.trim() ||
@@ -310,6 +344,8 @@ function loadRpcOnly(): Pick<
   return {
     polygonWssUrl,
     polygonMempoolHttpUrl,
+    detectionSource,
+    polynodeApiKey,
     exchangeAddresses,
     maxConcurrentTxLookups,
     withdrawalPollMinutes,
