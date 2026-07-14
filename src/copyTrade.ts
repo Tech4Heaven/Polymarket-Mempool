@@ -14,6 +14,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { withSuppressedPolymarketClobConsole } from "./clobConsoleSuppress.js";
 import type { CopyTradeConfig } from "./env.js";
 import type { Ctf1155TransferRow } from "./ctf1155Inbound.js";
+import { appendLedger, type LedgerRecord } from "./orderLedger.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { fetchPolymarketMarketLabels } from "./gammaEventName.js";
 
@@ -813,6 +814,8 @@ async function reconcileHedge(
     const msg = `hedge placed · condition=${state.conditionId} hedgeToken=${finalHedge.tokenId} price=${finalHedge.price} shares=${finalHedge.size} cost=$${finalCost.toFixed(4)} · tx=${txHash} · ${JSON.stringify(resp)}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+    // P&L ledger (fire-and-forget): the hedge leg is part of each target's realized profit.
+    void recordOrderForPnl({ cfg, resp, tokenId: finalHedge.tokenId, side: "buy", isHedge: true, limitPrice: finalHedge.price, conditionId: state.conditionId });
   } catch (e) {
     const errMsg = `hedge · post failed: ${e instanceof Error ? e.message : String(e)} · condition=${state.conditionId} hedgeToken=${finalHedge.tokenId} · tx=${txHash}`;
     console.error(errMsg);
@@ -1073,6 +1076,64 @@ export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig): Promise<voi
  * Sizes with **shares = (pUSD_notional × COPY_RATIO, clipped) / currentPrice**, where `currentPrice` is the
  * order-book midpoint derived locally from best bid/ask. Posts a marketable GTC limit at/through the book.
  */
+/**
+ * Fire-and-forget: record a LIVE posted order to the P&L ledger for later per-target reconciliation.
+ * Always called with `void` — it must never block or break the trading path, so every failure is
+ * swallowed. Fill amounts are the post-time fill from the CLOB response (see orderLedger note).
+ */
+async function recordOrderForPnl(args: {
+  cfg: CopyTradeConfig;
+  resp: unknown;
+  tokenId: string;
+  side: "buy" | "sell";
+  isHedge: boolean;
+  limitPrice: number;
+  conditionId?: string;
+  outcome?: string;
+  event?: string;
+}): Promise<void> {
+  try {
+    const orderId = (args.resp as { orderID?: string })?.orderID;
+    if (!orderId) {
+      return;
+    }
+    const r = args.resp as { takingAmount?: string; makingAmount?: string };
+    const taking = parseFloat(r.takingAmount ?? "0") || 0;
+    const making = parseFloat(r.makingAmount ?? "0") || 0;
+    const filledShares = args.side === "buy" ? taking : making;
+    const filledUsdc = args.side === "buy" ? making : taking;
+
+    const conditionId = args.conditionId ?? (await getOppositeTokenId(args.tokenId))?.conditionId;
+    if (!conditionId) {
+      return; // can't reconcile without the market
+    }
+    let outcome = args.outcome;
+    let event = args.event;
+    if (outcome === undefined || event === undefined) {
+      const labels = await fetchPolymarketMarketLabels(args.tokenId);
+      outcome = outcome ?? labels.outcome;
+      event = event ?? labels.event;
+    }
+    const rec: LedgerRecord = {
+      ts: Date.now(),
+      orderId,
+      target: args.cfg.targetAddress,
+      conditionId,
+      tokenId: args.tokenId,
+      outcome: outcome ?? "",
+      side: args.side,
+      isHedge: args.isHedge,
+      filledShares,
+      filledUsdc,
+      limitPrice: args.limitPrice,
+      event: event ?? "",
+    };
+    await appendLedger(rec);
+  } catch {
+    // bookkeeping is best-effort; never affect trading
+  }
+}
+
 export async function executeCopyTrade(
   cfg: CopyTradeConfig,
   digest: CopyDigest,
@@ -1497,6 +1558,8 @@ export async function executeCopyTrade(
   const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)} · tx=${txHash}${flushSuffix} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+  // P&L ledger (fire-and-forget): record this order for per-target reconciliation at resolution.
+  void recordOrderForPnl({ cfg, resp, tokenId: digest.tokenId, side: digest.side, isHedge: false, limitPrice, outcome, event });
 
   // After a successful live BUY: add filled shares to sharesByToken and reconcile (hedge grows).
   // After a successful live SELL: subtract filled shares from sharesByToken and reconcile so
