@@ -51,6 +51,14 @@ max_position_usdc = 100
 # Example: max_price_difference = 0.1, drift_rewatch_max = 0.2 → re-watch skips with drift in (0.1, 0.2];
 # a skip at drift 0.15 is re-watched, a skip at 0.3 is dropped. Default 0.2.
 # drift_rewatch_max = 0.2
+# Auto-stop (drawdown circuit breaker). Positive USD loss caps on this target's REALIZED P&L
+# (from resolved markets in the P&L ledger). When breached, the bot halts NEW copies for the target
+# (existing positions can still be exited via sells). Omit either to disable that limit.
+#   max_drawdown_per_day: stop once today's (UTC) realized P&L <= -this; auto-resumes next UTC day.
+#   max_drawdown_total:   stop once all-time realized P&L <= -this; stays stopped until P&L recovers
+#                         above the cap or you raise/remove the limit.
+# max_drawdown_per_day = 50
+# max_drawdown_total = 200
 # Master enable/disable for the row. When false, the bot does NOTHING for this address — no copy,
 # no mempool match, no withdrawal poll. Default true. Handy to temporarily pause a target without
 # deleting its config.

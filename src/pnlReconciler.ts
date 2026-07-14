@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from "path";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import type { AppConfig } from "./env.js";
 import { readLedger, type LedgerRecord } from "./orderLedger.js";
+import { appendRealizedPnl } from "./pnlRealized.js";
 
 /**
  * Per-target P&L reconciler. Periodically finds markets the bot traded (from the order ledger) that
@@ -142,6 +143,8 @@ async function reconcileOnce(config: AppConfig): Promise<void> {
       } else {
         console.log(line);
       }
+      // Structured feed for the drawdown guard (pollable, no API/log-parsing).
+      void appendRealizedPnl({ ts: Date.now(), target, conditionId, pnl });
     }
 
     await markResolved(conditionId);

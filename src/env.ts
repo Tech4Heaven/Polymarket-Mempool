@@ -79,6 +79,10 @@ export type TargetCopyParams = {
    * Larger drifts are dropped permanently. Should exceed max_price_difference. Default 0.2.
    */
   driftRewatchMax?: number;
+  /** Auto-stop: max realized USD loss today (UTC) before halting new copies; omit to disable. */
+  maxDrawdownPerDay?: number;
+  /** Auto-stop: max realized USD loss all-time before halting new copies; omit to disable. */
+  maxDrawdownTotal?: number;
   copyTradeLogPath: string;
 };
 
@@ -102,6 +106,10 @@ export type CopyTradeConfig = CopyTradeShared & {
   driftRewatchSeconds?: number;
   /** Per-target max drift at skip time still eligible for re-watch (default 0.2). */
   driftRewatchMax?: number;
+  /** Per-target auto-stop: max realized USD loss today (UTC) before halting new copies. */
+  maxDrawdownPerDay?: number;
+  /** Per-target auto-stop: max realized USD loss all-time before halting new copies. */
+  maxDrawdownTotal?: number;
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -166,6 +174,8 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     accumulateBelowMin: p.accumulateBelowMin,
     driftRewatchSeconds: p.driftRewatchSeconds,
     driftRewatchMax: p.driftRewatchMax,
+    maxDrawdownPerDay: p.maxDrawdownPerDay,
+    maxDrawdownTotal: p.maxDrawdownTotal,
     targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
@@ -472,6 +482,17 @@ export async function loadAppConfig(): Promise<AppConfig> {
           );
         }
 
+        const maxDrawdownPerDay = row.max_drawdown_per_day ?? defaults.max_drawdown_per_day;
+        const maxDrawdownTotal = row.max_drawdown_total ?? defaults.max_drawdown_total;
+        for (const [k, v] of [
+          ["max_drawdown_per_day", maxDrawdownPerDay],
+          ["max_drawdown_total", maxDrawdownTotal],
+        ] as const) {
+          if (v !== undefined && (!Number.isFinite(v) || v <= 0)) {
+            throw new Error(`targets ${row.address}: ${k} must be a positive number (USD loss limit)`);
+          }
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -487,6 +508,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
           accumulateBelowMin,
           driftRewatchSeconds,
           driftRewatchMax,
+          maxDrawdownPerDay,
+          maxDrawdownTotal,
           copyTradeLogPath,
         });
       }

@@ -7,6 +7,7 @@ import { extractCtf1155TransfersForTargets } from "./ctf1155Inbound.js";
 import type { AppConfig, TargetCopyParams } from "./env.js";
 import { loadAppConfig, mergeCopyTradeConfig } from "./env.js";
 import { startMempoolWatcher } from "./mempool.js";
+import { startDrawdownGuard } from "./drawdownGuard.js";
 import { startPnlReconciler } from "./pnlReconciler.js";
 import { startPolynodeWatcher, type PolynodeMatch } from "./polynodeWatcher.js";
 import { buildDigestsFromSettlement } from "./settlementDigest.js";
@@ -271,6 +272,9 @@ async function main() {
 
   // Per-target realized-P&L reconciler: writes `[resolved]` lines to per-target logs as markets settle.
   startPnlReconciler(config);
+
+  // Drawdown breaker: auto-halt copies for targets that breach max_drawdown_per_day / max_drawdown_total.
+  startDrawdownGuard(config);
 
   // Watch enabled target wallets for fund withdrawals (funds leaving → trader may have rotated address).
   startWithdrawalWatcher(config);

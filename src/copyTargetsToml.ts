@@ -53,6 +53,14 @@ export type TomlDefaultsSection = {
    */
   drift_rewatch_max?: number;
   /**
+   * Auto-stop copying this target when its realized P&L falls too far. Positive USD loss limits:
+   *  - max_drawdown_per_day: stop new copies once today's (UTC) realized P&L ≤ −this; resumes next day.
+   *  - max_drawdown_total:   stop new copies once all-time realized P&L ≤ −this (until config/limit change).
+   * Omit either to disable that limit. Realized P&L comes from resolved markets in the P&L ledger.
+   */
+  max_drawdown_per_day?: number;
+  max_drawdown_total?: number;
+  /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
    */
@@ -76,6 +84,8 @@ export type TomlTargetRow = {
   accumulate_below_min?: boolean;
   drift_rewatch_seconds?: number;
   drift_rewatch_max?: number;
+  max_drawdown_per_day?: number;
+  max_drawdown_total?: number;
   enabled?: boolean;
 };
 
@@ -144,6 +154,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       accumulate_below_min: boolOrUndef("accumulate_below_min", src),
       drift_rewatch_seconds: numOrUndef("drift_rewatch_seconds", src),
       drift_rewatch_max: numOrUndef("drift_rewatch_max", src),
+      max_drawdown_per_day: numOrUndef("max_drawdown_per_day", src),
+      max_drawdown_total: numOrUndef("max_drawdown_total", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -180,6 +192,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       accumulate_below_min: boolOrUndef("accumulate_below_min", row),
       drift_rewatch_seconds: numOrUndef("drift_rewatch_seconds", row),
       drift_rewatch_max: numOrUndef("drift_rewatch_max", row),
+      max_drawdown_per_day: numOrUndef("max_drawdown_per_day", row),
+      max_drawdown_total: numOrUndef("max_drawdown_total", row),
       enabled: boolOrUndef("enabled", row),
     });
   }

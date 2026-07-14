@@ -15,6 +15,7 @@ import { withSuppressedPolymarketClobConsole } from "./clobConsoleSuppress.js";
 import type { CopyTradeConfig } from "./env.js";
 import type { Ctf1155TransferRow } from "./ctf1155Inbound.js";
 import { appendLedger, type LedgerRecord } from "./orderLedger.js";
+import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { fetchPolymarketMarketLabels } from "./gammaEventName.js";
 
@@ -1140,6 +1141,16 @@ export async function executeCopyTrade(
   txHash: string,
   opts?: { fromRewatch?: boolean }
 ): Promise<void> {
+  // Drawdown circuit breaker: halt NEW exposure (buys) for a target that breached its P&L limit.
+  // Sells/exits are still allowed so existing positions can be unwound.
+  if (digest.side === "buy") {
+    const stop = isTargetStopped(cfg.targetAddress);
+    if (stop) {
+      await logCopySkip(`target auto-stopped (drawdown) · ${stop}`, digest, txHash, cfg);
+      return;
+    }
+  }
+
   const implied = impliedPrice(digest.pusdRaw, digest.outcomeRaw);
   const originPusd = parseFloat(formatUnits(digest.pusdRaw, 6));
   const originShares = parseFloat(formatUnits(digest.outcomeRaw, 6));
