@@ -61,6 +61,16 @@ export type TomlDefaultsSection = {
   max_drawdown_per_day?: number;
   max_drawdown_total?: number;
   /**
+   * Taker fill improvement. Post buys ABOVE the best ask so they cross and fill instead of resting:
+   *  - taker_bump:          price amount (0–1 units, e.g. 0.02 = 2¢) added above the ask.
+   *  - max_taker_bump_frac: caps the bump to this fraction of the ask (e.g. 0.10 = at most 10% of price),
+   *                         so low prices aren't over-paid. Tick-aware: if one tick would exceed the cap,
+   *                         it posts at the ask (no bump). Default 0.10 when taker_bump is set.
+   * Omit taker_bump (or 0) to keep maker-style posting. Applied after the drift check; buy_price_max caps it.
+   */
+  taker_bump?: number;
+  max_taker_bump_frac?: number;
+  /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
    */
@@ -86,6 +96,8 @@ export type TomlTargetRow = {
   drift_rewatch_max?: number;
   max_drawdown_per_day?: number;
   max_drawdown_total?: number;
+  taker_bump?: number;
+  max_taker_bump_frac?: number;
   enabled?: boolean;
 };
 
@@ -156,6 +168,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       drift_rewatch_max: numOrUndef("drift_rewatch_max", src),
       max_drawdown_per_day: numOrUndef("max_drawdown_per_day", src),
       max_drawdown_total: numOrUndef("max_drawdown_total", src),
+      taker_bump: numOrUndef("taker_bump", src),
+      max_taker_bump_frac: numOrUndef("max_taker_bump_frac", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -194,6 +208,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       drift_rewatch_max: numOrUndef("drift_rewatch_max", row),
       max_drawdown_per_day: numOrUndef("max_drawdown_per_day", row),
       max_drawdown_total: numOrUndef("max_drawdown_total", row),
+      taker_bump: numOrUndef("taker_bump", row),
+      max_taker_bump_frac: numOrUndef("max_taker_bump_frac", row),
       enabled: boolOrUndef("enabled", row),
     });
   }

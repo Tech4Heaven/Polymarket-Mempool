@@ -83,6 +83,10 @@ export type TargetCopyParams = {
   maxDrawdownPerDay?: number;
   /** Auto-stop: max realized USD loss all-time before halting new copies; omit to disable. */
   maxDrawdownTotal?: number;
+  /** Taker fill: price amount (0–1) added above the ask so buys cross and fill. Omit/0 = maker-style. */
+  takerBump?: number;
+  /** Cap on the taker bump as a fraction of the ask (default 0.10 when takerBump set). */
+  maxTakerBumpFrac?: number;
   copyTradeLogPath: string;
 };
 
@@ -110,6 +114,10 @@ export type CopyTradeConfig = CopyTradeShared & {
   maxDrawdownPerDay?: number;
   /** Per-target auto-stop: max realized USD loss all-time before halting new copies. */
   maxDrawdownTotal?: number;
+  /** Per-target taker bump (price added above the ask so buys fill). */
+  takerBump?: number;
+  /** Per-target cap on the taker bump as a fraction of the ask. */
+  maxTakerBumpFrac?: number;
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -176,6 +184,8 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     driftRewatchMax: p.driftRewatchMax,
     maxDrawdownPerDay: p.maxDrawdownPerDay,
     maxDrawdownTotal: p.maxDrawdownTotal,
+    takerBump: p.takerBump,
+    maxTakerBumpFrac: p.maxTakerBumpFrac,
     targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
@@ -493,6 +503,15 @@ export async function loadAppConfig(): Promise<AppConfig> {
           }
         }
 
+        const takerBump = row.taker_bump ?? defaults.taker_bump;
+        if (takerBump !== undefined && (!Number.isFinite(takerBump) || takerBump < 0 || takerBump >= 1)) {
+          throw new Error(`targets ${row.address}: taker_bump must be a price amount in [0, 1) (e.g. 0.02)`);
+        }
+        const maxTakerBumpFrac = row.max_taker_bump_frac ?? defaults.max_taker_bump_frac;
+        if (maxTakerBumpFrac !== undefined && (!Number.isFinite(maxTakerBumpFrac) || maxTakerBumpFrac <= 0 || maxTakerBumpFrac > 1)) {
+          throw new Error(`targets ${row.address}: max_taker_bump_frac must be a fraction in (0, 1] (e.g. 0.10)`);
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -510,6 +529,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
           driftRewatchMax,
           maxDrawdownPerDay,
           maxDrawdownTotal,
+          takerBump,
+          maxTakerBumpFrac,
           copyTradeLogPath,
         });
       }

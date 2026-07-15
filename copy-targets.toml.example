@@ -59,6 +59,16 @@ max_position_usdc = 100
 #                         above the cap or you raise/remove the limit.
 # max_drawdown_per_day = 50
 # max_drawdown_total = 200
+# Taker fill improvement — make buys cross the ask and fill instead of resting (thin books).
+#   taker_bump:          price added ABOVE the best ask (0-1 units; 0.02 = 2 cents). Omit/0 = maker-style.
+#   max_taker_bump_frac: caps the bump to this fraction of the ask so low prices aren't over-paid
+#                        (0.10 = at most 10% of price). Tick-aware: if one tick would exceed the cap it
+#                        posts at the ask (no bump). Default 0.10 when taker_bump is set.
+# Example: ask 0.58 → posts 0.60 (2c bump, ~3.4%); ask 0.10 → posts 0.11 (capped to 10%); ask 0.01 on a
+# 0.01-tick market → posts 0.01 (bump would be a full-tick 100% overpay, so it's skipped).
+# Applied after the drift check; buy_price_max still caps the final price.
+# taker_bump = 0.02
+# max_taker_bump_frac = 0.10
 # Master enable/disable for the row. When false, the bot does NOTHING for this address — no copy,
 # no mempool match, no withdrawal poll. Default true. Handy to temporarily pause a target without
 # deleting its config.

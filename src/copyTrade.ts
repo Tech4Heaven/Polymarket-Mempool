@@ -116,6 +116,39 @@ function roundToTick(price: number, tick: TickSize, mode: "up" | "down"): number
   return Math.max(0, Math.floor(price / t + 1e-12) * t);
 }
 
+/** Relative cap used for the taker bump when `taker_bump` is set but `max_taker_bump_frac` is omitted. */
+export const DEFAULT_MAX_TAKER_BUMP_FRAC = 0.1;
+
+/**
+ * Buy limit price with the optional taker bump applied. Posts ABOVE the ask so the order crosses and
+ * fills as a taker, but caps the bump to `maxFrac × ask` (so low prices aren't over-paid) and stays
+ * tick-aware: if rounding the bump UP to the tick would exceed the cap, it falls back to `baseLimit`
+ * (post at the ask) rather than overpay a whole tick — accepting the order may rest instead.
+ *
+ * Applied AFTER the drift check (option B), so the bump doesn't fight the drift filter; `buy_price_max`
+ * still bounds the result downstream. Returns `baseLimit` unchanged when the bump is disabled.
+ */
+export function applyTakerBump(
+  ask: number,
+  baseLimit: number,
+  tick: TickSize,
+  takerBump: number | undefined,
+  maxTakerBumpFrac: number | undefined
+): number {
+  if (takerBump === undefined || takerBump <= 0 || !(ask > 0)) {
+    return baseLimit;
+  }
+  const frac = maxTakerBumpFrac ?? DEFAULT_MAX_TAKER_BUMP_FRAC;
+  const cap = ask * frac;
+  const effBump = Math.min(takerBump, cap);
+  const bumped = roundToTick(ask + effBump, tick, "up");
+  const maxAllowed = ask * (1 + frac);
+  if (bumped > baseLimit && bumped <= maxAllowed + 1e-9) {
+    return bumped;
+  }
+  return baseLimit; // one tick would break the cap, or bump gives no improvement over base
+}
+
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
@@ -1336,6 +1369,9 @@ export async function executeCopyTrade(
     }
 
     limitPrice = roundToTick(effectivePrice, tickSize, "up");
+    // Taker bump (fill improvement): cross above the ask so the order fills, capped relative to price
+    // and tick-aware. After the drift check (option B), before the buy_price bounds below.
+    limitPrice = applyTakerBump(ask, limitPrice, tickSize, cfg.takerBump, cfg.maxTakerBumpFrac);
 
     if (cfg.buyPriceMin !== undefined && limitPrice < cfg.buyPriceMin) {
       await logCopySkip(
