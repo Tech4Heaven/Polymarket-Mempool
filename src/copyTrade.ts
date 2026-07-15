@@ -18,6 +18,7 @@ import { appendLedger, type LedgerRecord } from "./orderLedger.js";
 import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { fetchPolymarketMarketLabels } from "./gammaEventName.js";
+import { registerSimOrder } from "./fillSim.js";
 
 function aggregateOutcomeByTokenId(rows: Ctf1155TransferRow[]): Map<string, bigint> {
   const m = new Map<string, bigint>();
@@ -1558,6 +1559,23 @@ export async function executeCopyTrade(
       `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${effectiveImplied.toFixed(4)} · tx=${txHash}${flushSuffix}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+    // Fill simulation (dry-run only): track how this order would fill against real live market flow.
+    try {
+      registerSimOrder({
+        tokenId: digest.tokenId,
+        side: digest.side,
+        limitPrice,
+        size: orderShares,
+        book,
+        targetAddress: cfg.targetAddress,
+        logPath: cfg.copyTradeLogPath ?? "logs/sim.log",
+        event,
+        outcome,
+        txHash,
+      });
+    } catch (e) {
+      console.warn(`[SIM] register failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
     // Reservation for buys was already committed atomically above (max_market_usdc block).
     if (digest.side === "buy") {
       await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash);
