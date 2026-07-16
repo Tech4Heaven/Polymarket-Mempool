@@ -1316,6 +1316,7 @@ export async function executeCopyTrade(
   }
 
   let limitPrice: number;
+  let takerBumpNote = ""; // shows in the copy-posted/dry-run log whether the taker bump was applied
   if (digest.side === "buy") {
     const ask = bestAsk(book);
     if (ask === null) {
@@ -1369,10 +1370,16 @@ export async function executeCopyTrade(
       return;
     }
 
-    limitPrice = roundToTick(effectivePrice, tickSize, "up");
+    const baseLimit = roundToTick(effectivePrice, tickSize, "up");
     // Taker bump (fill improvement): cross above the ask so the order fills, capped relative to price
     // and tick-aware. After the drift check (option B), before the buy_price bounds below.
-    limitPrice = applyTakerBump(ask, limitPrice, tickSize, cfg.takerBump, cfg.maxTakerBumpFrac);
+    limitPrice = applyTakerBump(ask, baseLimit, tickSize, cfg.takerBump, cfg.maxTakerBumpFrac);
+    if (cfg.takerBump !== undefined && cfg.takerBump > 0) {
+      takerBumpNote =
+        limitPrice > baseLimit
+          ? ` · takerBump=+${(limitPrice - baseLimit).toFixed(4)} (ask=${ask.toFixed(4)} base=${baseLimit.toFixed(4)}→${limitPrice.toFixed(4)})`
+          : ` · takerBump=none (ask=${ask.toFixed(4)} base=${baseLimit.toFixed(4)}; cap/tick blocked)`;
+    }
 
     if (cfg.buyPriceMin !== undefined && limitPrice < cfg.buyPriceMin) {
       await logCopySkip(
@@ -1556,7 +1563,7 @@ export async function executeCopyTrade(
     const pUsdForLog = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
     const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
     const msg =
-      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${effectiveImplied.toFixed(4)} · tx=${txHash}${flushSuffix}`;
+      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${effectiveImplied.toFixed(4)}${takerBumpNote} · tx=${txHash}${flushSuffix}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
     // Fill simulation (dry-run only): track how this order would fill against real live market flow.
@@ -1620,7 +1627,7 @@ export async function executeCopyTrade(
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
   const intendedPUsd = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
   const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
-  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)} · tx=${txHash}${flushSuffix} · ${JSON.stringify(resp)}`;
+  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)}${takerBumpNote} · tx=${txHash}${flushSuffix} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
   // P&L ledger (fire-and-forget): record this order for per-target reconciliation at resolution.
