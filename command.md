@@ -104,7 +104,31 @@ npm run encrypt-wallet
 
 ---
 
-## 5. Quick log greps
+## 5. Sell / flatten positions
+
+Manually liquidate the copy wallet's positions (independent of copy targets). **Preview-first** — without `--execute` it only prints what it would sell.
+
+```bash
+# Preview ALL open positions the wallet holds (places nothing)
+npm run sell-all
+
+# Actually sell everything, marketable at the best bid
+npm run sell-all -- --execute
+
+# Sell an INDIVIDUAL market/position (preview, then add --execute to sell):
+npm run sell-all -- --slug btc-updown-5m-1782372900     # by market / event slug (substring)
+npm run sell-all -- --market "Bitcoin Up or Down"       # by market title / outcome text (substring)
+npm run sell-all -- --token 100313866500070...          # by exact outcome token
+
+# Skip tiny positions (default $0.01)
+npm run sell-all -- --min-usd 1
+```
+
+Uses the copy wallet (`FUNDER_ADDRESS`, same key/signature as copy trading). Resolved markets (no live book) are **skipped** — redeem those separately. Thin books may only fill the top bid level; re-run to sweep the remainder.
+
+---
+
+## 6. Quick log greps
 
 ```bash
 # Event type counts in a per-target log
@@ -122,7 +146,7 @@ grep "heartbeat timeout" logs/pm2-out.log
 
 ---
 
-## 6. Polymarket API lookups (replace `0x...` with target address)
+## 7. Polymarket API lookups (replace `0x...` with target address)
 
 ```bash
 curl -s "https://lb-api.polymarket.com/profit?window=all&address=0x..." | jq

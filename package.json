@@ -11,7 +11,8 @@
     "test-clob-btc-5m": "tsx scripts/testClobBtc5mCheapBuy.ts",
     "find-thresholds": "tsx scripts/findThresholds.ts",
     "analyze-target": "tsx scripts/analyzeTargetLog.ts",
-    "test": "tsx --test src/settlementDigest.test.ts src/pnlReconciler.test.ts src/drawdownGuard.test.ts src/takerBump.test.ts"
+    "test": "tsx --test src/settlementDigest.test.ts src/pnlReconciler.test.ts src/drawdownGuard.test.ts src/takerBump.test.ts",
+    "sell-all": "tsx scripts/sellAllPositions.ts"
   },
   "keywords": [],
   "author": "",
