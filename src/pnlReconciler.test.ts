@@ -88,6 +88,14 @@ test("unfilled resting order (0/0) contributes nothing", () => {
   assert.equal(r.pnl, 30);
 });
 
+test("regression: resting order that truly filled → real win (was reported $0)", () => {
+  // The bug: order logged filled=0 (resting), then filled 122.3 Up @0.30 and Up won.
+  // Reconciler now feeds the TRUE fill (from getOrder) here, so it must show the ~+$85.6 win,
+  // not $0. cost = 122.3*0.30 = 36.69, payout = 122.3.
+  const r = computeTargetPnl([rec({ outcome: "Up", side: "buy", filledShares: 122.3, filledUsdc: 36.69 })], "Up");
+  assert.ok(Math.abs(r.pnl - 85.61) < 0.02, `expected ~+85.6, got ${r.pnl}`);
+});
+
 test("net negative shares clamp to 0 payout", () => {
   // defensive: over-refund / accounting drift shouldn't create phantom payout
   const r = computeTargetPnl([rec({ outcome: "Up", side: "sell", filledShares: 10, filledUsdc: 5 })], "Up");
