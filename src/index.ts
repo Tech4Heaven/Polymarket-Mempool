@@ -199,9 +199,13 @@ async function main() {
       // Restart safety: cancel orphan GTC orders from a prior run so they can't fill behind
       // the (now-empty) in-memory hedge state and create double-hedge / unexpected exposure.
       // Only runs if any target uses hedging — otherwise the bot doesn't post GTC itself either.
-      const anyHedging = [...config.targetCopyProfiles.values()].some((p) => p.hedgePrice !== undefined);
+      const hedgePrices = [...config.targetCopyProfiles.values()]
+        .map((p) => p.hedgePrice)
+        .filter((x): x is number => x !== undefined);
+      const anyHedging = hedgePrices.length > 0;
       if (anyHedging && !probeCfg.dryRun) {
-        await cancelAllStaleGtcOrders(probeCfg);
+        // Cancels ONLY stale hedge orders; every target's resting copy orders are left alone.
+        await cancelAllStaleGtcOrders(probeCfg, hedgePrices);
       }
       // Mark the boot in every per-target log. Without this, a restart looks identical to
       // continuous operation when reading a per-target file later — and lost in-memory state

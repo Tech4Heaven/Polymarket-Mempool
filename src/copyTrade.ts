@@ -14,7 +14,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { withSuppressedPolymarketClobConsole } from "./clobConsoleSuppress.js";
 import type { CopyTradeConfig } from "./env.js";
 import type { Ctf1155TransferRow } from "./ctf1155Inbound.js";
-import { appendLedger, type LedgerRecord } from "./orderLedger.js";
+import { appendLedger, readLedger, type LedgerRecord } from "./orderLedger.js";
 import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { fetchPolymarketMarketLabels } from "./gammaEventName.js";
@@ -1081,7 +1081,15 @@ async function checkRestingHedgeSuppression(
  * Caveat: if other systems share this wallet, their GTC orders will also be cancelled. The user
  * was warned and opted in.
  */
-export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig): Promise<void> {
+/**
+ * On restart, cancel only STALE HEDGE orders — never copy orders. Hedges lose their in-memory
+ * tracking across a restart and could double-hedge / create unexpected exposure, so they must go;
+ * but resting COPY orders (from ANY target) are left alone so a restart doesn't wipe them.
+ *
+ * A hedge is identified by the P&L ledger (`isHedge` for that orderId) and, as a fallback for
+ * orders not in the ledger, a BUY resting at one of the configured `hedgePrices`.
+ */
+export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig, hedgePrices: number[] = []): Promise<void> {
   try {
     const client = await ensureClobClient(cfg);
     const orders = await client.getOpenOrders();
@@ -1089,8 +1097,30 @@ export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig): Promise<voi
       console.log("startup: no pre-existing open orders to clean up");
       return;
     }
-    console.log(`startup: cancelling ${orders.length} pre-existing open order(s)`);
-    for (const o of orders) {
+    const ledger = await readLedger();
+    const hedgeIds = new Set(ledger.filter((r) => r.isHedge).map((r) => r.orderId));
+    const isHedgeOrder = (o: { id?: string; side?: string; price?: string }): boolean => {
+      if (o.id && hedgeIds.has(o.id)) {
+        return true;
+      }
+      if ((o.side ?? "").toUpperCase() === "BUY") {
+        const p = parseFloat(o.price ?? "");
+        if (Number.isFinite(p) && hedgePrices.some((hp) => Math.abs(hp - p) < 1e-9)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const hedges = orders.filter(isHedgeOrder);
+    if (hedges.length === 0) {
+      console.log(`startup: ${orders.length} open order(s), none are hedges — leaving all copy orders resting`);
+      return;
+    }
+    console.log(
+      `startup: cancelling ${hedges.length} stale hedge order(s); leaving ${orders.length - hedges.length} copy order(s) resting`
+    );
+    for (const o of hedges) {
       const id = (o as { id?: string }).id;
       if (!id) {
         continue;
@@ -1101,7 +1131,7 @@ export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig): Promise<voi
         console.warn(`startup: cancel ${id} failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
-    console.log("startup: cleanup done");
+    console.log("startup: hedge cleanup done");
   } catch (e) {
     console.warn(`startup: failed to list open orders: ${e instanceof Error ? e.message : String(e)}`);
   }
