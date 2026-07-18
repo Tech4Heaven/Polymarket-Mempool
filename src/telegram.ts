@@ -12,6 +12,11 @@ function tgConfig(): { token: string; chatId: string } | null {
   return token && chatId ? { token, chatId } : null;
 }
 
+/** Per-deployment label (set BOT_NAME in each bot's .env) so one chat can tell the bots apart. */
+function botLabel(): string {
+  return process.env["BOT_NAME"]?.trim() || "";
+}
+
 export function isTelegramEnabled(): boolean {
   return tgConfig() !== null;
 }
@@ -21,11 +26,13 @@ export async function sendTelegram(text: string): Promise<void> {
   if (!c) {
     return;
   }
+  const label = botLabel();
+  const body = label ? `🤖 ${label}\n\n${text}` : text;
   try {
     const res = await fetch(`https://api.telegram.org/bot${c.token}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: c.chatId, text, disable_web_page_preview: true }),
+      body: JSON.stringify({ chat_id: c.chatId, text: body, disable_web_page_preview: true }),
     });
     if (!res.ok) {
       console.warn(`[telegram] sendMessage HTTP ${res.status}`);
