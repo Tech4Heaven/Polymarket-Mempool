@@ -9,6 +9,7 @@ import { loadAppConfig, mergeCopyTradeConfig } from "./env.js";
 import { startMempoolWatcher } from "./mempool.js";
 import { startDrawdownGuard } from "./drawdownGuard.js";
 import { startPnlReconciler } from "./pnlReconciler.js";
+import { startTelegramCommandListener } from "./telegramCommands.js";
 import { startPolynodeWatcher, type PolynodeMatch } from "./polynodeWatcher.js";
 import { buildDigestsFromSettlement } from "./settlementDigest.js";
 import { aggregatePusdForTargets } from "./pusdTransfers.js";
@@ -279,6 +280,11 @@ async function main() {
 
   // Drawdown breaker: auto-halt copies for targets that breach max_drawdown_per_day / max_drawdown_total.
   startDrawdownGuard(config);
+
+  // Telegram /balance command listener — only where TELEGRAM_COMMAND_LISTENER=true (Main), since one
+  // token can have a single getUpdates poller. Reports every deployment wallet (addresses read live
+  // from each sibling folder's .env).
+  startTelegramCommandListener(config);
 
   // Watch enabled target wallets for fund withdrawals (funds leaving → trader may have rotated address).
   startWithdrawalWatcher(config);
