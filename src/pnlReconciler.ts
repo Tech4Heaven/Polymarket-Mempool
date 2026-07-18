@@ -1,10 +1,12 @@
 import { appendFile, readFile } from "fs/promises";
-import { isAbsolute, resolve } from "path";
+import { basename, isAbsolute, resolve } from "path";
 import { ensureClobClient } from "./copyTrade.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
+import { evaluateTargetStop } from "./drawdownGuard.js";
 import { mergeCopyTradeConfig, type AppConfig, type CopyTradeConfig } from "./env.js";
 import { readLedger, type LedgerRecord } from "./orderLedger.js";
-import { appendRealizedPnl } from "./pnlRealized.js";
+import { appendRealizedPnl, readRealizedPnl } from "./pnlRealized.js";
+import { isTelegramEnabled, sendTelegram } from "./telegram.js";
 
 /**
  * Per-target realized-P&L reconciler. Finds markets the bot traded (from the order ledger) that have
@@ -161,6 +163,135 @@ async function conditionPnlFromChain(
   }
 }
 
+// ── Telegram resolution card ──────────────────────────────────────────────────
+
+function utcDay(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+function money(x: number): string {
+  return `${x >= 0 ? "+" : "-"}$${Math.abs(x).toFixed(2)}`;
+}
+function shortAddr(a: string): string {
+  return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
+}
+function usernameFor(config: AppConfig, target: string): string {
+  const lp = config.targetCopyProfiles.get(target)?.copyTradeLogPath;
+  if (lp) {
+    const name = basename(lp).replace(/\.log$/, "").split("_0x")[0];
+    if (name) {
+      return name;
+    }
+  }
+  return "target";
+}
+/** Outcome the bot primarily bought — the "your side" line. */
+function primaryBuySide(recs: LedgerRecord[]): string {
+  const cnt = new Map<string, number>();
+  for (const r of recs) {
+    if (r.side === "buy") {
+      cnt.set(r.outcome, (cnt.get(r.outcome) ?? 0) + 1);
+    }
+  }
+  let best = "";
+  let n = -1;
+  for (const [oc, c] of cnt) {
+    if (c > n) {
+      best = oc;
+      n = c;
+    }
+  }
+  return best || recs[0]?.outcome || "?";
+}
+/** If the bot bought the winning side but sold most of it before resolution, describe it. */
+function exitBeforePayout(trs: LedgerRecord[], winner: string, heldWinner: number): string | undefined {
+  let bSh = 0;
+  let bUsd = 0;
+  let sSh = 0;
+  let sUsd = 0;
+  for (const r of trs) {
+    if (r.outcome !== winner) {
+      continue;
+    }
+    if (r.side === "buy") {
+      bSh += r.filledShares;
+      bUsd += r.filledUsdc;
+    } else {
+      sSh += r.filledShares;
+      sUsd += r.filledUsdc;
+    }
+  }
+  if (bSh > 0.5 && sSh > bSh * 0.5 && heldWinner < bSh * 0.5) {
+    return `bought ${bSh.toFixed(0)} @${(bUsd / bSh).toFixed(2)}, sold ${sSh.toFixed(0)} @${(sUsd / sSh).toFixed(2)}`;
+  }
+  return undefined;
+}
+
+type CardOpts = {
+  target: string;
+  conditionId: string;
+  event: string;
+  winner: string;
+  yourSide: string;
+  breakdown: string;
+  cost: number;
+  payout: number;
+  pnl: number;
+  exitFlag?: string;
+};
+
+/** Build and send the you-vs-target resolution card. Best-effort; never throws to the caller. */
+async function sendResolutionCard(config: AppConfig, o: CardOpts): Promise<void> {
+  try {
+    const t = await conditionPnlFromChain(o.target, o.conditionId, o.winner);
+    const targetPnl = t ? t.payout - t.netUsdc : null;
+
+    // Running totals for this target — include the current market exactly once.
+    const realized = await readRealizedPnl();
+    const today = utcDay(Date.now());
+    let allTotal = o.pnl;
+    let dayTotal = o.pnl;
+    for (const r of realized) {
+      if (r.target.toLowerCase() !== o.target.toLowerCase()) {
+        continue;
+      }
+      if (r.conditionId.toLowerCase() === o.conditionId.toLowerCase()) {
+        continue; // this market — already counted via o.pnl
+      }
+      allTotal += r.pnl;
+      if (utcDay(r.ts) === today) {
+        dayTotal += r.pnl;
+      }
+    }
+
+    const profile = config.targetCopyProfiles.get(o.target);
+    const stop = evaluateTargetStop(allTotal, dayTotal, profile?.maxDrawdownTotal, profile?.maxDrawdownPerDay);
+
+    const lines: string[] = [
+      `${o.pnl >= 0 ? "✅ WIN" : "🔴 LOSS"}  ·  ${money(o.pnl)}`,
+      "",
+      `📊 ${o.event}`,
+      `👤 ${usernameFor(config, o.target)} (${shortAddr(o.target)})`,
+      `🎯 Your side: ${o.yourSide}   ·   Winner: ${o.winner}`,
+    ];
+    if (o.exitFlag) {
+      lines.push(`⚠️ Exited before payout — ${o.exitFlag}`);
+    }
+    lines.push("", `${o.breakdown ? o.breakdown + " · " : ""}cost $${o.cost.toFixed(2)} → payout $${o.payout.toFixed(2)}`, "");
+    lines.push(`You:    ${money(o.pnl)}`);
+    lines.push(
+      targetPnl === null ? "Target: n/a" : `Target: ${money(targetPnl)}     (Δ ${money(o.pnl - targetPnl)} vs target)`
+    );
+    lines.push("", `This target — today: ${money(dayTotal)} · all-time: ${money(allTotal)}`);
+    if (stop) {
+      lines.push(`⛔ ${stop} — copying paused`);
+    }
+
+    await sendTelegram(lines.join("\n"));
+  } catch (e) {
+    console.warn(`[telegram] card failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 async function reconcileOnce(config: AppConfig, client: ClobClient, funder: string | undefined): Promise<void> {
   const records = await readLedger();
   if (records.length === 0) {
@@ -192,6 +323,20 @@ async function reconcileOnce(config: AppConfig, client: ClobClient, funder: stri
         const { netSharesByOutcome, netUsdc, payout, pnl } = computeTargetPnl(trs, winner);
         const breakdown = [...netSharesByOutcome.entries()].map(([oc, sh]) => `${oc}=${sh.toFixed(2)}sh`).join(" ");
         writeResolved(config, target, event, conditionId, winner, breakdown, payout, netUsdc, pnl, "orderId");
+        if (isTelegramEnabled()) {
+          void sendResolutionCard(config, {
+            target,
+            conditionId,
+            event,
+            winner,
+            yourSide: primaryBuySide(trs),
+            breakdown,
+            cost: netUsdc,
+            payout,
+            pnl,
+            exitFlag: exitBeforePayout(trs, winner, netSharesByOutcome.get(winner) ?? 0),
+          });
+        }
       }
     } else {
       // Fallback: on-chain condition total, split across the condition's targets by buy-order count.
@@ -216,7 +361,21 @@ async function reconcileOnce(config: AppConfig, client: ClobClient, funder: stri
         const netUsdc = chain.netUsdc * frac;
         const pnl = payout - netUsdc;
         const note = byTarget.size > 1 ? `on-chain split ${byTarget.size}-way` : "on-chain";
-        writeResolved(config, target, trs.find((r) => r.event)?.event ?? event, conditionId, winner, "", payout, netUsdc, pnl, note);
+        const ev = trs.find((r) => r.event)?.event ?? event;
+        writeResolved(config, target, ev, conditionId, winner, "", payout, netUsdc, pnl, note);
+        if (isTelegramEnabled()) {
+          void sendResolutionCard(config, {
+            target,
+            conditionId,
+            event: ev,
+            winner,
+            yourSide: primaryBuySide(trs),
+            breakdown: "",
+            cost: netUsdc,
+            payout,
+            pnl,
+          });
+        }
       }
     }
 
