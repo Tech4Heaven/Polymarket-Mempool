@@ -25,7 +25,7 @@ import { isTelegramEnabled, sendTelegram } from "./telegram.js";
  *   pnl                = payout − netUsdc
  */
 
-const RECONCILE_INTERVAL_MS = 2 * 60_000;
+const RECONCILE_INTERVAL_MS = 30_000;
 const STARTUP_DELAY_MS = 30_000;
 const MAX_CHECKS_PER_CYCLE = 25;
 
