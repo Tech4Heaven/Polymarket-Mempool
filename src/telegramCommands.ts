@@ -12,18 +12,30 @@ import { fetchAllBalances, formatBalancesMessage, loadWalletList } from "./walle
  * anything else is dropped with no reply at all — a silent drop leaks nothing, not even that the
  * command exists. If the allowlist cannot be determined the listener does not start.
  *
- * IMPORTANT: only ONE process may poll getUpdates for a given bot token — a second poller gets HTTP
- * 409 Conflict. Since all deployments share one token, this listener runs ONLY where
- * TELEGRAM_COMMAND_LISTENER=true (set it in Main's .env only). Every bot still SENDS resolution cards;
- * this only governs who RECEIVES commands.
+ * SINGLE LISTENER: only ONE process may poll getUpdates for a given bot token — a second poller gets
+ * HTTP 409 Conflict. All deployments share one token, so set
+ *
+ *     TELEGRAM_COMMAND_LISTENER=<the BOT_NAME that should listen>   e.g. "Main"
+ *
+ * That exact line is safe to copy into EVERY deployment's .env: each bot listens only when the value
+ * matches its own BOT_NAME, so the identical config yields exactly one listener. ("true" is also
+ * accepted, but then the flag must appear in one .env only — copying it around causes 409 storms.)
+ * Every bot still SENDS resolution cards; this only governs who RECEIVES commands.
  */
 export function startTelegramCommandListener(config: AppConfig): { stop: () => void } {
   const tg = telegramConfig();
   if (!tg) {
     return { stop: () => undefined };
   }
-  if (process.env["TELEGRAM_COMMAND_LISTENER"]?.trim() !== "true") {
-    console.info("telegram commands: TELEGRAM_COMMAND_LISTENER not 'true' — listener not started");
+  const flag = process.env["TELEGRAM_COMMAND_LISTENER"]?.trim() ?? "";
+  const me = process.env["BOT_NAME"]?.trim() ?? "";
+  // Listen when explicitly "true", or when the flag names THIS bot — the latter lets one identical
+  // .env line be copied everywhere while still electing a single listener.
+  const shouldListen = flag === "true" || (flag !== "" && flag === me);
+  if (!shouldListen) {
+    console.info(
+      `telegram commands: listener disabled here (TELEGRAM_COMMAND_LISTENER=${flag || "unset"}, BOT_NAME=${me || "unset"})`
+    );
     return { stop: () => undefined };
   }
 
@@ -37,6 +49,7 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
 
   const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl);
   const warnedStrangers = new Set<string>(); // log each unauthorized id once, not on every poke
+  let warnedConflict = false;
   let offset = 0;
   let stopped = false;
 
@@ -71,11 +84,22 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
           const res = await fetch(url, { signal: ac.signal });
           if (!res.ok) {
             if (res.status === 409) {
-              console.warn("[telegram] getUpdates 409 Conflict — another process is polling this token");
+              // Another process owns the feed. Log once and back off hard — a misconfigured fleet
+              // would otherwise spam the error log every few seconds forever.
+              if (!warnedConflict) {
+                warnedConflict = true;
+                console.warn(
+                  "[telegram] getUpdates 409 Conflict — another process is polling this token. " +
+                    "Set TELEGRAM_COMMAND_LISTENER to a single BOT_NAME across deployments. Backing off."
+                );
+              }
+              await sleep(60_000);
+              continue;
             }
             await sleep(5_000);
             continue;
           }
+          warnedConflict = false;
           json = (await res.json()) as { ok?: boolean; result?: unknown[] };
         } finally {
           clearTimeout(t);
