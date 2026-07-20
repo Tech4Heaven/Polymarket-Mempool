@@ -1,5 +1,7 @@
+import { Contract, JsonRpcProvider } from "ethers";
 import { appendFile, readFile } from "fs/promises";
 import { basename, isAbsolute, resolve } from "path";
+import { CONDITIONAL_TOKENS } from "./contracts.js";
 import { ensureClobClient } from "./copyTrade.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { evaluateTargetStop } from "./drawdownGuard.js";
@@ -60,8 +62,89 @@ async function markResolved(conditionId: string): Promise<void> {
   }
 }
 
-/** Winning outcome label for a resolved market, or null if not resolved / lookup failed. */
-async function fetchWinner(conditionId: string): Promise<string | null> {
+const CTF_RESOLUTION_ABI = [
+  "function payoutDenominator(bytes32) view returns (uint256)",
+  "function payoutNumerators(bytes32, uint256) view returns (uint256)",
+];
+
+/**
+ * Static outcome ordering per condition: index i (the ConditionalTokens outcome slot) → outcome label.
+ * The token list and its order are fixed at market creation and available immediately — only the CLOB
+ * `winner` flag lags. Cached forever since it never changes.
+ */
+const outcomeOrderCache = new Map<string, string[]>();
+
+async function fetchOutcomeOrder(conditionId: string): Promise<string[] | null> {
+  const cached = outcomeOrderCache.get(conditionId);
+  if (cached) {
+    return cached;
+  }
+  try {
+    const res = await fetch(`https://clob.polymarket.com/markets/${conditionId}`, {
+      headers: { "user-agent": "copybot-pnl-reconciler" },
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const d = (await res.json()) as { tokens?: { outcome?: string }[] };
+    if (!Array.isArray(d.tokens) || d.tokens.length < 2) {
+      return null;
+    }
+    const outcomes = d.tokens.map((t) => t.outcome);
+    if (!outcomes.every((o): o is string => typeof o === "string" && o.length > 0)) {
+      return null;
+    }
+    outcomeOrderCache.set(conditionId, outcomes);
+    return outcomes;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Winning outcome index from the ConditionalTokens contract — the AUTHORITATIVE, FAST source. The
+ * payout is set the instant the market resolves (it is exactly what makes shares redeemable, ~1 min
+ * for BTC 5-min markets), unlike the CLOB `winner` metadata flag which is batch-updated minutes later.
+ * Returns null if not yet resolved, on a tie/scalar split (ambiguous), or on a read failure.
+ */
+async function onchainWinnerIndex(
+  provider: JsonRpcProvider,
+  conditionId: string,
+  outcomeCount: number
+): Promise<number | null> {
+  try {
+    const ctf = new Contract(CONDITIONAL_TOKENS, CTF_RESOLUTION_ABI, provider) as unknown as {
+      payoutDenominator: (c: string) => Promise<bigint>;
+      payoutNumerators: (c: string, i: number) => Promise<bigint>;
+    };
+    const denom = await ctf.payoutDenominator(conditionId);
+    if (denom === 0n) {
+      return null; // not resolved yet
+    }
+    let bestIdx = -1;
+    let best = -1n;
+    let tie = false;
+    for (let i = 0; i < outcomeCount; i++) {
+      const n = await ctf.payoutNumerators(conditionId, i);
+      if (n > best) {
+        best = n;
+        bestIdx = i;
+        tie = false;
+      } else if (n === best) {
+        tie = true;
+      }
+    }
+    if (bestIdx < 0 || best <= 0n || tie) {
+      return null; // no clear winner (e.g. 50/50 scalar split) — let the CLOB fallback decide
+    }
+    return bestIdx;
+  } catch {
+    return null;
+  }
+}
+
+/** CLOB `winner` flag — slower fallback, used only if the on-chain read is unavailable. */
+async function clobWinner(conditionId: string): Promise<string | null> {
   try {
     const res = await fetch(`https://clob.polymarket.com/markets/${conditionId}`, {
       headers: { "user-agent": "copybot-pnl-reconciler" },
@@ -78,6 +161,22 @@ async function fetchWinner(conditionId: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Winning outcome label for a resolved market, or null if not resolved / lookup failed.
+ * On-chain ConditionalTokens payout is primary (~1 min after resolution); the CLOB `winner` metadata
+ * flag (minutes-late) is only a fallback if the on-chain read can't produce a label.
+ */
+async function fetchWinner(provider: JsonRpcProvider, conditionId: string): Promise<string | null> {
+  const order = await fetchOutcomeOrder(conditionId);
+  if (order) {
+    const idx = await onchainWinnerIndex(provider, conditionId, order.length);
+    if (idx !== null && idx < order.length) {
+      return order[idx] ?? null;
+    }
+  }
+  return clobWinner(conditionId);
 }
 
 function groupBy<T>(items: T[], key: (t: T) => string): Map<string, T[]> {
@@ -292,7 +391,12 @@ async function sendResolutionCard(config: AppConfig, o: CardOpts): Promise<void>
   }
 }
 
-async function reconcileOnce(config: AppConfig, client: ClobClient, funder: string | undefined): Promise<void> {
+async function reconcileOnce(
+  config: AppConfig,
+  client: ClobClient,
+  funder: string | undefined,
+  provider: JsonRpcProvider
+): Promise<void> {
   const records = await readLedger();
   if (records.length === 0) {
     return;
@@ -309,7 +413,7 @@ async function reconcileOnce(config: AppConfig, client: ClobClient, funder: stri
       break;
     }
     checks += 1;
-    const winner = await fetchWinner(conditionId);
+    const winner = await fetchWinner(provider, conditionId);
     if (winner === null) {
       continue; // not resolved yet
     }
@@ -419,18 +523,20 @@ export function startPnlReconciler(config: AppConfig): void {
   }
   const cfg: CopyTradeConfig = mergeCopyTradeConfig(config.copyTradeShared, probe);
   let client: ClobClient | null = null;
+  // Provider for reading ConditionalTokens resolution on-chain (fast winner detection).
+  const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl);
 
   const run = async () => {
     try {
       if (!client) {
         client = await ensureClobClient(cfg);
       }
-      await reconcileOnce(config, client, cfg.funderAddress);
+      await reconcileOnce(config, client, cfg.funderAddress, provider);
     } catch (e) {
       console.warn(`[pnl] reconcile error: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
   setTimeout(() => void run(), STARTUP_DELAY_MS).unref();
   setInterval(() => void run(), RECONCILE_INTERVAL_MS).unref();
-  console.info("pnl reconciler: on · realized P&L from true order fills (getOrder), on-chain fallback");
+  console.info("pnl reconciler: on · winner from on-chain ConditionalTokens payout (CLOB fallback), fills from getOrder");
 }
