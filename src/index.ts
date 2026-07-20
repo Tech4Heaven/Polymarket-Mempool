@@ -9,6 +9,7 @@ import { loadAppConfig, mergeCopyTradeConfig } from "./env.js";
 import { startMempoolWatcher } from "./mempool.js";
 import { startDrawdownGuard } from "./drawdownGuard.js";
 import { startPnlReconciler } from "./pnlReconciler.js";
+import { warnIfChatNotPrivate } from "./telegram.js";
 import { startTelegramCommandListener } from "./telegramCommands.js";
 import { startPolynodeWatcher, type PolynodeMatch } from "./polynodeWatcher.js";
 import { buildDigestsFromSettlement } from "./settlementDigest.js";
@@ -280,6 +281,9 @@ async function main() {
 
   // Drawdown breaker: auto-halt copies for targets that breach max_drawdown_per_day / max_drawdown_total.
   startDrawdownGuard(config);
+
+  // P&L cards / balances are private — warn if they'd land in a group where others could read them.
+  warnIfChatNotPrivate();
 
   // Telegram /balance command listener — only where TELEGRAM_COMMAND_LISTENER=true (Main), since one
   // token can have a single getUpdates poller. Reports every deployment wallet (addresses read live

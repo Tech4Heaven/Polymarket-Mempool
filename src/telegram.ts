@@ -1,9 +1,16 @@
 /**
  * Minimal Telegram sender. Configured via env:
- *   TELEGRAM_BOT_TOKEN   bot token from @BotFather
- *   TELEGRAM_CHAT_ID     chat/channel id to post to
- * If either is missing the feature is off and sends are no-ops. Plain-text messages (no parse_mode)
- * so the P&L cards with $, +/−, emojis need no escaping. Never throws into the caller.
+ *   TELEGRAM_BOT_TOKEN         bot token from @BotFather
+ *   TELEGRAM_CHAT_ID           chat id to post to (your private chat)
+ *   TELEGRAM_ALLOWED_USER_IDS  optional extra user ids allowed to receive/command
+ * If token or chat id is missing the feature is off and sends are no-ops. Plain-text messages (no
+ * parse_mode) so the P&L cards with $, +/−, emojis need no escaping. Never throws into the caller.
+ *
+ * CONFIDENTIALITY: everything this module sends — realized P&L per market and per target, wallet
+ * balances — is private financial information. Delivery is therefore allowlisted at the transport:
+ * sends go ONLY to TELEGRAM_CHAT_ID or an id in TELEGRAM_ALLOWED_USER_IDS, and any other recipient is
+ * refused here rather than trusted to callers. That way no future/handler bug can leak a card to a
+ * chat id supplied by a stranger.
  */
 
 function tgConfig(): { token: string; chatId: string } | null {
@@ -26,16 +33,39 @@ export function telegramConfig(): { token: string; chatId: string } | null {
   return tgConfig();
 }
 
-/** Send to a specific chat (e.g. reply to whoever issued a command). Best-effort; never throws. */
-export async function sendTelegramTo(chatId: string, text: string): Promise<void> {
+/**
+ * Ids allowed to issue commands AND receive messages. Explicit TELEGRAM_ALLOWED_USER_IDS wins;
+ * otherwise defaults to TELEGRAM_CHAT_ID when that is a private chat (its id == the owner's user id).
+ * An empty set means "nobody" — callers must fail closed, never open up.
+ */
+export function allowedUserIds(chatId: string): Set<string> {
+  const ids = new Set<string>();
+  for (const p of (process.env["TELEGRAM_ALLOWED_USER_IDS"] ?? "").split(",")) {
+    const t = p.trim();
+    if (t) {
+      ids.add(t);
+    }
+  }
+  if (ids.size === 0 && chatId && !chatId.startsWith("-")) {
+    ids.add(chatId); // private chat id == owner's user id
+  }
+  return ids;
+}
+
+/** True if `chatId` may receive private data: the configured chat, or an allowlisted user id. */
+export function isAuthorizedRecipient(chatId: string): boolean {
   const c = tgConfig();
   if (!c) {
-    return;
+    return false;
   }
+  return chatId === c.chatId || allowedUserIds(c.chatId).has(chatId);
+}
+
+async function post(token: string, chatId: string, text: string): Promise<void> {
   const label = botLabel();
   const body = label ? `🤖 ${label}\n\n${text}` : text;
   try {
-    const res = await fetch(`https://api.telegram.org/bot${c.token}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text: body, disable_web_page_preview: true }),
@@ -48,23 +78,41 @@ export async function sendTelegramTo(chatId: string, text: string): Promise<void
   }
 }
 
+/**
+ * Send to a specific chat (e.g. reply to whoever issued a command). Refuses any recipient that is not
+ * the configured chat or an allowlisted user — private data never leaves the allowlist.
+ */
+export async function sendTelegramTo(chatId: string, text: string): Promise<void> {
+  const c = tgConfig();
+  if (!c) {
+    return;
+  }
+  if (!isAuthorizedRecipient(chatId)) {
+    console.warn(`[telegram] refused send to unauthorized chat id=${chatId}`);
+    return;
+  }
+  await post(c.token, chatId, text);
+}
+
+/** Send to the configured chat (resolution cards, alerts). */
 export async function sendTelegram(text: string): Promise<void> {
   const c = tgConfig();
   if (!c) {
     return;
   }
-  const label = botLabel();
-  const body = label ? `🤖 ${label}\n\n${text}` : text;
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${c.token}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: c.chatId, text: body, disable_web_page_preview: true }),
-    });
-    if (!res.ok) {
-      console.warn(`[telegram] sendMessage HTTP ${res.status}`);
-    }
-  } catch (e) {
-    console.warn(`[telegram] send failed: ${e instanceof Error ? e.message : String(e)}`);
+  await post(c.token, c.chatId, text);
+}
+
+/**
+ * Warn once at startup if P&L would land somewhere other than a private chat. A negative id is a
+ * group/channel, so every member there would see realized P&L and balances.
+ */
+export function warnIfChatNotPrivate(): void {
+  const c = tgConfig();
+  if (c && c.chatId.startsWith("-")) {
+    console.warn(
+      `[telegram] TELEGRAM_CHAT_ID=${c.chatId} is a group/channel — P&L cards and balances will be ` +
+        `visible to everyone in it. Use your private chat id to keep them secret.`
+    );
   }
 }
