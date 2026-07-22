@@ -12,7 +12,19 @@ max_price_difference = 0.1
 # (market re-priced AWAY from target's side in the gap between their fill and ours — strong
 # signal the target's read is wrong). Omit = no underbid skip (mirror at the cheaper price).
 # max_underbid_difference = 0.15
+# Underbid skip, PROPORTIONAL (optional, 0–1). Skip the copy when the price has fallen more than this
+# FRACTION below the target's entry:  effective < implied × (1 - max_underbid_frac).
+# Use this to tell a genuine cheap entry from a collapsed one — an absolute cap can't, because the
+# same gap means different things at different prices (0.29 is routine from 0.60, fatal from 0.30):
+#   entry 0.60 → 0.01 = 98% drop → skip      entry 0.30 → 0.01 = 97% drop → skip
+#   entry 0.01 → 0.01 =  0% drop → COPY  (a genuine 1¢ buy; buy_price_min would wrongly reject it)
+# Ignores drops smaller than 2 ticks, so tick noise on cheap markets doesn't trip it.
+# Set together with max_underbid_difference to also cap high-price entries: the absolute rule takes
+# over above entry = max_underbid_difference / max_underbid_frac (e.g. 0.3 / 0.5 = 0.60).
+# max_underbid_frac = 0.5
 # Buy only: optional absolute outcome price bounds in [0, 1] (omit either side for no limit)
+# NOTE: buy_price_min is an ABSOLUTE floor — it rejects every cheap buy, including ones where the
+# target itself entered that low. Prefer max_underbid_frac if that's what you're trying to prevent.
 # buy_price_min = 0.05
 # buy_price_max = 0.85
 min_position_usdc = 1

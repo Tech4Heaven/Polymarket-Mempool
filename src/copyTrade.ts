@@ -121,6 +121,13 @@ function roundToTick(price: number, tick: TickSize, mode: "up" | "down"): number
 export const DEFAULT_MAX_TAKER_BUMP_FRAC = 0.1;
 
 /**
+ * Dead zone for the proportional underbid guard, in ticks. On cheap markets a 1-tick move is a large
+ * PERCENTAGE (0.03 → 0.02 is 33%) but not a real collapse, so the fractional rule only fires once the
+ * drop also exceeds this many ticks. Collapses are large in both absolute and relative terms.
+ */
+export const UNDERBID_FRAC_DEAD_ZONE_TICKS = 2;
+
+/**
  * Buy limit price with the optional taker bump applied. Posts ABOVE the ask so the order crosses and
  * fills as a taker, but caps the bump to `maxFrac × ask` (so low prices aren't over-paid) and stays
  * tick-aware: if rounding the bump UP to the tick would exceed the cap, it falls back to `baseLimit`
@@ -1518,6 +1525,28 @@ export async function executeCopyTrade(
         { copyUsd: clippedUsdc ?? undefined, implied: effectiveImplied }
       );
       return;
+    }
+    // PROPORTIONAL underbid guard. The absolute cap above can't separate "target bought cheap" from
+    // "price collapsed since the target bought", because the same absolute gap means different things
+    // at different entry prices (0.29 is routine from 0.60 but catastrophic from 0.30). Measuring the
+    // drop as a FRACTION of the target's entry scales the tolerance with the entry price:
+    //   entry 0.60 → 0.01 = 98% drop → skip      entry 0.30 → 0.01 = 97% drop → skip
+    //   entry 0.01 → 0.01 =  0% drop → COPY (a genuine cheap entry, which a price floor would reject)
+    // Guarded by a tick-sized dead zone so ordinary 1-tick noise on cheap markets can't trip it.
+    if (cfg.maxUnderbidFrac !== undefined && effectiveImplied > 0 && drift < 0) {
+      const dropFrac = -drift / effectiveImplied;
+      const deadZone = (parseFloat(tickSize) || 0) * UNDERBID_FRAC_DEAD_ZONE_TICKS;
+      if (dropFrac > cfg.maxUnderbidFrac && -drift > deadZone) {
+        const floor = effectiveImplied * (1 - cfg.maxUnderbidFrac);
+        await logCopySkip(
+          `underbid frac skip · implied(on-chain)=${effectiveImplied.toFixed(4)} effective=${effectivePrice.toFixed(4)} clobMid=${currentPrice.toFixed(4)} bestAsk=${ask.toFixed(4)} drop=${(dropFrac * 100).toFixed(1)}% maxUnderbidFrac=${cfg.maxUnderbidFrac} (floor=${floor.toFixed(4)})${flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : ""}`,
+          digest,
+          txHash,
+          cfg,
+          { copyUsd: clippedUsdc ?? undefined, implied: effectiveImplied }
+        );
+        return;
+      }
     }
 
     const baseLimit = roundToTick(effectivePrice, tickSize, "up");

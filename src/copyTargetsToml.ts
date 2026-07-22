@@ -9,6 +9,12 @@ export type TomlDefaultsSection = {
   max_price_difference?: number;
   /** Buy only: skip when (implied - effectivePrice) > this. Omit for no underbid skip. */
   max_underbid_difference?: number;
+  /**
+   * Buy only: skip when the price has fallen more than this FRACTION of the target's entry, i.e.
+   * effectivePrice < implied × (1 - this). Scales with entry price, so it separates "target bought
+   * cheap" (copy) from "price collapsed since the target bought" (skip). Omit to disable.
+   */
+  max_underbid_frac?: number;
   /** Buy only: outcome price in [0,1]; omit for no floor */
   buy_price_min?: number;
   /** Buy only: outcome price in [0,1]; omit for no ceiling */
@@ -83,6 +89,7 @@ export type TomlTargetRow = {
   copy_ratio?: number;
   max_price_difference?: number;
   max_underbid_difference?: number;
+  max_underbid_frac?: number;
   buy_price_min?: number;
   buy_price_max?: number;
   min_position_usdc?: number;
@@ -155,6 +162,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       copy_ratio: numOrUndef("copy_ratio", src),
       max_price_difference: numOrUndef("max_price_difference", src),
       max_underbid_difference: numOrUndef("max_underbid_difference", src),
+      max_underbid_frac: numOrUndef("max_underbid_frac", src),
       buy_price_min: numOrUndef("buy_price_min", src),
       buy_price_max: numOrUndef("buy_price_max", src),
       min_position_usdc: numOrUndef("min_position_usdc", src),
@@ -195,6 +203,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       copy_ratio: numOrUndef("copy_ratio", row),
       max_price_difference: numOrUndef("max_price_difference", row),
       max_underbid_difference: numOrUndef("max_underbid_difference", row),
+      max_underbid_frac: numOrUndef("max_underbid_frac", row),
       buy_price_min: numOrUndef("buy_price_min", row),
       buy_price_max: numOrUndef("buy_price_max", row),
       min_position_usdc: numOrUndef("min_position_usdc", row),

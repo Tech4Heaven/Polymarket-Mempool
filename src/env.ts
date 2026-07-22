@@ -47,6 +47,13 @@ export type TargetCopyParams = {
   maxPriceDifference: number;
   /** Buy only: skip if (implied - effectivePrice) > this. Undefined = no underbid skip. */
   maxUnderbidDifference?: number;
+  /**
+   * Buy only: skip if the price fell more than this FRACTION below the target's entry, i.e.
+   * effectivePrice < implied × (1 - this). Unlike the absolute cap, the tolerance scales with the
+   * entry price, so a genuine cheap entry (target also bought low) copies while a collapse from a
+   * higher entry is skipped. Undefined = disabled.
+   */
+  maxUnderbidFrac?: number;
   /** Buy only: skip if limit price is below this (undefined = no floor). Outcome price in (0,1). */
   buyPriceMin?: number;
   /** Buy only: skip if limit price is above this (undefined = no cap). Outcome price in (0,1). */
@@ -94,6 +101,7 @@ export type CopyTradeConfig = CopyTradeShared & {
   copyRatio: number;
   maxPriceDifference: number;
   maxUnderbidDifference?: number;
+  maxUnderbidFrac?: number;
   buyPriceMin?: number;
   buyPriceMax?: number;
   minPositionUsdc: number;
@@ -172,6 +180,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     copyRatio: p.copyRatio,
     maxPriceDifference: p.maxPriceDifference,
     maxUnderbidDifference: p.maxUnderbidDifference,
+    maxUnderbidFrac: p.maxUnderbidFrac,
     buyPriceMin: p.buyPriceMin,
     buyPriceMax: p.buyPriceMax,
     minPositionUsdc: p.minPositionUsdc,
@@ -429,6 +438,18 @@ export async function loadAppConfig(): Promise<AppConfig> {
           }
           maxUnderbidDifference = maxUnderbidDifferenceRaw;
         }
+        const maxUnderbidFracRaw = row.max_underbid_frac ?? defaults.max_underbid_frac;
+        let maxUnderbidFrac: number | undefined;
+        if (maxUnderbidFracRaw !== undefined) {
+          // A fraction of the entry price: 0.5 = "price may not fall more than 50% below entry".
+          // 1 or more would floor at/below zero and reject every buy, so it's rejected as a typo.
+          if (!Number.isFinite(maxUnderbidFracRaw) || maxUnderbidFracRaw <= 0 || maxUnderbidFracRaw >= 1) {
+            throw new Error(
+              `targets ${row.address}: max_underbid_frac must be a fraction between 0 and 1 (e.g. 0.5)`
+            );
+          }
+          maxUnderbidFrac = maxUnderbidFracRaw;
+        }
         const minPositionUsdc = requireNum(
           "min_position_usdc",
           row.min_position_usdc ?? defaults.min_position_usdc,
@@ -517,6 +538,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           copyRatio,
           maxPriceDifference,
           maxUnderbidDifference,
+          maxUnderbidFrac,
           buyPriceMin,
           buyPriceMax,
           minPositionUsdc,
