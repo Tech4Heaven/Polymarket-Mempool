@@ -534,7 +534,18 @@ export function startPnlReconciler(config: AppConfig): void {
       console.warn(`[pnl] reconcile error: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
-  setTimeout(() => void run(), STARTUP_DELAY_MS).unref();
-  setInterval(() => void run(), RECONCILE_INTERVAL_MS).unref();
+
+  // Self-rescheduling timer: the NEXT cycle is scheduled only AFTER the current one finishes. This
+  // guarantees cycles never overlap — overlapping cycles both saw a market as unresolved (it's marked
+  // resolved only at the end) and each sent the resolution card, producing DUPLICATE notifications.
+  // (A plain setInterval + a coinciding startup setTimeout previously fired two concurrent runs.)
+  const scheduleNext = (delayMs: number): void => {
+    const t = setTimeout(async () => {
+      await run();
+      scheduleNext(RECONCILE_INTERVAL_MS);
+    }, delayMs);
+    t.unref();
+  };
+  scheduleNext(STARTUP_DELAY_MS);
   console.info("pnl reconciler: on · winner from on-chain ConditionalTokens payout (CLOB fallback), fills from getOrder");
 }
