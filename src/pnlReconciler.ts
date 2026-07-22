@@ -8,7 +8,7 @@ import { evaluateTargetStop } from "./drawdownGuard.js";
 import { mergeCopyTradeConfig, type AppConfig, type CopyTradeConfig } from "./env.js";
 import { readLedger, type LedgerRecord } from "./orderLedger.js";
 import { appendRealizedPnl, readRealizedPnl } from "./pnlRealized.js";
-import { isTelegramEnabled, sendTelegram } from "./telegram.js";
+import { isTelegramEnabled, sendTelegram, tgCode, tgEsc } from "./telegram.js";
 
 /**
  * Per-target realized-P&L reconciler. Finds markets the bot traded (from the order ledger) that have
@@ -270,9 +270,6 @@ function utcDay(ts: number): string {
 function money(x: number): string {
   return `${x >= 0 ? "+" : "-"}$${Math.abs(x).toFixed(2)}`;
 }
-function shortAddr(a: string): string {
-  return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
-}
 function usernameFor(config: AppConfig, target: string): string {
   const lp = config.targetCopyProfiles.get(target)?.copyTradeLogPath;
   if (lp) {
@@ -368,21 +365,22 @@ async function sendResolutionCard(config: AppConfig, o: CardOpts): Promise<void>
     const lines: string[] = [
       `${o.pnl >= 0 ? "✅ WIN" : "🔴 LOSS"}  ·  ${money(o.pnl)}`,
       "",
-      `📊 ${o.event}`,
-      `👤 ${usernameFor(config, o.target)} (${shortAddr(o.target)})`,
-      `🎯 Your side: ${o.yourSide}   ·   Winner: ${o.winner}`,
+      `📊 ${tgEsc(o.event)}`,
+      `👤 ${tgEsc(usernameFor(config, o.target))}`,
+      tgCode(o.target),
+      `🎯 Your side: ${tgEsc(o.yourSide)}   ·   Winner: ${tgEsc(o.winner)}`,
     ];
     if (o.exitFlag) {
-      lines.push(`⚠️ Exited before payout — ${o.exitFlag}`);
+      lines.push(`⚠️ Exited before payout — ${tgEsc(o.exitFlag)}`);
     }
-    lines.push("", `${o.breakdown ? o.breakdown + " · " : ""}cost $${o.cost.toFixed(2)} → payout $${o.payout.toFixed(2)}`, "");
+    lines.push("", `${o.breakdown ? tgEsc(o.breakdown) + " · " : ""}cost $${o.cost.toFixed(2)} → payout $${o.payout.toFixed(2)}`, "");
     lines.push(`You:    ${money(o.pnl)}`);
     lines.push(
       targetPnl === null ? "Target: n/a" : `Target: ${money(targetPnl)}     (Δ ${money(o.pnl - targetPnl)} vs target)`
     );
     lines.push("", `This target — today: ${money(dayTotal)} · all-time: ${money(allTotal)}`);
     if (stop) {
-      lines.push(`⛔ ${stop} — copying paused`);
+      lines.push(`⛔ ${tgEsc(stop)} — copying paused`);
     }
 
     await sendTelegram(lines.join("\n"));

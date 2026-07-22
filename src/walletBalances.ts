@@ -3,6 +3,7 @@ import { readFile, readdir } from "fs/promises";
 import { dirname, join } from "path";
 import { PUSD_TOKEN } from "./contracts.js";
 import type { AppConfig } from "./env.js";
+import { tgCode, tgEsc } from "./telegram.js";
 
 const ERC20_BALANCE_ABI = ["function balanceOf(address owner) view returns (uint256)"];
 
@@ -68,11 +69,11 @@ export async function fetchAllBalances(provider: JsonRpcProvider, refs: WalletRe
 function usd(n: number | null): string {
   return n === null ? "n/a" : `$${n.toFixed(2)}`;
 }
-function shortAddr(a: string): string {
-  return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
-}
 
-/** Build the plain-text balances card for Telegram. */
+/**
+ * Build the balances card for Telegram (HTML). Each wallet's full address is a tap-to-copy <code>
+ * span so it can be pasted straight into an explorer.
+ */
 export function formatBalancesMessage(rows: WalletBalance[]): string {
   const lines: string[] = ["💰 Wallet balances", ""];
   let sumCash = 0;
@@ -81,7 +82,7 @@ export function formatBalancesMessage(rows: WalletBalance[]): string {
   let anyPos = false;
   for (const r of rows) {
     const total = r.cash !== null && r.positions !== null ? r.cash + r.positions : null;
-    lines.push(`${r.name} (${shortAddr(r.address)})`);
+    lines.push(`${tgEsc(r.name)}  ${tgCode(r.address)}`);
     lines.push(`  cash ${usd(r.cash)} · pos ${usd(r.positions)} · total ${usd(total)}`);
     if (r.cash !== null) {
       sumCash += r.cash;

@@ -3,7 +3,7 @@ import { CONDITIONAL_TOKENS, CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V2, PUSD_TOK
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import type { AppConfig } from "./env.js";
 import { fetchPolymarketProfileLabel } from "./polymarketProfile.js";
-import { isTelegramEnabled, sendTelegram } from "./telegram.js";
+import { isTelegramEnabled, sendTelegram, tgCode, tgEsc } from "./telegram.js";
 
 const ERC20_BALANCE_ABI = ["function balanceOf(address owner) view returns (uint256)"];
 const ERC20_TRANSFER_ABI = ["event Transfer(address indexed from, address indexed to, uint256 value)"];
@@ -34,10 +34,6 @@ function internalAddresses(): Set<string> {
     }
   }
   return set;
-}
-
-function shortAddr(a: string): string {
-  return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
 }
 
 /** On-chain pUSD (collateral) cash balance for a wallet, in USD (6 decimals → number). */
@@ -177,11 +173,11 @@ export function startWithdrawalWatcher(config: AppConfig): { stop: () => void } 
       if (isTelegramEnabled()) {
         const destLines = [...byDest.entries()]
           .sort((a, b) => b[1] - a[1])
-          .map(([addr, amt]) => `   ${addr} ($${amt.toFixed(2)})`)
+          .map(([addr, amt]) => `   ${tgCode(addr)} ($${amt.toFixed(2)})`)
           .join("\n");
         const card =
           `⚠️ WITHDRAWAL ALERT\n\n` +
-          `👤 ${label} (${shortAddr(address)})\n` +
+          `👤 ${tgEsc(label)}\n${tgCode(address)}\n` +
           `💸 $${externalOut.toFixed(2)} sent to non-Polymarket address(es):\n${destLines}\n` +
           `${cash !== null ? `Current cash: $${cash.toFixed(2)}\n` : ""}` +
           `\nTarget may have moved funds out — review before continuing to copy.`;

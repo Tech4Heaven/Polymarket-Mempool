@@ -61,14 +61,32 @@ export function isAuthorizedRecipient(chatId: string): boolean {
   return chatId === c.chatId || allowedUserIds(c.chatId).has(chatId);
 }
 
+/**
+ * Escape text for Telegram HTML parse mode. Only &, <, > are special in HTML mode — $, +, −, ·,
+ * emoji all pass through untouched. Apply to every dynamic value interpolated into a message.
+ */
+export function tgEsc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Wrap a value in a monospace <code> span. On Telegram mobile a single tap on <code> text copies it
+ * to the clipboard — use this for full addresses / ids so they can be pasted straight into an explorer.
+ */
+export function tgCode(s: string): string {
+  return `<code>${tgEsc(s)}</code>`;
+}
+
 async function post(token: string, chatId: string, text: string): Promise<void> {
   const label = botLabel();
-  const body = label ? `🤖 ${label}\n\n${text}` : text;
+  // Messages are HTML (for tap-to-copy <code>). The label is dynamic, so escape it; `text` is already
+  // built HTML-safe by the caller.
+  const body = label ? `🤖 ${tgEsc(label)}\n\n${text}` : text;
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: body, disable_web_page_preview: true }),
+      body: JSON.stringify({ chat_id: chatId, text: body, parse_mode: "HTML", disable_web_page_preview: true }),
     });
     if (!res.ok) {
       console.warn(`[telegram] sendMessage HTTP ${res.status}`);
