@@ -112,6 +112,86 @@ export async function sendTelegramTo(chatId: string, text: string): Promise<void
   await post(c.token, chatId, text);
 }
 
+/** One inline-keyboard button: label + the callback_data delivered back when it's tapped. */
+export type InlineButton = { text: string; callback_data: string };
+export type InlineKeyboard = InlineButton[][];
+
+async function tgApi(method: string, body: Record<string, unknown>): Promise<{ ok?: boolean; result?: unknown; description?: string } | null> {
+  const c = tgConfig();
+  if (!c) {
+    return null;
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${c.token}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = (await res.json().catch(() => null)) as { ok?: boolean; result?: unknown; description?: string } | null;
+    if (!res.ok) {
+      console.warn(`[telegram] ${method} HTTP ${res.status}${j?.description ? ` · ${j.description}` : ""}`);
+    }
+    return j;
+  } catch (e) {
+    console.warn(`[telegram] ${method} failed: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+function withLabel(text: string): string {
+  const label = botLabel();
+  return label ? `🤖 ${tgEsc(label)}\n\n${text}` : text;
+}
+
+/** Send an HTML message with an inline keyboard. Returns the new message_id (for later edits), or null. */
+export async function sendTelegramKeyboard(chatId: string, text: string, keyboard: InlineKeyboard): Promise<number | null> {
+  if (!isAuthorizedRecipient(chatId)) {
+    console.warn(`[telegram] refused send to unauthorized chat id=${chatId}`);
+    return null;
+  }
+  const j = await tgApi("sendMessage", {
+    chat_id: chatId,
+    text: withLabel(text),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: keyboard },
+  });
+  const id = (j?.result as { message_id?: number } | undefined)?.message_id;
+  return typeof id === "number" ? id : null;
+}
+
+/** Replace a message's text (and optionally its keyboard). */
+export async function editTelegramMessage(chatId: string, messageId: number, text: string, keyboard?: InlineKeyboard): Promise<void> {
+  if (!isAuthorizedRecipient(chatId)) {
+    return;
+  }
+  await tgApi("editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: withLabel(text),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+  });
+}
+
+/** Replace only a message's inline keyboard (e.g. reflect a toggled checkbox). */
+export async function editTelegramKeyboard(chatId: string, messageId: number, keyboard: InlineKeyboard): Promise<void> {
+  if (!isAuthorizedRecipient(chatId)) {
+    return;
+  }
+  await tgApi("editMessageReplyMarkup", {
+    chat_id: chatId,
+    message_id: messageId,
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
+/** Acknowledge a button tap (clears the client's loading spinner; optional toast text). */
+export async function answerCallback(callbackId: string, text?: string): Promise<void> {
+  await tgApi("answerCallbackQuery", { callback_query_id: callbackId, ...(text ? { text } : {}) });
+}
+
 /** Send to the configured chat (resolution cards, alerts). */
 export async function sendTelegram(text: string): Promise<void> {
   const c = tgConfig();

@@ -102,7 +102,7 @@ export function formatBalancesMessage(rows: WalletBalance[]): string {
 }
 
 /** Minimal .env parser: KEY=VALUE lines, skipping blanks/comments, stripping surrounding quotes. */
-async function parseEnvFile(path: string): Promise<Record<string, string>> {
+export async function parseEnvFile(path: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   try {
     const raw = await readFile(path, "utf8");

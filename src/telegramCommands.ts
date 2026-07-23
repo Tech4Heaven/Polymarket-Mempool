@@ -1,7 +1,33 @@
 import { JsonRpcProvider } from "ethers";
 import type { AppConfig } from "./env.js";
-import { allowedUserIds, sendTelegramTo, telegramConfig } from "./telegram.js";
+import {
+  allowedUserIds,
+  answerCallback,
+  editTelegramKeyboard,
+  editTelegramMessage,
+  sendTelegramKeyboard,
+  sendTelegramTo,
+  telegramConfig,
+  type InlineKeyboard,
+} from "./telegram.js";
+import { buildTargetPnlReport, discoverBots, type BotRef } from "./targetPnl.js";
 import { fetchAllBalances, formatBalancesMessage, loadWalletList } from "./walletBalances.js";
+
+const CHECKED = "✅";
+const UNCHECKED = "⬜️";
+
+/** Checkbox keyboard for /pnl: one toggle row per bot, then All/None, then Show. */
+function pnlKeyboard(bots: BotRef[], selected: Set<number>): InlineKeyboard {
+  const rows: InlineKeyboard = bots.map((b, i) => [
+    { text: `${selected.has(i) ? CHECKED : UNCHECKED} ${b.name}`, callback_data: `pnl:t:${i}` },
+  ]);
+  rows.push([
+    { text: "All", callback_data: "pnl:all" },
+    { text: "None", callback_data: "pnl:none" },
+  ]);
+  rows.push([{ text: "📊 Show P&L", callback_data: "pnl:go" }]);
+  return rows;
+}
 
 /**
  * Telegram command listener (long-poll getUpdates). Handles `/balance` by reporting every deployment
@@ -49,6 +75,8 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
 
   const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl);
   const warnedStrangers = new Set<string>(); // log each unauthorized id once, not on every poke
+  // /pnl checkbox state: `${chatId}:${messageId}` → selected bot indices (into discoverBots() order).
+  const pnlSel = new Map<string, Set<number>>();
   let warnedConflict = false;
   let offset = 0;
   let stopped = false;
@@ -63,10 +91,61 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
       }
       const rows = await fetchAllBalances(provider, refs);
       await sendTelegramTo(chatId, formatBalancesMessage(rows));
+    } else if (cmd === "/pnl") {
+      const bots = await discoverBots();
+      if (bots.length === 0) {
+        await sendTelegramTo(chatId, "No bots found.");
+        return;
+      }
+      const selected = new Set(bots.map((_, i) => i)); // default: all selected
+      const msgId = await sendTelegramKeyboard(chatId, "Select bots, then tap Show P&L:", pnlKeyboard(bots, selected));
+      if (msgId !== null) {
+        pnlSel.set(`${chatId}:${msgId}`, selected);
+      }
     } else if (cmd === "/start" || cmd === "/help") {
-      await sendTelegramTo(chatId, "Commands:\n/balance — cash + open positions for every wallet");
+      await sendTelegramTo(
+        chatId,
+        "Commands:\n/balance — cash + open positions for every wallet\n/pnl — realized P&L per active target (pick bots)"
+      );
     }
     // unknown commands: ignore silently
+  };
+
+  const handleCallback = async (cbId: string, chatId: string, messageId: number, data: string): Promise<void> => {
+    const bots = await discoverBots();
+    const key = `${chatId}:${messageId}`;
+    let sel = pnlSel.get(key) ?? new Set(bots.map((_, i) => i));
+    if (data === "pnl:all") {
+      sel = new Set(bots.map((_, i) => i));
+    } else if (data === "pnl:none") {
+      sel = new Set();
+    } else if (data.startsWith("pnl:t:")) {
+      const i = Number(data.slice("pnl:t:".length));
+      if (Number.isInteger(i)) {
+        if (sel.has(i)) {
+          sel.delete(i);
+        } else {
+          sel.add(i);
+        }
+      }
+    } else if (data === "pnl:go") {
+      const chosen = bots.filter((_, i) => sel.has(i));
+      if (chosen.length === 0) {
+        await answerCallback(cbId, "Select at least one bot");
+        return;
+      }
+      await answerCallback(cbId, "Computing…");
+      const report = await buildTargetPnlReport(chosen);
+      await editTelegramMessage(chatId, messageId, report); // replaces the picker with the report
+      pnlSel.delete(key);
+      return;
+    } else {
+      await answerCallback(cbId);
+      return;
+    }
+    pnlSel.set(key, sel);
+    await editTelegramKeyboard(chatId, messageId, pnlKeyboard(bots, sel));
+    await answerCallback(cbId);
   };
 
   const poll = async (): Promise<void> => {
@@ -75,7 +154,7 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
         const url = new URL(`https://api.telegram.org/bot${tg.token}/getUpdates`);
         url.searchParams.set("timeout", "30");
         url.searchParams.set("offset", String(offset));
-        url.searchParams.set("allowed_updates", JSON.stringify(["message"]));
+        url.searchParams.set("allowed_updates", JSON.stringify(["message", "callback_query"]));
         // Abort a bit after the server-side long-poll window so a dead socket can't wedge the loop.
         const ac = new AbortController();
         const t = setTimeout(() => ac.abort(), 40_000);
@@ -108,10 +187,48 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
           const upd = u as {
             update_id?: number;
             message?: { text?: string; chat?: { id?: number }; from?: { id?: number; username?: string } };
+            callback_query?: {
+              id?: string;
+              data?: string;
+              from?: { id?: number; username?: string };
+              message?: { message_id?: number; chat?: { id?: number } };
+            };
           };
           if (typeof upd.update_id === "number") {
             offset = upd.update_id + 1; // ack (also ack'd for strangers, so they can't wedge the loop)
           }
+
+          // Inline-keyboard button tap (/pnl checkboxes).
+          if (upd.callback_query) {
+            const cq = upd.callback_query;
+            const cbId = cq.id;
+            const cbFrom = cq.from?.id;
+            const cbChat = cq.message?.chat?.id;
+            const cbMsg = cq.message?.message_id;
+            if (typeof cbId !== "string") {
+              continue;
+            }
+            // Same allowlist as messages. Unauthorized: don't even answer (reveal nothing).
+            if (typeof cbFrom !== "number" || !allowed.has(String(cbFrom))) {
+              if (!warnedStrangers.has(String(cbFrom))) {
+                warnedStrangers.add(String(cbFrom));
+                console.warn(`[telegram] ignored callback from unauthorized user id=${String(cbFrom)}`);
+              }
+              continue;
+            }
+            if (typeof cbChat === "number" && typeof cbMsg === "number" && typeof cq.data === "string") {
+              try {
+                await handleCallback(cbId, String(cbChat), cbMsg, cq.data);
+              } catch (e) {
+                console.warn(`[telegram] callback failed: ${e instanceof Error ? e.message : String(e)}`);
+                await answerCallback(cbId);
+              }
+            } else {
+              await answerCallback(cbId);
+            }
+            continue;
+          }
+
           const text = upd.message?.text;
           const chatId = upd.message?.chat?.id;
           const fromId = upd.message?.from?.id;
@@ -145,7 +262,7 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
     }
   };
 
-  console.info("telegram commands: listening for /balance");
+  console.info("telegram commands: listening for /balance, /pnl");
   void poll();
   return { stop: () => {
     stopped = true;
