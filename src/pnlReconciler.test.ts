@@ -96,6 +96,19 @@ test("regression: resting order that truly filled → real win (was reported $0)
   assert.ok(Math.abs(r.pnl - 85.61) < 0.02, `expected ~+85.6, got ${r.pnl}`);
 });
 
+test("oversold outcome (sold more than bought) yields NET-NEGATIVE shares — the phantom-win tell", () => {
+  // Real incident: ledger had only 95 of the 652 Down buys, but the full 473 Down sell. Raw math
+  // books a phantom +$385 "win" ($0 payout, negative cost). The reconciler now DETECTS this via the
+  // net-negative shares and falls back to the on-chain total instead of trusting it.
+  const trs = [
+    rec({ outcome: "Down", side: "buy", filledShares: 95, filledUsdc: 50.35 }),
+    rec({ outcome: "Down", side: "sell", filledShares: 473, filledUsdc: 435.16 }),
+  ];
+  const r = computeTargetPnl(trs, "Down");
+  assert.ok(r.pnl > 380, `raw math fabricates the win (${r.pnl.toFixed(2)}) — hence the guard`);
+  assert.ok((r.netSharesByOutcome.get("Down") ?? 0) < -1, "net Down shares must be < -1 so the guard trips");
+});
+
 test("net negative shares clamp to 0 payout", () => {
   // defensive: over-refund / accounting drift shouldn't create phantom payout
   const r = computeTargetPnl([rec({ outcome: "Up", side: "sell", filledShares: 10, filledUsdc: 5 })], "Up");

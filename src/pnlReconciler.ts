@@ -30,6 +30,10 @@ import { isTelegramEnabled, sendTelegram, tgCode, tgEsc } from "./telegram.js";
 const RECONCILE_INTERVAL_MS = 30_000;
 const STARTUP_DELAY_MS = 30_000;
 const MAX_CHECKS_PER_CYCLE = 25;
+// Net shares below this (per outcome) mean the per-order fills are inconsistent — more was SOLD than
+// bought, so the ledger is missing buys for this condition. Trusting it fabricates a phantom "win"
+// (sell proceeds counted with no matching cost), so we fall back to the on-chain total instead.
+const NEG_SHARE_TOLERANCE = 1;
 
 type ClobClient = Awaited<ReturnType<typeof ensureClobClient>>;
 
@@ -335,23 +339,79 @@ type CardOpts = {
   exitFlag?: string;
 };
 
-/** Build and send the you-vs-target resolution card. Best-effort; never throws to the caller. */
-async function sendResolutionCard(config: AppConfig, o: CardOpts): Promise<void> {
-  try {
-    const t = await conditionPnlFromChain(o.target, o.conditionId, o.winner);
-    const targetPnl = t ? t.payout - t.netUsdc : null;
+// One target usually resolves several markets around the same time (multiple 5-min coins). Rather
+// than a card per market, we buffer a target's freshly-resolved markets and send ONE card with the
+// TOTAL P&L (yours vs the target's), so you compare like-for-like at that moment.
+//   - FLUSH_QUIET: flush this many ms after the LAST new resolution for the target (debounce).
+//   - FLUSH_MAX:   but never hold a batch longer than this from its first market.
+const FLUSH_QUIET_MS = 45_000;
+const FLUSH_MAX_MS = 4 * 60_000;
 
-    // Running totals for this target — include the current market exactly once.
+type PendingBatch = { markets: CardOpts[]; firstTs: number; timer: ReturnType<typeof setTimeout> };
+const pendingByTarget = new Map<string, PendingBatch>();
+
+/** Add a resolved market to its target's pending batch and (re)arm the debounced flush. */
+function enqueueResolutionCard(config: AppConfig, o: CardOpts): void {
+  const key = o.target.toLowerCase();
+  let p = pendingByTarget.get(key);
+  const now = Date.now();
+  if (!p) {
+    p = { markets: [], firstTs: now, timer: setTimeout(() => undefined, 0) };
+    pendingByTarget.set(key, p);
+  }
+  p.markets.push(o);
+  clearTimeout(p.timer);
+  const delay = Math.min(FLUSH_QUIET_MS, Math.max(0, FLUSH_MAX_MS - (now - p.firstTs)));
+  p.timer = setTimeout(() => void flushBatch(config, key), delay);
+  p.timer.unref();
+}
+
+async function flushBatch(config: AppConfig, key: string): Promise<void> {
+  const p = pendingByTarget.get(key);
+  if (!p) {
+    return;
+  }
+  pendingByTarget.delete(key);
+  await sendAggregatedCard(config, p.markets);
+}
+
+/**
+ * One card per target for a batch of just-resolved markets: total your-P&L vs total target-P&L (with
+ * the delta), a compact per-market win/loss list, and the target's running today / all-time totals.
+ * Best-effort; never throws to the caller.
+ */
+async function sendAggregatedCard(config: AppConfig, markets: CardOpts[]): Promise<void> {
+  if (markets.length === 0) {
+    return;
+  }
+  try {
+    const target = markets[0]!.target;
+    const yourTotal = markets.reduce((s, m) => s + m.pnl, 0);
+
+    // The target's own P&L for each market (on-chain), summed. Unknown markets are skipped.
+    const targetPerMarket = await Promise.all(
+      markets.map(async (m) => {
+        const t = await conditionPnlFromChain(m.target, m.conditionId, m.winner);
+        return t ? t.payout - t.netUsdc : null;
+      })
+    );
+    let targetTotal = 0;
+    let targetKnown = false;
+    for (const tp of targetPerMarket) {
+      if (tp !== null) {
+        targetTotal += tp;
+        targetKnown = true;
+      }
+    }
+
+    // Running totals: the batch's markets are already in the realized ledger by flush time, so sum directly.
     const realized = await readRealizedPnl();
     const today = utcDay(Date.now());
-    let allTotal = o.pnl;
-    let dayTotal = o.pnl;
+    let allTotal = 0;
+    let dayTotal = 0;
     for (const r of realized) {
-      if (r.target.toLowerCase() !== o.target.toLowerCase()) {
+      if (r.target.toLowerCase() !== target.toLowerCase()) {
         continue;
-      }
-      if (r.conditionId.toLowerCase() === o.conditionId.toLowerCase()) {
-        continue; // this market — already counted via o.pnl
       }
       allTotal += r.pnl;
       if (utcDay(r.ts) === today) {
@@ -359,24 +419,25 @@ async function sendResolutionCard(config: AppConfig, o: CardOpts): Promise<void>
       }
     }
 
-    const profile = config.targetCopyProfiles.get(o.target);
+    const profile = config.targetCopyProfiles.get(target);
     const stop = evaluateTargetStop(allTotal, dayTotal, profile?.maxDrawdownTotal, profile?.maxDrawdownPerDay);
 
+    const n = markets.length;
     const lines: string[] = [
-      `${o.pnl >= 0 ? "✅ WIN" : "🔴 LOSS"}  ·  ${money(o.pnl)}`,
+      `${yourTotal >= 0 ? "✅" : "🔴"}  ${n} market${n > 1 ? "s" : ""} resolved · net ${money(yourTotal)}`,
       "",
-      `📊 ${tgEsc(o.event)}`,
-      `👤 ${tgEsc(usernameFor(config, o.target))}`,
-      tgCode(o.target),
-      `🎯 Your side: ${tgEsc(o.yourSide)}   ·   Winner: ${tgEsc(o.winner)}`,
+      `👤 ${tgEsc(usernameFor(config, target))}`,
+      tgCode(target),
+      "",
     ];
-    if (o.exitFlag) {
-      lines.push(`⚠️ Exited before payout — ${tgEsc(o.exitFlag)}`);
+    for (const m of markets) {
+      lines.push(`${m.pnl >= 0 ? "✅" : "🔴"} ${tgEsc(m.event)} — ${money(m.pnl)}${m.exitFlag ? " ⚠️" : ""}`);
     }
-    lines.push("", `${o.breakdown ? tgEsc(o.breakdown) + " · " : ""}cost $${o.cost.toFixed(2)} → payout $${o.payout.toFixed(2)}`, "");
-    lines.push(`You:    ${money(o.pnl)}`);
+    lines.push("", `You:    ${money(yourTotal)}`);
     lines.push(
-      targetPnl === null ? "Target: n/a" : `Target: ${money(targetPnl)}     (Δ ${money(o.pnl - targetPnl)} vs target)`
+      targetKnown
+        ? `Target: ${money(targetTotal)}     (Δ ${money(yourTotal - targetTotal)} vs target)`
+        : "Target: n/a"
     );
     lines.push("", `This target — today: ${money(dayTotal)} · all-time: ${money(allTotal)}`);
     if (stop) {
@@ -419,14 +480,33 @@ async function reconcileOnce(
     const event = recs.find((r) => r.event)?.event ?? "";
     const corrected = await correctFillsViaOrders(client, recs);
 
+    // Trust the exact per-order path only if it's internally consistent. If any target oversold an
+    // outcome (net shares < −tolerance), the ledger is missing buys for this condition and the P&L is
+    // fabricated — fall through to the on-chain total, which reflects real trades + redemptions.
+    let trustCorrected = corrected !== null;
     if (corrected) {
+      for (const [target, trs] of groupBy(corrected, (r) => r.target)) {
+        const { netSharesByOutcome } = computeTargetPnl(trs, winner);
+        const oversold = [...netSharesByOutcome.entries()].find(([, sh]) => sh < -NEG_SHARE_TOLERANCE);
+        if (oversold) {
+          trustCorrected = false;
+          console.warn(
+            `[pnl] orderId fills inconsistent (oversold ${oversold[0]}=${oversold[1].toFixed(2)}sh) · ` +
+              `condition=${conditionId} target=${target} → using on-chain fallback`
+          );
+          break;
+        }
+      }
+    }
+
+    if (corrected && trustCorrected) {
       // Exact, per-order → per-target.
       for (const [target, trs] of groupBy(corrected, (r) => r.target)) {
         const { netSharesByOutcome, netUsdc, payout, pnl } = computeTargetPnl(trs, winner);
         const breakdown = [...netSharesByOutcome.entries()].map(([oc, sh]) => `${oc}=${sh.toFixed(2)}sh`).join(" ");
         writeResolved(config, target, event, conditionId, winner, breakdown, payout, netUsdc, pnl, "orderId");
         if (isTelegramEnabled()) {
-          void sendResolutionCard(config, {
+          enqueueResolutionCard(config, {
             target,
             conditionId,
             event,
@@ -466,7 +546,7 @@ async function reconcileOnce(
         const ev = trs.find((r) => r.event)?.event ?? event;
         writeResolved(config, target, ev, conditionId, winner, "", payout, netUsdc, pnl, note);
         if (isTelegramEnabled()) {
-          void sendResolutionCard(config, {
+          enqueueResolutionCard(config, {
             target,
             conditionId,
             event: ev,
