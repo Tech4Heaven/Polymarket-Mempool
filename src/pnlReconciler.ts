@@ -424,7 +424,7 @@ async function sendAggregatedCard(config: AppConfig, markets: CardOpts[]): Promi
 
     const n = markets.length;
     const lines: string[] = [
-      `${yourTotal >= 0 ? "✅" : "🔴"}  ${n} market${n > 1 ? "s" : ""} resolved · net ${money(yourTotal)}`,
+      `${yourTotal >= 0 ? "✅ WIN" : "🔴 LOSS"}  ·  ${money(yourTotal)}  ·  ${n} market${n > 1 ? "s" : ""} resolved`,
       "",
       `👤 ${tgEsc(usernameFor(config, target))}`,
       tgCode(target),
