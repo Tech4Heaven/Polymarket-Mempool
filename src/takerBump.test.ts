@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyTakerBump, DEFAULT_MAX_TAKER_BUMP_FRAC } from "./copyTrade.js";
+import { applyTakerBump, DEFAULT_MAX_TAKER_BUMP_FRAC, proportionalSellShares } from "./copyTrade.js";
+
+test("proportional sell: target sold 10 of 100 (10%), we hold 90 → sell 9", () => {
+  assert.equal(proportionalSellShares(10, 100, 90), 9);
+});
+test("proportional sell: target full exit (100 of 100) → we sell all 90", () => {
+  assert.equal(proportionalSellShares(100, 100, 90), 90);
+});
+test("proportional sell: target sold half → we sell half", () => {
+  assert.equal(proportionalSellShares(50, 100, 90), 45);
+});
+test("proportional sell: unknown target holding (null) → full exit (safe default)", () => {
+  assert.equal(proportionalSellShares(10, null, 90), 90);
+});
+test("proportional sell: fraction clamped to 1 if target sold ≥ held", () => {
+  assert.equal(proportionalSellShares(120, 100, 90), 90);
+});
+test("proportional sell: zero/negative target holding → full exit", () => {
+  assert.equal(proportionalSellShares(10, 0, 90), 90);
+});
 import type { TickSize } from "@polymarket/clob-client-v2";
 
 const T01 = "0.01" as TickSize; // 1¢ tick

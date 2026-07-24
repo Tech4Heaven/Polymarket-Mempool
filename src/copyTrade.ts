@@ -7,7 +7,8 @@ import {
   SignatureTypeV2,
   type TickSize,
 } from "@polymarket/clob-client-v2";
-import { formatUnits } from "ethers";
+import { Contract, JsonRpcProvider, formatUnits } from "ethers";
+import { CONDITIONAL_TOKENS } from "./contracts.js";
 import { createWalletClient, http } from "viem";
 import { polygon } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
@@ -150,6 +151,44 @@ function postErrorMessage(resp: unknown): string | null {
     return `HTTP ${r.status}`;
   }
   return null;
+}
+
+/**
+ * Proportional sell: mirror the FRACTION the target sold onto our own position, rather than dumping
+ * everything on any target sell. `targetSold`/`targetHeldBefore` are the target's; `botBalance` is
+ * ours. If the target's holding is unknown (null) we fall back to a full exit — the safe default and
+ * the previous behavior. Example: target sold 10 of 100 held (10%), we hold 90 → sell 9.
+ */
+export function proportionalSellShares(
+  targetSold: number,
+  targetHeldBefore: number | null,
+  botBalance: number
+): number {
+  if (targetHeldBefore === null || !(targetHeldBefore > 0)) {
+    return botBalance;
+  }
+  const fraction = Math.min(1, Math.max(0, targetSold / targetHeldBefore));
+  return fraction * botBalance;
+}
+
+const ERC1155_BALANCE_ABI = ["function balanceOf(address account, uint256 id) view returns (uint256)"];
+let ctfProvider: JsonRpcProvider | null = null;
+
+/** The target's on-chain ERC-1155 balance of an outcome token (their holding), in shares. Null on failure. */
+async function fetchTargetTokenBalance(cfg: CopyTradeConfig, target: string, tokenId: string): Promise<number | null> {
+  try {
+    if (!ctfProvider) {
+      ctfProvider = new JsonRpcProvider(cfg.polygonHttpUrl);
+    }
+    const ctf = new Contract(CONDITIONAL_TOKENS, ERC1155_BALANCE_ABI, ctfProvider) as unknown as {
+      balanceOf: (account: string, id: bigint) => Promise<bigint>;
+    };
+    const raw = await ctf.balanceOf(target, BigInt(tokenId));
+    const v = parseFloat(formatUnits(raw, 6));
+    return Number.isFinite(v) ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Relative cap used for the taker bump when `taker_bump` is set but `max_taker_bump_frac` is omitted. */
@@ -318,10 +357,6 @@ function addSideSpent(targetAddress: string, tokenId: string, usdcDelta: number)
     spent: newSpent,
     lastUpdated: Date.now(),
   });
-}
-
-function resetSideSpent(targetAddress: string, tokenId: string): void {
-  sideSpendByTargetToken.delete(sideSpendKey(targetAddress, tokenId));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -724,8 +759,8 @@ setInterval(() => {
       hedgeStateByTargetCondition.delete(key);
       continue;
     }
-    if (state.cfg.dryRun || state.cfg.hedgePrice === undefined) {
-      continue;
+    if (state.cfg.dryRun) {
+      continue; // dry-run states have no real CLOB orders to poll
     }
     const pending = [...state.mainOrders.entries()].filter(([, o]) => !o.terminal);
     if (pending.length === 0) {
@@ -758,9 +793,11 @@ setInterval(() => {
       const shown = [state.tokenA, state.tokenB]
         .map((t) => `${t.slice(0, 8)}…=${(state.sharesByToken.get(t) ?? 0).toFixed(2)}(was ${(prev.get(t) ?? 0).toFixed(2)})`)
         .join(" ");
-      const poll = `hedge poll · target=${state.cfg.targetAddress} condition=${state.conditionId} shares ${shown} · copy order fill detected, reconciling`;
+      const poll = `position poll · target=${state.cfg.targetAddress} condition=${state.conditionId} shares ${shown} · late copy fill detected`;
       console.log(poll);
       void appendCopyTradeSuccessLine(poll, state.cfg.copyTradeLogPath);
+      // reconcileHedge self-gates on hedge_price — a no-op for non-hedged targets, so the poll just
+      // keeps their position accurate (for proportional sells) without touching any hedge.
       await reconcileHedge(state.cfg, client, state, "poller");
     }).catch((e) => {
       console.warn(`hedge poll error · ${key}: ${e instanceof Error ? e.message : String(e)}`);
@@ -1042,8 +1079,28 @@ async function getOrCreateHedgeState(
 }
 
 /**
- * Record a successful BUY copy in state (additive to sharesByToken, using ACTUAL filled shares)
- * and reconcile the hedge. Serialized per-condition via the mutex so it can't race the poller.
+ * This target's tracked filled position (shares) for an outcome token — the shares filled from
+ * copying THIS target specifically, isolated from other targets that share the same wallet/market.
+ * Derived from per-order fills (getOrder), kept current by the poller. Null when there's no tracked
+ * state yet (before the first copy, or across a restart) — caller should fall back to the wallet
+ * balance in that case.
+ */
+async function getTargetPosition(cfg: CopyTradeConfig, tokenId: string): Promise<number | null> {
+  const info = await resolveMarketTokens(tokenId);
+  if (!info) {
+    return null;
+  }
+  const state = hedgeStateByTargetCondition.get(hedgeStateKey(cfg.targetAddress, info.conditionId));
+  if (!state) {
+    return null;
+  }
+  return state.sharesByToken.get(tokenId) ?? 0;
+}
+
+/**
+ * Record a successful BUY copy in this target's position state (additive to sharesByToken, using
+ * ACTUAL filled shares). Runs for EVERY target — the per-target position feeds proportional sells,
+ * and (when hedge_price is set) the hedge. Serialized per-condition via the mutex vs the poller.
  */
 async function recordCopyBuyAndReconcile(
   cfg: CopyTradeConfig,
@@ -1054,9 +1111,6 @@ async function recordCopyBuyAndReconcile(
   orderId: string,
   postedShares: number
 ): Promise<void> {
-  if (cfg.hedgePrice === undefined) {
-    return;
-  }
   const state = await getOrCreateHedgeState(cfg, primaryTokenId);
   if (!state) {
     const warn = `hedge · could not resolve opposite token for tokenId=${primaryTokenId} · tx=${txHash}`;
@@ -1089,13 +1143,9 @@ async function recordCopySellAndReconcile(
   orderId: string,
   postedShares: number
 ): Promise<void> {
-  if (cfg.hedgePrice === undefined) {
-    return;
-  }
   const state = await getOrCreateHedgeState(cfg, soldTokenId);
   if (!state) {
-    // No existing condition state means there was no hedge to adjust — nothing to do.
-    return;
+    return; // opposite token unresolvable — can't track; nothing to do
   }
 
   await runExclusive(state, async () => {
@@ -1634,6 +1684,7 @@ export async function executeCopyTrade(
 
   // Buy: size from clipped notional. Sell: immediately liquidate full token balance.
   let orderShares: number;
+  let sellFraction = 1; // fraction of OUR position a sell trims (1 = full exit); used for the bucket below
   if (digest.side === "buy") {
     orderShares = (clippedUsdc ?? 0) / limitPrice;
   } else {
@@ -1662,7 +1713,31 @@ export async function executeCopyTrade(
       );
       return;
     }
-    orderShares = fullBalance;
+    // Proportional partial sell: sell the same FRACTION of OUR position that the target sold of theirs.
+    //   fraction    = target's sold shares / target's holding before the sell (read on-chain; pending
+    //                 detection means their tx hasn't settled, so it's the pre-sell balance).
+    //   ourPosition = shares filled from THIS target only (tracked per-order), NOT the wallet total —
+    //                 so a sell never touches shares another target filled in the same market. Capped
+    //                 by the real wallet balance (can't sell more than the wallet holds). Falls back to
+    //                 the wallet balance only when there's no tracked state (e.g. across a restart).
+    const targetBefore = await fetchTargetTokenBalance(cfg, cfg.targetAddress, digest.tokenId);
+    const tracked = await getTargetPosition(cfg, digest.tokenId);
+    const ourPosition = tracked === null ? fullBalance : Math.min(tracked, fullBalance);
+    orderShares = proportionalSellShares(originShares, targetBefore, ourPosition);
+    sellFraction = ourPosition > 0 ? orderShares / ourPosition : 1;
+    const sellNote =
+      `sell sizing · target sold ${originShares.toFixed(2)} of ${targetBefore === null ? "?" : targetBefore.toFixed(2)} held ` +
+      `(${(sellFraction * 100).toFixed(1)}%) → selling ${orderShares.toFixed(2)} of THIS target's ` +
+      `${tracked === null ? `wallet ${fullBalance.toFixed(2)}` : `${ourPosition.toFixed(2)}`} (wallet ${fullBalance.toFixed(2)}) · token=${digest.tokenId}`;
+    console.log(sellNote);
+    void appendCopyTradeSuccessLine(sellNote, cfg.copyTradeLogPath);
+    if (orderShares <= 0) {
+      await logCopySkip(`nothing to sell for this target · token=${digest.tokenId}`, digest, txHash, cfg, {
+        limitPrice,
+        implied: effectiveImplied,
+      });
+      return;
+    }
   }
 
   const minOrder = parseFloat(book.min_order_size);
@@ -1809,8 +1884,11 @@ export async function executeCopyTrade(
       // Dry run: no real order exists, so pass DRY_RUN — registerMainOrder treats it as fully filled.
       await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, orderShares, txHash, "DRY_RUN", orderShares);
     } else {
-      resetSideSpent(cfg.targetAddress, digest.tokenId);
-      clearSkipBuffer(cfg.targetAddress, digest.tokenId);
+      const spent = getSideSpent(cfg.targetAddress, digest.tokenId);
+      addSideSpent(cfg.targetAddress, digest.tokenId, -(sellFraction * spent));
+      if (sellFraction >= 0.999) {
+        clearSkipBuffer(cfg.targetAddress, digest.tokenId);
+      }
     }
     return;
   }
@@ -1911,8 +1989,12 @@ export async function executeCopyTrade(
     await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash, postedOrderId, orderShares);
   } else {
     await recordCopySellAndReconcile(cfg, client, digest.tokenId, filledShares, txHash, postedOrderId, orderShares);
-    resetSideSpent(cfg.targetAddress, digest.tokenId);
-    // Target exited this side — any pending below-min accumulator entries are now stale.
-    clearSkipBuffer(cfg.targetAddress, digest.tokenId);
+    // Free the max_market_usdc bucket proportionally to the fraction sold (a full exit zeroes it).
+    const spent = getSideSpent(cfg.targetAddress, digest.tokenId);
+    addSideSpent(cfg.targetAddress, digest.tokenId, -(sellFraction * spent));
+    if (sellFraction >= 0.999) {
+      // Full exit — any pending below-min accumulator entries are now stale.
+      clearSkipBuffer(cfg.targetAddress, digest.tokenId);
+    }
   }
 }
