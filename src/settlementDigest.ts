@@ -1,4 +1,14 @@
+import type { TickSize } from "@polymarket/clob-client-v2";
 import type { CopyDigest } from "./copyTrade.js";
+
+const TICK_SIZES: TickSize[] = ["0.1", "0.01", "0.001", "0.0001"];
+/** Map the settlement's numeric tick_size to the CLOB's TickSize literal, or null if unrecognized. */
+function toTickSize(n: number | undefined): TickSize | undefined {
+  if (typeof n !== "number") {
+    return undefined;
+  }
+  return TICK_SIZES.find((t) => Math.abs(parseFloat(t) - n) < 1e-9);
+}
 
 /**
  * PolyNode settlement feed types (subset we consume).
@@ -32,6 +42,14 @@ export type SettlementData = {
   detected_at?: number;
   block_number?: number | null;
   taker_wallet?: string;
+  /** The taker's order: side / token / SIGNED price / size. `taker_price` is the LIMIT, not the fill. */
+  taker_side?: "BUY" | "SELL";
+  taker_price?: number;
+  taker_size?: number;
+  taker_token?: string;
+  token_ids?: string[];
+  /** The market's tick size at the moment of this trade — authoritative and real-time. */
+  tick_size?: number;
   condition_id?: string;
   neg_risk?: boolean;
   market_title?: string;
@@ -58,24 +76,83 @@ function toRaw6(n: number): bigint {
  * identical in shape to the on-chain (receipt-derived) path — so everything downstream in
  * `executeCopyTrade` is unchanged.
  *
- * Rule (per PolyNode docs): a wallet's genuine trade is the set of fills in `trades[]` where
- * `fill.maker === target`. We read `side`/`token_id`/`price`/`size` straight off those fills.
- * We NEVER match by `taker` (that's the counterparty — inverted token and complement price).
+ * TWO roles, handled differently (this is what fixes the signed-price bug):
  *
- * Mirrors `buildCopyDigests`: emits at most one digest, and only when the target's fills reference
- * exactly ONE outcome token with a single consistent side. Anything ambiguous (multiple tokens, or
- * both buy and sell of the same token in one tx) returns `[]` — no copy.
+ *  - Target is the TAKER (`taker_wallet === target`). PolyNode includes a SELF-ENTRY where
+ *    `maker === taker === target`; its `price` is the target's SIGNED LIMIT (set high to cross fast),
+ *    NOT the fill. Reading it makes `implied` bogus (e.g. 0.99 when they filled at 0.77). Instead we
+ *    reconstruct the REAL fill from the COUNTERPARTY legs (`taker === target && maker !== target`):
+ *    each such maker leg is a real resting order that executed. In a binary market a maker on the
+ *    OPPOSITE outcome mints a complete set, so the taker's per-share cost for their token is
+ *    `1 − maker_price`; a maker on the SAME token is a direct fill at `maker_price`. We size-weight
+ *    across legs → the true average entry.
+ *
+ *  - Target is a genuine MAKER (their resting order was hit; `taker !== target`). A maker fills at
+ *    their own resting price, so `maker`-leg price IS the real fill — the original logic is correct.
+ *
+ * Emits at most one digest, only when the target's fills reference exactly ONE outcome token with a
+ * single consistent side. Anything ambiguous returns `[]` — no copy.
  */
 export function buildDigestsFromSettlement(data: SettlementData, targetAddress: string): CopyDigest[] {
   const target = targetAddress.toLowerCase();
-  const trades = data.trades ?? [];
+  const digests =
+    data.taker_wallet?.toLowerCase() === target ? takerDigest(data, target) : makerDigest(data.trades ?? [], target);
+  // Stamp the market's real-time tick from the settlement so the copy order is priced on the correct
+  // tick the FIRST time — no cached-tick guess, no post-reject-and-repost round-trip.
+  const tickSize = toTickSize(data.tick_size);
+  if (tickSize) {
+    for (const d of digests) {
+      d.tickSize = tickSize;
+    }
+  }
+  return digests;
+}
 
-  // token_id -> aggregated { side, shares, pusd, mixed }
+/** Target is the taker: real entry from the counterparty maker legs (complement rule + weighted avg). */
+function takerDigest(data: SettlementData, target: string): CopyDigest[] {
+  const side: "buy" | "sell" | null =
+    data.taker_side === "SELL" ? "sell" : data.taker_side === "BUY" ? "buy" : null;
+  const takerToken = data.taker_token;
+  if (!side || !takerToken) {
+    return [];
+  }
+  let shares = 0;
+  let pusd = 0;
+  for (const t of data.trades ?? []) {
+    // Counterparty legs only: the target must be the taker AND the maker must be someone else
+    // (skip the self-entry, whose price is the signed limit).
+    if (t?.taker?.toLowerCase() !== target || t?.maker?.toLowerCase() === target || !t.token_id) {
+      continue;
+    }
+    const size = Number(t.size);
+    const price = Number(t.price);
+    if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(price) || price <= 0 || price >= 1) {
+      continue;
+    }
+    // Same token as the taker → direct fill at maker price; opposite token (binary mint) → 1 − price.
+    const legPrice = t.token_id === takerToken ? price : 1 - price;
+    if (legPrice <= 0 || legPrice >= 1) {
+      continue;
+    }
+    shares += size;
+    pusd += size * legPrice;
+  }
+  const outcomeRaw = toRaw6(shares);
+  const pusdRaw = toRaw6(pusd);
+  if (outcomeRaw === 0n || pusdRaw === 0n) {
+    return [];
+  }
+  return [{ side, tokenId: takerToken, outcomeRaw, pusdRaw }];
+}
+
+/** Target is a genuine maker: their resting-order fills price at `maker_price` (the real fill). */
+function makerDigest(trades: SettlementTrade[], target: string): CopyDigest[] {
   type Agg = { side: "buy" | "sell"; shares: number; pusd: number; mixed: boolean };
   const byToken = new Map<string, Agg>();
 
   for (const t of trades) {
-    if (!t || typeof t.maker !== "string" || t.maker.toLowerCase() !== target) {
+    // Genuine maker fills only: maker === target but the taker is someone else (exclude self-entry).
+    if (!t || typeof t.maker !== "string" || t.maker.toLowerCase() !== target || t.taker?.toLowerCase() === target) {
       continue;
     }
     const side: "buy" | "sell" | null = t.side === "SELL" ? "sell" : t.side === "BUY" ? "buy" : null;
@@ -96,7 +173,6 @@ export function buildDigestsFromSettlement(data: SettlementData, targetAddress: 
     }
   }
 
-  // Only copy when the target touched exactly one outcome token, cleanly (single side).
   if (byToken.size !== 1) {
     return [];
   }

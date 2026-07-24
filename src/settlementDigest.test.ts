@@ -109,6 +109,121 @@ test("case-insensitive maker matching", () => {
   assert.equal(d.length, 1);
 });
 
+// ── Taker case: real entry from counterparty legs, NOT the signed self-entry ──────────────────
+const UP = TOKEN_A;
+const DOWN = TOKEN_B;
+
+/** A taker settlement: top-level taker_* + counterparty legs + the self-entry (signed). */
+function takerSettlement(opts: {
+  takerSide: "BUY" | "SELL";
+  takerToken: string;
+  signedPrice: number;
+  legs: SettlementTrade[];
+}): SettlementData {
+  return {
+    tx_hash: "0xtaker",
+    status: "pending",
+    taker_wallet: TARGET,
+    taker_side: opts.takerSide,
+    taker_token: opts.takerToken,
+    taker_price: opts.signedPrice,
+    trades: [
+      ...opts.legs,
+      // self-entry: maker === taker === target, price = SIGNED limit (must be ignored)
+      trade({ maker: TARGET, taker: TARGET, token_id: opts.takerToken, side: opts.takerSide, price: opts.signedPrice, size: 5 }),
+    ],
+  };
+}
+
+test("REAL captured ETH: signed 0.81, maker Down@0.20 → entry 0.80 (1 − maker price)", () => {
+  const d = buildDigestsFromSettlement(
+    takerSettlement({
+      takerSide: "BUY",
+      takerToken: UP,
+      signedPrice: 0.81,
+      legs: [trade({ maker: OTHER, taker: TARGET, token_id: DOWN, side: "BUY", price: 0.2, size: 7 })],
+    }),
+    TARGET
+  );
+  // shares 7, pUSD 7 * (1 - 0.20) = 5.6 → implied 0.80, NOT the signed 0.81
+  assert.deepEqual(d, [{ side: "buy", tokenId: UP, outcomeRaw: 7_000000n, pusdRaw: 5_600000n }]);
+});
+
+test("signed price is IGNORED: signs 0.99 but fills at 0.77 (maker Down@0.23)", () => {
+  const d = buildDigestsFromSettlement(
+    takerSettlement({
+      takerSide: "BUY",
+      takerToken: UP,
+      signedPrice: 0.99,
+      legs: [trade({ maker: OTHER, taker: TARGET, token_id: DOWN, side: "BUY", price: 0.23, size: 100 })],
+    }),
+    TARGET
+  );
+  const { outcomeRaw, pusdRaw } = d[0]!;
+  const implied = Number(pusdRaw) / Number(outcomeRaw);
+  assert.ok(Math.abs(implied - 0.77) < 1e-9, `expected 0.77, got ${implied}`); // NOT 0.99
+});
+
+test("direct match (maker sells the SAME token) → entry = maker price", () => {
+  const d = buildDigestsFromSettlement(
+    takerSettlement({
+      takerSide: "BUY",
+      takerToken: UP,
+      signedPrice: 0.9,
+      legs: [trade({ maker: OTHER, taker: TARGET, token_id: UP, side: "SELL", price: 0.75, size: 20 })],
+    }),
+    TARGET
+  );
+  assert.deepEqual(d, [{ side: "buy", tokenId: UP, outcomeRaw: 20_000000n, pusdRaw: 15_000000n }]); // 20 * 0.75
+});
+
+test("multi-maker taker fill → size-weighted average of (1 − maker price)", () => {
+  const d = buildDigestsFromSettlement(
+    takerSettlement({
+      takerSide: "BUY",
+      takerToken: UP,
+      signedPrice: 0.99,
+      legs: [
+        trade({ maker: OTHER, taker: TARGET, token_id: DOWN, side: "BUY", price: 0.2, size: 4 }), // Up 0.80
+        trade({ maker: OTHER, taker: TARGET, token_id: DOWN, side: "BUY", price: 0.3, size: 6 }), // Up 0.70
+      ],
+    }),
+    TARGET
+  );
+  // shares 10, pUSD 4*0.80 + 6*0.70 = 3.2 + 4.2 = 7.4 → implied 0.74
+  assert.deepEqual(d, [{ side: "buy", tokenId: UP, outcomeRaw: 10_000000n, pusdRaw: 7_400000n }]);
+});
+
+test("taker SELL: complement rule applies the same way", () => {
+  const d = buildDigestsFromSettlement(
+    takerSettlement({
+      takerSide: "SELL",
+      takerToken: UP,
+      signedPrice: 0.01,
+      legs: [trade({ maker: OTHER, taker: TARGET, token_id: DOWN, side: "SELL", price: 0.35, size: 50 })],
+    }),
+    TARGET
+  );
+  // selling Up, maker on Down @0.35 → Up sell price 1 - 0.35 = 0.65
+  assert.deepEqual(d, [{ side: "sell", tokenId: UP, outcomeRaw: 50_000000n, pusdRaw: 32_500000n }]);
+});
+
+test("self-entry alone (no counterparty legs) → no copy, never uses signed price", () => {
+  const d = buildDigestsFromSettlement(
+    {
+      tx_hash: "0xt",
+      status: "pending",
+      taker_wallet: TARGET,
+      taker_side: "BUY",
+      taker_token: UP,
+      taker_price: 0.99,
+      trades: [trade({ maker: TARGET, taker: TARGET, token_id: UP, side: "BUY", price: 0.99, size: 5 })],
+    },
+    TARGET
+  );
+  assert.deepEqual(d, []);
+});
+
 test("matchedMakerTargets returns configured targets present as makers (lowercased)", () => {
   const set = new Set([TARGET.toLowerCase(), OTHER.toLowerCase()]);
   const data = settlement([

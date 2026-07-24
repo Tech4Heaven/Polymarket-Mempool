@@ -42,6 +42,9 @@ export type CopyDigest = {
   outcomeRaw: bigint;
   /** Full pUSD `sent` (buy) or `received` (sell) from the receipt for the target; only used when a single outcome tokenId is present. */
   pusdRaw: bigint;
+  /** Market tick size from the PolyNode settlement (real-time). Used to price the order correctly on
+   * the first post. Undefined on the on-chain path → fall back to the cached CLOB tick. */
+  tickSize?: TickSize;
 };
 
 /**
@@ -115,6 +118,38 @@ function roundToTick(price: number, tick: TickSize, mode: "up" | "down"): number
     return Math.min(1, Math.ceil(price / t - 1e-12) * t);
   }
   return Math.max(0, Math.floor(price / t + 1e-12) * t);
+}
+
+const TICK_SIZES: TickSize[] = ["0.1", "0.01", "0.001", "0.0001"];
+function numToTickSize(n: number): TickSize | null {
+  return TICK_SIZES.find((t) => Math.abs(parseFloat(t) - n) < 1e-9) ?? null;
+}
+
+/**
+ * The CLOB rejects a post whose price violates the market's tick with e.g.
+ * `{"error":"price 0.046 breaks minimum tick size rule 0.01","status":400}`. Our cached tick can be
+ * finer than what order-placement enforces (Polymarket's tick is price-dependent), so we parse the
+ * REQUIRED tick out of the error to self-correct and retry. Returns null if not a tick-size error.
+ */
+function tickSizeFromError(resp: unknown): TickSize | null {
+  const err = (resp as { error?: unknown })?.error;
+  if (typeof err !== "string") {
+    return null;
+  }
+  const m = err.match(/tick size rule\s+([0-9.]+)/i);
+  return m ? numToTickSize(parseFloat(m[1]!)) : null;
+}
+
+/** A rejection message if the CLOB refused the order (error / 4xx-5xx), else null (order accepted). */
+function postErrorMessage(resp: unknown): string | null {
+  const r = resp as { error?: unknown; status?: unknown };
+  if (typeof r?.error === "string" && r.error.length > 0) {
+    return r.error;
+  }
+  if (typeof r?.status === "number" && r.status >= 400) {
+    return `HTTP ${r.status}`;
+  }
+  return null;
 }
 
 /** Relative cap used for the taker bump when `taker_bump` is set but `max_taker_bump_frac` is omitted. */
@@ -1448,8 +1483,15 @@ export async function executeCopyTrade(
   // book already carries both sides, and currentPrice is only ever used as max(mid,ask) for buys
   // / min(mid,bid) for sells — both collapse to the book's ask/bid. Saves one CLOB request per
   // copy and removes the sequential getPrice fallback.
+  // Prefer the real-time tick from the PolyNode settlement (digest.tickSize) — it's the market's
+  // actual tick at trade time, so the order prices correctly on the FIRST post. Only fall back to the
+  // CLOB lookup on the on-chain detection path (no settlement tick). Seed the cache with the
+  // authoritative value so the hedge path and any fallback use it too.
+  if (digest.tickSize) {
+    tickSizeByToken.set(digest.tokenId, digest.tickSize);
+  }
   const [tickSize, negRisk, book] = await Promise.all([
-    getTickSizeCached(client, digest.tokenId),
+    digest.tickSize ?? getTickSizeCached(client, digest.tokenId),
     getNegRiskCached(client, digest.tokenId),
     client.getOrderBook(digest.tokenId),
   ]);
@@ -1773,18 +1815,34 @@ export async function executeCopyTrade(
     return;
   }
 
-  let resp;
-  try {
-    resp = await client.createAndPostOrder(
-      {
-        tokenID: digest.tokenId,
-        price: limitPrice,
-        side,
-        size: orderShares,
-      },
-      { tickSize, negRisk },
+  let postPrice = limitPrice;
+  let postTick: TickSize = tickSize;
+  const postOnce = (price: number, tk: TickSize) =>
+    client.createAndPostOrder(
+      { tokenID: digest.tokenId, price, side, size: orderShares },
+      { tickSize: tk, negRisk },
       OrderType.GTC
     );
+
+  let resp;
+  try {
+    resp = await postOnce(postPrice, postTick);
+    // Self-heal a too-fine tick: the CLOB tells us the real tick in the error. Correct the cache,
+    // re-round the price to it (buys down toward the ask, sells up toward the bid — still crosses,
+    // no overpay), and retry ONCE. Otherwise a low-price copy is silently lost to a 400.
+    const correctedTick = tickSizeFromError(resp);
+    if (correctedTick && correctedTick !== postTick) {
+      tickSizeByToken.set(digest.tokenId, correctedTick);
+      const newPrice = roundToTick(postPrice, correctedTick, digest.side === "buy" ? "down" : "up");
+      if (newPrice > 0 && Math.abs(newPrice - postPrice) > 1e-12) {
+        const note = `tick-size retry · token=${digest.tokenId} tick ${postTick}→${correctedTick} · price ${postPrice}→${newPrice} · tx=${txHash}`;
+        console.warn(note);
+        void appendCopyTradeSuccessLine(note, cfg.copyTradeLogPath);
+        postPrice = newPrice;
+        postTick = correctedTick;
+        resp = await postOnce(postPrice, postTick);
+      }
+    }
   } catch (e) {
     // Post failed after we reserved — release the reservation so a failed order doesn't
     // permanently consume max_market_usdc capacity. This is the only refund path.
@@ -1792,6 +1850,22 @@ export async function executeCopyTrade(
       addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
     }
     throw e;
+  }
+  limitPrice = postPrice; // reflect any tick-retry adjustment in the logs/ledger below
+
+  // A rejected order (error / 4xx in the response, not a throw) is NOT on the book — do not log it as
+  // "posted", do not record it for P&L, and release the max_market_usdc reservation so a rejection
+  // can't permanently consume the cap.
+  const postErr = postErrorMessage(resp);
+  if (postErr) {
+    if (reservedUsdc > 0) {
+      addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
+    }
+    const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
+    const fmsg = `copy REJECTED · ${digest.side} shares=${orderShares} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} tick=${postTick} · error=${JSON.stringify(postErr)} · tx=${txHash}`;
+    console.warn(fmsg);
+    void appendCopyTradeSuccessLine(fmsg, cfg.copyTradeLogPath);
+    return;
   }
 
   // Actual fill from the CLOB response. The labels flip by side:
