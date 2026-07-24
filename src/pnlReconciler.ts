@@ -241,17 +241,26 @@ async function conditionPnlFromChain(
   winner: string
 ): Promise<{ payout: number; netUsdc: number } | null> {
   try {
-    const res = await fetch(`https://data-api.polymarket.com/activity?user=${funder}&limit=1000`, {
-      headers: { "user-agent": "copybot-pnl-reconciler" },
-    });
+    // Filter to THIS market server-side (`market=<conditionId>`): returns just this condition's rows,
+    // so it works no matter how active the wallet is. `limit` is hard-capped at 500 by the API — asking
+    // for more returns `{"error":"max activity limit of 500 exceeded"}` (a non-array), which is exactly
+    // what was making every card show "Target: n/a".
+    const url = new URL("https://data-api.polymarket.com/activity");
+    url.searchParams.set("user", funder);
+    url.searchParams.set("market", conditionId);
+    url.searchParams.set("limit", "500");
+    const res = await fetch(url, { headers: { "user-agent": "copybot-pnl-reconciler" } });
     if (!res.ok) {
       return null;
     }
-    const d = (await res.json()) as Array<Record<string, unknown>>;
+    const d = (await res.json()) as unknown;
+    if (!Array.isArray(d)) {
+      return null; // error object / unexpected shape — never iterate it
+    }
     const cond = conditionId.toLowerCase();
     const sharesByOutcome = new Map<string, number>();
     let netUsdc = 0;
-    for (const x of d) {
+    for (const x of d as Array<Record<string, unknown>>) {
       if (x["type"] !== "TRADE" || String(x["conditionId"] ?? "").toLowerCase() !== cond) {
         continue;
       }
