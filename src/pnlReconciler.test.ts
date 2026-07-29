@@ -109,6 +109,32 @@ test("oversold outcome (sold more than bought) yields NET-NEGATIVE shares — th
   assert.ok((r.netSharesByOutcome.get("Down") ?? 0) < -1, "net Down shares must be < -1 so the guard trips");
 });
 
+test("50:50 split resolution: every share pays $0.50 (both sides), not $1-to-winner", () => {
+  // The purplesnails tennis case: bought 167.6 of the "losing" side + 7.2 of the other for ~$90.49,
+  // market voided 50:50. Old code counted only the winner side ×$1 → fake big loss. Correct: 0.5×all.
+  const r = computeTargetPnl(
+    [
+      rec({ outcome: "Alame", side: "buy", filledShares: 167.6, filledUsdc: 87.0 }),
+      rec({ outcome: "Arakawa", side: "buy", filledShares: 7.2, filledUsdc: 3.49 }),
+    ],
+    new Map([
+      ["Arakawa", 0.5],
+      ["Alame", 0.5],
+    ])
+  );
+  // payout = 0.5*(167.6 + 7.2) = 87.4 ; cost 90.49 → pnl ≈ -3.09 (NOT -83)
+  assert.ok(Math.abs(r.payout - 87.4) < 0.01, `payout ${r.payout}`);
+  assert.ok(Math.abs(r.pnl - -3.09) < 0.02, `pnl ${r.pnl}`);
+});
+
+test("single-winner via payout map matches the string form", () => {
+  const trs = [rec({ outcome: "Up", side: "buy", filledShares: 100, filledUsdc: 40 })];
+  const viaString = computeTargetPnl(trs, "Up");
+  const viaMap = computeTargetPnl(trs, new Map([["Up", 1], ["Down", 0]]));
+  assert.equal(viaString.pnl, viaMap.pnl);
+  assert.equal(viaMap.payout, 100);
+});
+
 test("net negative shares clamp to 0 payout", () => {
   // defensive: over-refund / accounting drift shouldn't create phantom payout
   const r = computeTargetPnl([rec({ outcome: "Up", side: "sell", filledShares: 10, filledUsdc: 5 })], "Up");

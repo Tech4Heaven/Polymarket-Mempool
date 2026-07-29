@@ -105,17 +105,21 @@ async function fetchOutcomeOrder(conditionId: string): Promise<string[] | null> 
   }
 }
 
+/** Outcome label → payout fraction in [0,1] (sums to ~1). {Up:1,Down:0} normally; {Up:0.5,Down:0.5} for a split. */
+export type Payouts = Map<string, number>;
+
 /**
- * Winning outcome index from the ConditionalTokens contract — the AUTHORITATIVE, FAST source. The
- * payout is set the instant the market resolves (it is exactly what makes shares redeemable, ~1 min
- * for BTC 5-min markets), unlike the CLOB `winner` metadata flag which is batch-updated minutes later.
- * Returns null if not yet resolved, on a tie/scalar split (ambiguous), or on a read failure.
+ * On-chain payout VECTOR from ConditionalTokens: fraction[i] = payoutNumerators[i] / denominator.
+ * This is the AUTHORITATIVE, FAST source (set the instant the market resolves, ~1 min). Crucially it
+ * handles BOTH a single winner ([1,0] → 1.0/0.0) AND a SPLIT resolution ([1,1]/2 → 0.5/0.5) — e.g. a
+ * voided / walkover / tied sports market, where EVERY share pays $0.50, not $1-to-the-winner.
+ * Returns null if unresolved (denominator 0) or on a read failure.
  */
-async function onchainWinnerIndex(
+async function onchainPayouts(
   provider: JsonRpcProvider,
   conditionId: string,
   outcomeCount: number
-): Promise<number | null> {
+): Promise<number[] | null> {
   try {
     const ctf = new Contract(CONDITIONAL_TOKENS, CTF_RESOLUTION_ABI, provider) as unknown as {
       payoutDenominator: (c: string) => Promise<bigint>;
@@ -125,23 +129,13 @@ async function onchainWinnerIndex(
     if (denom === 0n) {
       return null; // not resolved yet
     }
-    let bestIdx = -1;
-    let best = -1n;
-    let tie = false;
+    const d = Number(denom);
+    const fr: number[] = [];
     for (let i = 0; i < outcomeCount; i++) {
       const n = await ctf.payoutNumerators(conditionId, i);
-      if (n > best) {
-        best = n;
-        bestIdx = i;
-        tie = false;
-      } else if (n === best) {
-        tie = true;
-      }
+      fr.push(Number(n) / d);
     }
-    if (bestIdx < 0 || best <= 0n || tie) {
-      return null; // no clear winner (e.g. 50/50 scalar split) — let the CLOB fallback decide
-    }
-    return bestIdx;
+    return fr.some((x) => x > 0) ? fr : null;
   } catch {
     return null;
   }
@@ -168,19 +162,35 @@ async function clobWinner(conditionId: string): Promise<string | null> {
 }
 
 /**
- * Winning outcome label for a resolved market, or null if not resolved / lookup failed.
- * On-chain ConditionalTokens payout is primary (~1 min after resolution); the CLOB `winner` metadata
- * flag (minutes-late) is only a fallback if the on-chain read can't produce a label.
+ * Payout fractions per outcome for a resolved market, or null if unresolved / lookup failed. On-chain
+ * payout vector is primary (handles 50:50 splits correctly). The CLOB single-winner flag is only a
+ * fallback and CANNOT represent a split (it assumes winner=1, loser=0), so on-chain must lead.
  */
-async function fetchWinner(provider: JsonRpcProvider, conditionId: string): Promise<string | null> {
+async function fetchPayouts(provider: JsonRpcProvider, conditionId: string): Promise<Payouts | null> {
   const order = await fetchOutcomeOrder(conditionId);
   if (order) {
-    const idx = await onchainWinnerIndex(provider, conditionId, order.length);
-    if (idx !== null && idx < order.length) {
-      return order[idx] ?? null;
+    const fr = await onchainPayouts(provider, conditionId, order.length);
+    if (fr) {
+      const m: Payouts = new Map();
+      order.forEach((oc, i) => m.set(oc, fr[i] ?? 0));
+      return m;
     }
   }
-  return clobWinner(conditionId);
+  const w = await clobWinner(conditionId);
+  return w ? new Map([[w, 1]]) : null;
+}
+
+/** Human label for a resolved payout: the winning outcome, or e.g. "Up 50% / Down 50%" for a split. */
+function payoutLabel(payouts: Payouts): string {
+  const nz = [...payouts.entries()].filter(([, f]) => f > 0).sort((a, b) => b[1] - a[1]);
+  if (nz.length === 0) return "?";
+  if (nz.length === 1) return nz[0]![0];
+  return nz.map(([oc, f]) => `${oc} ${Math.round(f * 100)}%`).join(" / ");
+}
+
+/** The single outcome with the highest payout fraction (for the exit-before-payout heuristic). */
+function topOutcome(payouts: Payouts): string {
+  return [...payouts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
 }
 
 function groupBy<T>(items: T[], key: (t: T) => string): Map<string, T[]> {
@@ -197,11 +207,17 @@ function groupBy<T>(items: T[], key: (t: T) => string): Map<string, T[]> {
   return m;
 }
 
-/** Pure per-target P&L from records (whose fills are the TRUE fills), given the winning outcome. */
+/**
+ * Pure per-target P&L from records (whose fills are the TRUE fills). Accepts either a single winning
+ * outcome (string → treated as {winner: 1}) or a full payout map (for 50:50 / split resolutions).
+ * Payout = Σ over outcomes of held-shares × payout-fraction — so a "losing" side in a 50:50 still
+ * contributes its $0.50/share instead of being counted as $0.
+ */
 export function computeTargetPnl(
   trs: LedgerRecord[],
-  winner: string
+  winnerOrPayouts: string | Payouts
 ): { netSharesByOutcome: Map<string, number>; netUsdc: number; payout: number; pnl: number } {
+  const payouts: Payouts = typeof winnerOrPayouts === "string" ? new Map([[winnerOrPayouts, 1]]) : winnerOrPayouts;
   const netSharesByOutcome = new Map<string, number>();
   let netUsdc = 0;
   for (const r of trs) {
@@ -209,7 +225,10 @@ export function computeTargetPnl(
     netSharesByOutcome.set(r.outcome, (netSharesByOutcome.get(r.outcome) ?? 0) + sgn * r.filledShares);
     netUsdc += sgn * r.filledUsdc;
   }
-  const payout = Math.max(0, netSharesByOutcome.get(winner) ?? 0);
+  let payout = 0;
+  for (const [oc, sh] of netSharesByOutcome) {
+    payout += Math.max(0, sh) * (payouts.get(oc) ?? 0);
+  }
   return { netSharesByOutcome, netUsdc, payout, pnl: payout - netUsdc };
 }
 
@@ -238,7 +257,7 @@ async function correctFillsViaOrders(client: ClobClient, records: LedgerRecord[]
 async function conditionPnlFromChain(
   funder: string,
   conditionId: string,
-  winner: string
+  payouts: Payouts
 ): Promise<{ payout: number; netUsdc: number } | null> {
   try {
     // Filter to THIS market server-side (`market=<conditionId>`): returns just this condition's rows,
@@ -269,7 +288,12 @@ async function conditionPnlFromChain(
       const oc = String(x["outcome"] ?? "");
       sharesByOutcome.set(oc, (sharesByOutcome.get(oc) ?? 0) + sgn * (parseFloat(String(x["size"] ?? "0")) || 0));
     }
-    return { payout: Math.max(0, sharesByOutcome.get(winner) ?? 0), netUsdc };
+    // Payout = Σ over outcomes of held-shares × payout-fraction (handles single-winner AND 50:50 split).
+    let payout = 0;
+    for (const [oc, sh] of sharesByOutcome) {
+      payout += Math.max(0, sh) * (payouts.get(oc) ?? 0);
+    }
+    return { payout, netUsdc };
   } catch {
     return null;
   }
@@ -339,7 +363,8 @@ type CardOpts = {
   target: string;
   conditionId: string;
   event: string;
-  winner: string;
+  winner: string; // display label (e.g. "Up", or "Up 50% / Down 50%" for a split)
+  payouts: Payouts; // outcome → fraction; needed to compute the TARGET's P&L correctly (incl. splits)
   yourSide: string;
   breakdown: string;
   cost: number;
@@ -400,7 +425,7 @@ async function sendAggregatedCard(config: AppConfig, markets: CardOpts[]): Promi
     // The target's own P&L for each market (on-chain), summed. Unknown markets are skipped.
     const targetPerMarket = await Promise.all(
       markets.map(async (m) => {
-        const t = await conditionPnlFromChain(m.target, m.conditionId, m.winner);
+        const t = await conditionPnlFromChain(m.target, m.conditionId, m.payouts);
         return t ? t.payout - t.netUsdc : null;
       })
     );
@@ -481,10 +506,12 @@ async function reconcileOnce(
       break;
     }
     checks += 1;
-    const winner = await fetchWinner(provider, conditionId);
-    if (winner === null) {
+    const payouts = await fetchPayouts(provider, conditionId);
+    if (payouts === null) {
       continue; // not resolved yet
     }
+    const winner = payoutLabel(payouts); // display label (single winner, or "Up 50% / Down 50%")
+    const top = topOutcome(payouts); // for the exit-before-payout heuristic
 
     const event = recs.find((r) => r.event)?.event ?? "";
     const corrected = await correctFillsViaOrders(client, recs);
@@ -495,7 +522,7 @@ async function reconcileOnce(
     let trustCorrected = corrected !== null;
     if (corrected) {
       for (const [target, trs] of groupBy(corrected, (r) => r.target)) {
-        const { netSharesByOutcome } = computeTargetPnl(trs, winner);
+        const { netSharesByOutcome } = computeTargetPnl(trs, payouts);
         const oversold = [...netSharesByOutcome.entries()].find(([, sh]) => sh < -NEG_SHARE_TOLERANCE);
         if (oversold) {
           trustCorrected = false;
@@ -511,7 +538,7 @@ async function reconcileOnce(
     if (corrected && trustCorrected) {
       // Exact, per-order → per-target.
       for (const [target, trs] of groupBy(corrected, (r) => r.target)) {
-        const { netSharesByOutcome, netUsdc, payout, pnl } = computeTargetPnl(trs, winner);
+        const { netSharesByOutcome, netUsdc, payout, pnl } = computeTargetPnl(trs, payouts);
         const breakdown = [...netSharesByOutcome.entries()].map(([oc, sh]) => `${oc}=${sh.toFixed(2)}sh`).join(" ");
         writeResolved(config, target, event, conditionId, winner, breakdown, payout, netUsdc, pnl, "orderId");
         if (isTelegramEnabled()) {
@@ -520,12 +547,13 @@ async function reconcileOnce(
             conditionId,
             event,
             winner,
+            payouts,
             yourSide: primaryBuySide(trs),
             breakdown,
             cost: netUsdc,
             payout,
             pnl,
-            exitFlag: exitBeforePayout(trs, winner, netSharesByOutcome.get(winner) ?? 0),
+            exitFlag: exitBeforePayout(trs, top, netSharesByOutcome.get(top) ?? 0),
           });
         }
       }
@@ -534,7 +562,7 @@ async function reconcileOnce(
       if (!funder) {
         continue; // no wallet to query on-chain — retry next cycle (getOrder may recover)
       }
-      const chain = await conditionPnlFromChain(funder, conditionId, winner);
+      const chain = await conditionPnlFromChain(funder, conditionId, payouts);
       if (chain === null) {
         continue; // couldn't determine fills — retry next cycle (do NOT mark resolved)
       }
@@ -560,6 +588,7 @@ async function reconcileOnce(
             conditionId,
             event: ev,
             winner,
+            payouts,
             yourSide: primaryBuySide(trs),
             breakdown: "",
             cost: netUsdc,
