@@ -4,14 +4,13 @@ import { computeTargetPnl } from "./pnlReconciler.js";
 import type { LedgerRecord } from "./orderLedger.js";
 
 function rec(p: Partial<LedgerRecord>): LedgerRecord {
-  return {
+  const base = {
     ts: 0,
     orderId: "0x",
     target: "0xT",
     conditionId: "0xC",
-    tokenId: "1",
     outcome: "Up",
-    side: "buy",
+    side: "buy" as const,
     isHedge: false,
     filledShares: 0,
     filledUsdc: 0,
@@ -19,6 +18,9 @@ function rec(p: Partial<LedgerRecord>): LedgerRecord {
     event: "M",
     ...p,
   };
+  // Payouts are now matched by tokenId, so give each outcome its own tokenId (= the outcome name here)
+  // unless one is set explicitly. This mirrors production, where tokenId is the robust match key.
+  return { ...base, tokenId: p.tokenId ?? base.outcome };
 }
 
 test("winning buy: payout = shares, pnl = shares - cost", () => {

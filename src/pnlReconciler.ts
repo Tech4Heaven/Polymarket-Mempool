@@ -76,10 +76,16 @@ const CTF_RESOLUTION_ABI = [
  * The token list and its order are fixed at market creation and available immediately — only the CLOB
  * `winner` flag lags. Cached forever since it never changes.
  */
-const outcomeOrderCache = new Map<string, string[]>();
+type MarketToken = { tokenId: string; outcome: string; winner: boolean };
+const marketTokenCache = new Map<string, MarketToken[]>();
 
-async function fetchOutcomeOrder(conditionId: string): Promise<string[] | null> {
-  const cached = outcomeOrderCache.get(conditionId);
+/**
+ * The market's outcome tokens in outcome-slot order: {tokenId, outcome, winner}. We key P&L on
+ * `tokenId` (immutable, identical across CLOB/data-api/ledger) rather than the outcome LABEL, which
+ * differs between sources (e.g. CLOB "O'connell" vs data-api "Oconnell") and silently zeroed payouts.
+ */
+async function fetchMarketTokens(conditionId: string): Promise<MarketToken[] | null> {
+  const cached = marketTokenCache.get(conditionId);
   if (cached) {
     return cached;
   }
@@ -90,22 +96,26 @@ async function fetchOutcomeOrder(conditionId: string): Promise<string[] | null> 
     if (!res.ok) {
       return null;
     }
-    const d = (await res.json()) as { tokens?: { outcome?: string }[] };
+    const d = (await res.json()) as { tokens?: { token_id?: string; outcome?: string; winner?: boolean }[] };
     if (!Array.isArray(d.tokens) || d.tokens.length < 2) {
       return null;
     }
-    const outcomes = d.tokens.map((t) => t.outcome);
-    if (!outcomes.every((o): o is string => typeof o === "string" && o.length > 0)) {
+    const toks = d.tokens.map((t) => ({
+      tokenId: String(t.token_id ?? ""),
+      outcome: String(t.outcome ?? ""),
+      winner: t.winner === true,
+    }));
+    if (toks.some((t) => !t.tokenId || !t.outcome)) {
       return null;
     }
-    outcomeOrderCache.set(conditionId, outcomes);
-    return outcomes;
+    marketTokenCache.set(conditionId, toks);
+    return toks;
   } catch {
     return null;
   }
 }
 
-/** Outcome label → payout fraction in [0,1] (sums to ~1). {Up:1,Down:0} normally; {Up:0.5,Down:0.5} for a split. */
+/** tokenId → payout fraction in [0,1] (sums to ~1). Keyed by tokenId, NOT outcome label (labels differ across sources). */
 export type Payouts = Map<string, number>;
 
 /**
@@ -166,31 +176,45 @@ async function clobWinner(conditionId: string): Promise<string | null> {
  * payout vector is primary (handles 50:50 splits correctly). The CLOB single-winner flag is only a
  * fallback and CANNOT represent a split (it assumes winner=1, loser=0), so on-chain must lead.
  */
-async function fetchPayouts(provider: JsonRpcProvider, conditionId: string): Promise<Payouts | null> {
-  const order = await fetchOutcomeOrder(conditionId);
-  if (order) {
-    const fr = await onchainPayouts(provider, conditionId, order.length);
-    if (fr) {
-      const m: Payouts = new Map();
-      order.forEach((oc, i) => m.set(oc, fr[i] ?? 0));
-      return m;
-    }
+type Resolution = {
+  /** tokenId → payout fraction. Used to compute P&L (matched by tokenId, robust to label differences). */
+  byToken: Payouts;
+  /** Human display: winner outcome, or "Up 50% / Down 50%" for a split. */
+  label: string;
+  /** tokenId of the highest-paying outcome (for the exit-before-payout heuristic). */
+  topTokenId: string;
+};
+
+async function fetchPayouts(provider: JsonRpcProvider, conditionId: string): Promise<Resolution | null> {
+  const toks = await fetchMarketTokens(conditionId);
+  if (!toks) {
+    return null; // can't resolve tokens → can't price by token; retry next cycle
   }
-  const w = await clobWinner(conditionId);
-  return w ? new Map([[w, 1]]) : null;
-}
-
-/** Human label for a resolved payout: the winning outcome, or e.g. "Up 50% / Down 50%" for a split. */
-function payoutLabel(payouts: Payouts): string {
-  const nz = [...payouts.entries()].filter(([, f]) => f > 0).sort((a, b) => b[1] - a[1]);
-  if (nz.length === 0) return "?";
-  if (nz.length === 1) return nz[0]![0];
-  return nz.map(([oc, f]) => `${oc} ${Math.round(f * 100)}%`).join(" / ");
-}
-
-/** The single outcome with the highest payout fraction (for the exit-before-payout heuristic). */
-function topOutcome(payouts: Payouts): string {
-  return [...payouts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+  let fr = await onchainPayouts(provider, conditionId, toks.length);
+  if (!fr) {
+    // Fallback: CLOB `winner` flag → 1.0 to the winning token, 0 to the rest (can't express a split).
+    if (!toks.some((t) => t.winner)) {
+      return null; // not resolved on-chain AND no CLOB winner → unresolved
+    }
+    fr = toks.map((t) => (t.winner ? 1 : 0));
+  }
+  const byToken: Payouts = new Map();
+  const parts: { outcome: string; f: number; tokenId: string }[] = [];
+  toks.forEach((t, i) => {
+    const f = fr![i] ?? 0;
+    byToken.set(t.tokenId, f);
+    if (f > 0) {
+      parts.push({ outcome: t.outcome, f, tokenId: t.tokenId });
+    }
+  });
+  parts.sort((a, b) => b.f - a.f);
+  const label =
+    parts.length === 0
+      ? "?"
+      : parts.length === 1
+        ? parts[0]!.outcome
+        : parts.map((p) => `${p.outcome} ${Math.round(p.f * 100)}%`).join(" / ");
+  return { byToken, label, topTokenId: parts[0]?.tokenId ?? "" };
 }
 
 function groupBy<T>(items: T[], key: (t: T) => string): Map<string, T[]> {
@@ -216,20 +240,29 @@ function groupBy<T>(items: T[], key: (t: T) => string): Map<string, T[]> {
 export function computeTargetPnl(
   trs: LedgerRecord[],
   winnerOrPayouts: string | Payouts
-): { netSharesByOutcome: Map<string, number>; netUsdc: number; payout: number; pnl: number } {
+): {
+  netSharesByOutcome: Map<string, number>;
+  netSharesByToken: Map<string, number>;
+  netUsdc: number;
+  payout: number;
+  pnl: number;
+} {
   const payouts: Payouts = typeof winnerOrPayouts === "string" ? new Map([[winnerOrPayouts, 1]]) : winnerOrPayouts;
   const netSharesByOutcome = new Map<string, number>();
+  const netSharesByToken = new Map<string, number>();
   let netUsdc = 0;
   for (const r of trs) {
     const sgn = r.side === "buy" ? 1 : -1;
     netSharesByOutcome.set(r.outcome, (netSharesByOutcome.get(r.outcome) ?? 0) + sgn * r.filledShares);
+    netSharesByToken.set(r.tokenId, (netSharesByToken.get(r.tokenId) ?? 0) + sgn * r.filledShares);
     netUsdc += sgn * r.filledUsdc;
   }
+  // Payout matched by tokenId (robust to outcome-label differences across sources).
   let payout = 0;
-  for (const [oc, sh] of netSharesByOutcome) {
-    payout += Math.max(0, sh) * (payouts.get(oc) ?? 0);
+  for (const [tok, sh] of netSharesByToken) {
+    payout += Math.max(0, sh) * (payouts.get(tok) ?? 0);
   }
-  return { netSharesByOutcome, netUsdc, payout, pnl: payout - netUsdc };
+  return { netSharesByOutcome, netSharesByToken, netUsdc, payout, pnl: payout - netUsdc };
 }
 
 /**
@@ -277,7 +310,7 @@ async function conditionPnlFromChain(
       return null; // error object / unexpected shape — never iterate it
     }
     const cond = conditionId.toLowerCase();
-    const sharesByOutcome = new Map<string, number>();
+    const sharesByToken = new Map<string, number>();
     let netUsdc = 0;
     for (const x of d as Array<Record<string, unknown>>) {
       if (x["type"] !== "TRADE" || String(x["conditionId"] ?? "").toLowerCase() !== cond) {
@@ -285,13 +318,13 @@ async function conditionPnlFromChain(
       }
       const sgn = x["side"] === "BUY" ? 1 : -1;
       netUsdc += sgn * (parseFloat(String(x["usdcSize"] ?? "0")) || 0);
-      const oc = String(x["outcome"] ?? "");
-      sharesByOutcome.set(oc, (sharesByOutcome.get(oc) ?? 0) + sgn * (parseFloat(String(x["size"] ?? "0")) || 0));
+      const tok = String(x["asset"] ?? ""); // token id — matches the payout map's key
+      sharesByToken.set(tok, (sharesByToken.get(tok) ?? 0) + sgn * (parseFloat(String(x["size"] ?? "0")) || 0));
     }
-    // Payout = Σ over outcomes of held-shares × payout-fraction (handles single-winner AND 50:50 split).
+    // Payout = Σ over tokens of held-shares × payout-fraction (by tokenId; handles single-winner AND splits).
     let payout = 0;
-    for (const [oc, sh] of sharesByOutcome) {
-      payout += Math.max(0, sh) * (payouts.get(oc) ?? 0);
+    for (const [tok, sh] of sharesByToken) {
+      payout += Math.max(0, sh) * (payouts.get(tok) ?? 0);
     }
     return { payout, netUsdc };
   } catch {
@@ -336,13 +369,13 @@ function primaryBuySide(recs: LedgerRecord[]): string {
   return best || recs[0]?.outcome || "?";
 }
 /** If the bot bought the winning side but sold most of it before resolution, describe it. */
-function exitBeforePayout(trs: LedgerRecord[], winner: string, heldWinner: number): string | undefined {
+function exitBeforePayout(trs: LedgerRecord[], winnerTokenId: string, heldWinner: number): string | undefined {
   let bSh = 0;
   let bUsd = 0;
   let sSh = 0;
   let sUsd = 0;
   for (const r of trs) {
-    if (r.outcome !== winner) {
+    if (r.tokenId !== winnerTokenId) {
       continue;
     }
     if (r.side === "buy") {
@@ -506,12 +539,11 @@ async function reconcileOnce(
       break;
     }
     checks += 1;
-    const payouts = await fetchPayouts(provider, conditionId);
-    if (payouts === null) {
+    const resolution = await fetchPayouts(provider, conditionId);
+    if (resolution === null) {
       continue; // not resolved yet
     }
-    const winner = payoutLabel(payouts); // display label (single winner, or "Up 50% / Down 50%")
-    const top = topOutcome(payouts); // for the exit-before-payout heuristic
+    const { byToken: payouts, label: winner, topTokenId } = resolution;
 
     const event = recs.find((r) => r.event)?.event ?? "";
     const corrected = await correctFillsViaOrders(client, recs);
@@ -538,7 +570,7 @@ async function reconcileOnce(
     if (corrected && trustCorrected) {
       // Exact, per-order → per-target.
       for (const [target, trs] of groupBy(corrected, (r) => r.target)) {
-        const { netSharesByOutcome, netUsdc, payout, pnl } = computeTargetPnl(trs, payouts);
+        const { netSharesByOutcome, netSharesByToken, netUsdc, payout, pnl } = computeTargetPnl(trs, payouts);
         const breakdown = [...netSharesByOutcome.entries()].map(([oc, sh]) => `${oc}=${sh.toFixed(2)}sh`).join(" ");
         writeResolved(config, target, event, conditionId, winner, breakdown, payout, netUsdc, pnl, "orderId");
         if (isTelegramEnabled()) {
@@ -553,7 +585,7 @@ async function reconcileOnce(
             cost: netUsdc,
             payout,
             pnl,
-            exitFlag: exitBeforePayout(trs, top, netSharesByOutcome.get(top) ?? 0),
+            exitFlag: exitBeforePayout(trs, topTokenId, netSharesByToken.get(topTokenId) ?? 0),
           });
         }
       }
