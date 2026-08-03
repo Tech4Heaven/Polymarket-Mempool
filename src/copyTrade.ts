@@ -909,24 +909,42 @@ async function safeCancel(client: ClobClient, orderId: string, cfg: CopyTradeCon
   }
 }
 
+/** Default hedge size as a fraction of the filled main position (1.0 = fully balance the position). */
+export const DEFAULT_HEDGE_TOKEN_PERCENT = 1;
+
+/** Hedge shares still needed = target (percent × main) minus what's already held on the hedge side. */
+export function idealHedgeSize(mainShares: number, hedgeHeld: number, percent: number): number {
+  if (!(mainShares > 0)) {
+    return 0;
+  }
+  return mainShares * percent - hedgeHeld;
+}
+
 /**
- * Compute the ideal hedge for current holdings: GTC BUY on the smaller side at hedge_price,
- * sized to the net imbalance. Returns null if the position is balanced (no hedge needed).
+ * Compute the ideal hedge: a GTC BUY on the side OPPOSITE the target's main, sized to
+ * `hedge_token_percent × (filled main position)`, minus any hedge shares already held. Returns null
+ * when no more hedge is needed.
+ *
+ * Direction (which side is "main") comes from the COPIED position (mainOrders), NOT total shares —
+ * filled hedge shares inflate the hedge side and must never be mistaken for the target's direction.
+ * This is what prevents the runaway "hedge > main" we saw: once the hedge side reaches percent × main
+ * it stops, and it never flips to hedging the main side just because the hedge over-filled.
  */
-function computeIdealHedge(state: MarketHedgeState, hedgePrice: number): HedgeRest | null {
-  const sharesA = state.sharesByToken.get(state.tokenA) ?? 0;
-  const sharesB = state.sharesByToken.get(state.tokenB) ?? 0;
-  const imbalance = Math.abs(sharesA - sharesB);
-  if (imbalance <= 0) {
+function computeIdealHedge(state: MarketHedgeState, hedgePrice: number, hedgePercent: number): HedgeRest | null {
+  const copied = new Map<string, number>();
+  for (const o of state.mainOrders.values()) {
+    copied.set(o.tokenId, (copied.get(o.tokenId) ?? 0) + (o.side === "buy" ? o.matched : -o.matched));
+  }
+  const cA = Math.max(0, copied.get(state.tokenA) ?? 0);
+  const cB = Math.max(0, copied.get(state.tokenB) ?? 0);
+  const mainShares = Math.max(cA, cB);
+  const hedgeToken = cA >= cB ? state.tokenB : state.tokenA; // opposite the target's main
+  const hedgeHeld = state.sharesByToken.get(hedgeToken) ?? 0; // incl. already-filled hedge shares
+  const size = idealHedgeSize(mainShares, hedgeHeld, hedgePercent);
+  if (size <= 0) {
     return null;
   }
-  const shortTokenId = sharesA > sharesB ? state.tokenB : state.tokenA;
-  return {
-    orderId: "",
-    tokenId: shortTokenId,
-    price: hedgePrice,
-    size: imbalance,
-  };
+  return { orderId: "", tokenId: hedgeToken, price: hedgePrice, size };
 }
 
 /**
@@ -943,7 +961,7 @@ async function reconcileHedge(
   if (cfg.hedgePrice === undefined) {
     return;
   }
-  const ideal = computeIdealHedge(state, cfg.hedgePrice);
+  const ideal = computeIdealHedge(state, cfg.hedgePrice, cfg.hedgeTokenPercent ?? DEFAULT_HEDGE_TOKEN_PERCENT);
 
   // If current hedge already matches ideal, nothing to do (avoids needless cancel/replace churn).
   if (

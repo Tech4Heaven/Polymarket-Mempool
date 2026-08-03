@@ -68,6 +68,8 @@ export type TargetCopyParams = {
    * condition). Per-target. Omit = no hedging.
    */
   hedgePrice?: number;
+  /** Hedge size as a fraction of the filled main position (0 < x ≤ 1). Default 1 (fully balance). */
+  hedgeTokenPercent?: number;
   /**
    * Per-side max USDC cap. The most USDC we'll commit to this target's copies on a single
    * outcome token. Applied independently per outcome. Buys are clipped to fit; full sells
@@ -110,6 +112,8 @@ export type CopyTradeConfig = CopyTradeShared & {
   dryRun: boolean;
   /** Per-target hedge price (merged from TargetCopyParams). Omit = no hedging. */
   hedgePrice?: number;
+  /** Per-target hedge size as a fraction of the filled main position (default 1). */
+  hedgeTokenPercent?: number;
   /** Per-target per-side max USDC cap. Omit = no cap. */
   maxMarketUsdc?: number;
   /** Per-target below-min accumulator toggle. */
@@ -187,6 +191,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     maxPositionUsdc: p.maxPositionUsdc,
     dryRun: p.dryRun,
     hedgePrice: p.hedgePrice,
+    hedgeTokenPercent: p.hedgeTokenPercent,
     maxMarketUsdc: p.maxMarketUsdc,
     accumulateBelowMin: p.accumulateBelowMin,
     driftRewatchSeconds: p.driftRewatchSeconds,
@@ -486,6 +491,15 @@ export async function loadAppConfig(): Promise<AppConfig> {
         const hedgePriceRaw = row.hedge_price ?? defaults.hedge_price;
         const hedgePrice = optionalProb01("hedge_price", hedgePriceRaw, `targets ${row.address}`);
 
+        const hedgeTokenPercentRaw = row.hedge_token_percent ?? defaults.hedge_token_percent;
+        let hedgeTokenPercent: number | undefined;
+        if (hedgeTokenPercentRaw !== undefined) {
+          if (!Number.isFinite(hedgeTokenPercentRaw) || hedgeTokenPercentRaw <= 0 || hedgeTokenPercentRaw > 1) {
+            throw new Error(`targets ${row.address}: hedge_token_percent must be a fraction in (0, 1] (e.g. 0.5)`);
+          }
+          hedgeTokenPercent = hedgeTokenPercentRaw;
+        }
+
         const maxMarketUsdcRaw = row.max_market_usdc ?? defaults.max_market_usdc;
         let maxMarketUsdc: number | undefined;
         if (maxMarketUsdcRaw !== undefined) {
@@ -545,6 +559,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           maxPositionUsdc,
           dryRun,
           hedgePrice,
+          hedgeTokenPercent,
           maxMarketUsdc,
           accumulateBelowMin,
           driftRewatchSeconds,

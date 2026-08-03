@@ -25,10 +25,12 @@ export type TomlDefaultsSection = {
   dry_run?: boolean;
   /**
    * If set (0,1), after each copy BUY we place a GTC limit BUY for the OPPOSITE outcome at this
-   * price, sized to our total holdings of the primary side in that condition. Acts as a passive
-   * pre-hedge. Subsequent target opposite-side BUYs are suppressed (we're already hedged).
+   * price, sized to the filled main position in that condition. Acts as a passive pre-hedge.
+   * Subsequent target opposite-side BUYs are suppressed (we're already hedged).
    */
   hedge_price?: number;
+  /** Hedge size as a fraction of the filled main position (0 < x ≤ 1). Default 1 = fully balance. */
+  hedge_token_percent?: number;
   /**
    * Per-side max USDC cap: the most USDC we'll commit to copies of THIS target on a single
    * outcome token. Applies independently per outcome (Up and Down each get their own bucket),
@@ -96,6 +98,7 @@ export type TomlTargetRow = {
   max_position_usdc?: number;
   dry_run?: boolean;
   hedge_price?: number;
+  hedge_token_percent?: number;
   max_market_usdc?: number;
   watch_withdrawals?: boolean;
   accumulate_below_min?: boolean;
@@ -169,6 +172,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       max_position_usdc: numOrUndef("max_position_usdc", src),
       dry_run: boolOrUndef("dry_run", src),
       hedge_price: numOrUndef("hedge_price", src),
+      hedge_token_percent: numOrUndef("hedge_token_percent", src),
       max_market_usdc: numOrUndef("max_market_usdc", src),
       watch_withdrawals: boolOrUndef("watch_withdrawals", src),
       accumulate_below_min: boolOrUndef("accumulate_below_min", src),
@@ -210,6 +214,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       max_position_usdc: numOrUndef("max_position_usdc", row),
       dry_run: boolOrUndef("dry_run", row),
       hedge_price: numOrUndef("hedge_price", row),
+      hedge_token_percent: numOrUndef("hedge_token_percent", row),
       max_market_usdc: numOrUndef("max_market_usdc", row),
       watch_withdrawals: boolOrUndef("watch_withdrawals", row),
       accumulate_below_min: boolOrUndef("accumulate_below_min", row),

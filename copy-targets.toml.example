@@ -36,6 +36,10 @@ max_position_usdc = 100
 # When the target later buys the opposite side themselves, we suppress that copy (already hedged).
 # Omit = no hedging.
 # hedge_price = 0.10
+# Hedge size as a FRACTION of the filled main position (0 < x <= 1). Default 1 = fully balance
+# (hedge shares == main shares). e.g. 0.5 = hedge only 50% of the main. The hedge is capped at this
+# fraction of the main and never chases past it, so it can't balloon larger than the main.
+# hedge_token_percent = 0.5
 # Per-SIDE max USDC cap. The most USDC this target can cause us to commit to a single outcome
 # (Up and Down each get their own bucket — total per market can reach 2× this value).
 # Buys are clipped to fit; full sells reset the side. Omit = no cap.

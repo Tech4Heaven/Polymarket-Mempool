@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyTakerBump, DEFAULT_MAX_TAKER_BUMP_FRAC, proportionalSellShares } from "./copyTrade.js";
+import { applyTakerBump, DEFAULT_MAX_TAKER_BUMP_FRAC, proportionalSellShares, idealHedgeSize } from "./copyTrade.js";
+
+test("hedge size: percent 1.0 fully balances (100 main, 0 held → 100)", () => {
+  assert.equal(idealHedgeSize(100, 0, 1), 100);
+});
+test("hedge size: percent 0.5 targets half the main (100 main → 50)", () => {
+  assert.equal(idealHedgeSize(100, 0, 0.5), 50);
+});
+test("hedge size: subtracts already-held hedge shares (target 50, held 20 → 30 more)", () => {
+  assert.equal(idealHedgeSize(100, 20, 0.5), 30);
+});
+test("hedge size: already at/over target → 0 (never adds; stops over-hedge)", () => {
+  assert.equal(idealHedgeSize(52, 800, 0.5), 52 * 0.5 - 800); // negative → caller treats <=0 as none
+  assert.ok(idealHedgeSize(52, 800, 0.5) <= 0);
+});
+test("hedge size: no main position → 0", () => {
+  assert.equal(idealHedgeSize(0, 0, 0.5), 0);
+});
 
 test("proportional sell: target sold 10 of 100 (10%), we hold 90 → sell 9", () => {
   assert.equal(proportionalSellShares(10, 100, 90), 9);
