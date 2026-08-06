@@ -22,6 +22,6 @@ export async function appendCopyTradeSuccessLine(line: string, filePathOverride?
   try {
     await appendFile(filePath, `[${ts}] ${line}\n`, "utf8");
   } catch (e) {
-    console.error("copy-trades log append failed:", e);
+    console.error(`copy-trades log append failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }

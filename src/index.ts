@@ -57,7 +57,7 @@ function copyForProfile(config: AppConfig, profile: TargetCopyParams, digests: C
   const copyCfg = mergeCopyTradeConfig(config.copyTradeShared, profile);
   for (const d of digests) {
     void executeCopyTrade(copyCfg, d, txHash).catch((e) => {
-      console.error(`copy trade failed tx=${txHash} target=${profile.address} token=${d.tokenId}`, e);
+      console.error(`copy trade failed tx=${txHash} target=${profile.address} token=${d.tokenId}: ${formatLogErr(e)}`);
       void appendCopyTradeSuccessLine(
         `[copy-error] tx=${txHash} token=${d.tokenId} ${formatLogErr(e)}`,
         copyCfg.copyTradeLogPath
@@ -163,7 +163,7 @@ async function logMinedTransfers(
       copyForProfile(config, profile, digests, txHash);
     }
   } catch (e) {
-    console.error(`mined error tx=${txHash}`, e);
+    console.error(`mined error tx=${txHash}: ${formatLogErr(e)}`);
     if (config.copyTradeShared) {
       const msg = `[mined] tx=${txHash} error ${formatLogErr(e)}`;
       for (const addrRaw of matchedTargets) {
@@ -196,7 +196,7 @@ async function main() {
         await ensureClobClient(probeCfg);
         console.info("CLOB: createOrDeriveApiKey OK (L2 credentials derived from wallet).");
       } catch (e) {
-        console.error("CLOB: createOrDeriveApiKey failed — copy trades will fail until auth succeeds:", e);
+        console.error(`CLOB: createOrDeriveApiKey failed — copy trades will fail until auth succeeds: ${formatLogErr(e)}`);
       }
       // Restart safety: cancel orphan GTC orders from a prior run so they can't fill behind
       // the (now-empty) in-memory hedge state and create double-hedge / unexpected exposure.
