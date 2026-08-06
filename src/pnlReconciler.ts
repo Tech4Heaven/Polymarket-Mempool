@@ -414,7 +414,16 @@ type CardOpts = {
 const FLUSH_QUIET_MS = 45_000;
 const FLUSH_MAX_MS = 4 * 60_000;
 
-type PendingBatch = { markets: CardOpts[]; firstTs: number; timer: ReturnType<typeof setTimeout> };
+type PendingBatch = {
+  markets: CardOpts[];
+  /** conditionIds already queued in THIS batch — guards against the same market being listed/summed
+   * twice when a market is enqueued more than once (overlapping reconcile cycles, a crash-loop /
+   * double-started instance, or any re-processing before the resolved-cache write lands). Without this,
+   * N re-enqueues produced an N× inflated card (e.g. 3 markets × 8 cycles → "24 markets", 8× the P&L). */
+  seen: Set<string>;
+  firstTs: number;
+  timer: ReturnType<typeof setTimeout>;
+};
 const pendingByTarget = new Map<string, PendingBatch>();
 
 /** Add a resolved market to its target's pending batch and (re)arm the debounced flush. */
@@ -423,9 +432,13 @@ function enqueueResolutionCard(config: AppConfig, o: CardOpts): void {
   let p = pendingByTarget.get(key);
   const now = Date.now();
   if (!p) {
-    p = { markets: [], firstTs: now, timer: setTimeout(() => undefined, 0) };
+    p = { markets: [], seen: new Set(), firstTs: now, timer: setTimeout(() => undefined, 0) };
     pendingByTarget.set(key, p);
   }
+  if (p.seen.has(o.conditionId)) {
+    return; // already queued this market for this target in the current batch — never list/sum it twice
+  }
+  p.seen.add(o.conditionId);
   p.markets.push(o);
   clearTimeout(p.timer);
   const delay = Math.min(FLUSH_QUIET_MS, Math.max(0, FLUSH_MAX_MS - (now - p.firstTs)));
