@@ -143,9 +143,14 @@ export type CopyTradeConfig = CopyTradeShared & {
 
 /**
  * Where target trades are detected from:
- *  - `polynode`: PolyNode pending-settlement mempool feed only (~3–5s pre-confirmation).
+ *  - `polynode`: PolyNode pending-settlement mempool feed only (~3–5s pre-confirmation). DEFAULT.
  *  - `onchain`:  legacy OrderFilled log subscription + receipt (post-mining).
- *  - `both`:     PolyNode primary + on-chain fallback, deduped by (tx, target). Default.
+ *  - `both`:     PolyNode primary + on-chain fallback, deduped by (tx, target).
+ *
+ * Default is `polynode` — PolyNode is the sole detector. Do NOT rely on `both`/`onchain`: their
+ * on-chain path opens a Chainstack `eth_subscribe` (OrderFilled) that Chainstack bills per pushed
+ * message (~6M requests/day across the fleet — it exhausted a 20M/mo plan in days) and is redundant
+ * with PolyNode (which is also faster). Only set `both`/`onchain` deliberately for a specific reason.
  */
 export type DetectionSource = "polynode" | "onchain" | "both";
 
@@ -333,7 +338,7 @@ function parseDetectionSource(): DetectionSource {
   if (raw) {
     throw new Error(`DETECTION_SOURCE must be one of polynode|onchain|both (got "${raw}")`);
   }
-  return "both";
+  return "polynode"; // default: PolyNode is the sole detector — never silently start the Chainstack eth_subscribe watcher
 }
 
 function loadRpcOnly(): Pick<

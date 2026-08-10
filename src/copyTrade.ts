@@ -7,6 +7,7 @@ import {
   SignatureTypeV2,
   type TickSize,
 } from "@polymarket/clob-client-v2";
+import { readFileSync, writeFileSync, renameSync } from "fs";
 import { Contract, JsonRpcProvider, formatUnits } from "ethers";
 import { CONDITIONAL_TOKENS } from "./contracts.js";
 import { createWalletClient, http } from "viem";
@@ -312,33 +313,91 @@ async function getNegRiskCached(client: ClobClient, tokenId: string): Promise<bo
  * Per-target per-side spend tracker for `max_market_usdc`. Key = `${targetAddrLc}:${tokenId}`.
  * Each tokenId is unique per market+side, so per-side semantics fall out naturally.
  *
- * Buys ADD to the bucket; full sells RESET it (current code exits positions completely on sell).
- * Entries expire after SIDE_SPEND_TTL_MS of no activity so 5-minute markets don't accumulate
- * stale entries forever — sweep runs every 5 minutes.
+ * Tracks the USDC we POSTED (committed capital), not what filled — a resting/partial order still
+ * ties up the cap, so posting is what must be counted. Buys ADD; full sells and cancels REFUND.
+ *
+ * PERSISTED to disk (atomic write-through) and reloaded on startup, so the cumulative cap survives
+ * a bot restart. A market's bucket is only ever released by a sell/cancel refund or the long safety
+ * TTL below — NOT by a short idle timer. (A previous 30-minute TTL wrongly reset the bucket between
+ * entries that were >30 min apart, letting a $500 cap accumulate to $999 on one outcome.) The TTL is
+ * now a 3-day backstop purely to prune stragglers from markets we held to resolution (never sold, so
+ * never refunded) — far longer than any market's lifetime, so it can never reset an ACTIVE market.
  */
 type SideSpendEntry = { spent: number; lastUpdated: number };
 const sideSpendByTargetToken = new Map<string, SideSpendEntry>();
-const SIDE_SPEND_TTL_MS = 30 * 60 * 1000;
+const SIDE_SPEND_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3 days — safety prune only, never resets a live market
+
+function sideSpendPath(): string {
+  return process.env["SIDE_SPEND_PATH"]?.trim() || "logs/side-spend.json";
+}
+
+let sideSpendLoaded = false;
+/** Lazily load persisted buckets once, on first access (survives restart). */
+function ensureSideSpendLoaded(): void {
+  if (sideSpendLoaded) {
+    return;
+  }
+  sideSpendLoaded = true;
+  try {
+    const raw = readFileSync(sideSpendPath(), "utf8");
+    const obj = JSON.parse(raw) as Record<string, SideSpendEntry>;
+    const now = Date.now();
+    for (const [k, e] of Object.entries(obj)) {
+      if (e && typeof e.spent === "number" && typeof e.lastUpdated === "number") {
+        if (now - e.lastUpdated <= SIDE_SPEND_TTL_MS) {
+          sideSpendByTargetToken.set(k, e);
+        }
+      }
+    }
+  } catch {
+    // no file yet / unreadable → start empty
+  }
+}
+
+/** Atomically persist the whole (small) map: write temp then rename, so a crash can't corrupt it. */
+function persistSideSpend(): void {
+  try {
+    const obj: Record<string, SideSpendEntry> = {};
+    for (const [k, e] of sideSpendByTargetToken) {
+      obj[k] = e;
+    }
+    const p = sideSpendPath();
+    const tmp = `${p}.tmp`;
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, p);
+  } catch {
+    // best effort — an unwritable path must not break trading
+  }
+}
+
 setInterval(() => {
+  ensureSideSpendLoaded();
   const now = Date.now();
+  let changed = false;
   for (const [k, e] of sideSpendByTargetToken) {
     if (now - e.lastUpdated > SIDE_SPEND_TTL_MS) {
       sideSpendByTargetToken.delete(k);
+      changed = true;
     }
   }
-}, 5 * 60 * 1000).unref();
+  if (changed) {
+    persistSideSpend();
+  }
+}, 60 * 60 * 1000).unref(); // hourly sweep (TTL is 3 days, so no need to run often)
 
 function sideSpendKey(targetAddress: string, tokenId: string): string {
   return `${targetAddress.toLowerCase()}:${tokenId}`;
 }
 
 function getSideSpent(targetAddress: string, tokenId: string): number {
+  ensureSideSpendLoaded();
   const e = sideSpendByTargetToken.get(sideSpendKey(targetAddress, tokenId));
   if (!e) {
     return 0;
   }
   if (Date.now() - e.lastUpdated > SIDE_SPEND_TTL_MS) {
     sideSpendByTargetToken.delete(sideSpendKey(targetAddress, tokenId));
+    persistSideSpend();
     return 0;
   }
   return e.spent;
@@ -347,9 +406,10 @@ function getSideSpent(targetAddress: string, tokenId: string): number {
 /**
  * Adds (positive) or refunds (negative) USDC to a side's spend bucket. Refunds clamp at 0
  * to avoid going negative when our internal accounting drifts from reality (e.g., a cancel
- * races with a fill and we slightly over-refund).
+ * races with a fill and we slightly over-refund). Write-through persisted on every change.
  */
 function addSideSpent(targetAddress: string, tokenId: string, usdcDelta: number): void {
+  ensureSideSpendLoaded();
   const k = sideSpendKey(targetAddress, tokenId);
   const e = sideSpendByTargetToken.get(k);
   const newSpent = Math.max(0, (e?.spent ?? 0) + usdcDelta);
@@ -357,6 +417,7 @@ function addSideSpent(targetAddress: string, tokenId: string, usdcDelta: number)
     spent: newSpent,
     lastUpdated: Date.now(),
   });
+  persistSideSpend();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
