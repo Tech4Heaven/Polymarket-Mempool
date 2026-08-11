@@ -69,7 +69,7 @@ export function startWithdrawalWatcher(config: AppConfig): { stop: () => void } 
     return { stop: () => undefined };
   }
 
-  const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl);
+  const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl, 137, { staticNetwork: true });
   const pusd = new Contract(PUSD_TOKEN, ERC20_TRANSFER_ABI, provider) as Contract & {
     filters: { Transfer: (from?: string | null, to?: string | null) => ReturnType<Contract["filters"][string]> };
   };

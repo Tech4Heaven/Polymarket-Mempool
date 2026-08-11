@@ -73,7 +73,7 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
     return { stop: () => undefined };
   }
 
-  const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl);
+  const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl, 137, { staticNetwork: true });
   const warnedStrangers = new Set<string>(); // log each unauthorized id once, not on every poke
   // /pnl checkbox state: `${chatId}:${messageId}` → selected bot indices (into discoverBots() order).
   const pnlSel = new Map<string, Set<number>>();

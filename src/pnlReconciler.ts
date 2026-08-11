@@ -685,7 +685,7 @@ export function startPnlReconciler(config: AppConfig): void {
   const cfg: CopyTradeConfig = mergeCopyTradeConfig(config.copyTradeShared, probe);
   let client: ClobClient | null = null;
   // Provider for reading ConditionalTokens resolution on-chain (fast winner detection).
-  const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl);
+  const provider = new JsonRpcProvider(config.polygonMempoolHttpUrl, 137, { staticNetwork: true });
 
   const run = async () => {
     try {

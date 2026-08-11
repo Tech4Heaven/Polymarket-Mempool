@@ -179,7 +179,7 @@ let ctfProvider: JsonRpcProvider | null = null;
 async function fetchTargetTokenBalance(cfg: CopyTradeConfig, target: string, tokenId: string): Promise<number | null> {
   try {
     if (!ctfProvider) {
-      ctfProvider = new JsonRpcProvider(cfg.polygonHttpUrl);
+      ctfProvider = new JsonRpcProvider(cfg.polygonHttpUrl, 137, { staticNetwork: true });
     }
     const ctf = new Contract(CONDITIONAL_TOKENS, ERC1155_BALANCE_ABI, ctfProvider) as unknown as {
       balanceOf: (account: string, id: bigint) => Promise<bigint>;

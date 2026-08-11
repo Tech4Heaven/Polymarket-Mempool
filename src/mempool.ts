@@ -66,7 +66,7 @@ export function startMempoolWatcher(
 ): { provider: WebSocketProvider; stop: () => void } {
   const makeProvider = () =>
     new WebSocketProvider(() => makeWebSocket(config.polygonWssUrl) as never);
-  const httpProvider = new JsonRpcProvider(config.polygonMempoolHttpUrl);
+  const httpProvider = new JsonRpcProvider(config.polygonMempoolHttpUrl, 137, { staticNetwork: true });
   let provider = makeProvider();
   let stopped = false;
   let reconnecting = false;
