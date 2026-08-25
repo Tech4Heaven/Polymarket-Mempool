@@ -99,6 +99,13 @@ export type TomlDefaultsSection = {
   sell_reprice_deadline_ms?: number;
   sell_max_slippage_frac?: number;
   /**
+   * Restrict copying to specific crypto 5-minute "Up or Down" markets by asset. A single asset
+   * (market = "btc") or a list (market = ["btc", "eth"]). Values match the market slug prefix; long
+   * names are aliased (bitcoin→btc, ethereum→eth, …). When set, trades on any other asset — and any
+   * non-crypto market — are skipped. Omit to copy every market the target trades.
+   */
+  market?: string | string[];
+  /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
    */
@@ -133,6 +140,7 @@ export type TomlTargetRow = {
   sell_reprice_attempts?: number;
   sell_reprice_deadline_ms?: number;
   sell_max_slippage_frac?: number;
+  market?: string | string[];
   enabled?: boolean;
 };
 
@@ -170,6 +178,21 @@ function boolOrUndef(k: string, o: Record<string, unknown>): boolean | undefined
   }
   const v = o[k];
   return typeof v === "boolean" ? v : undefined;
+}
+
+/** Reads a value that may be a single string or an array of strings (e.g. market = "btc" or ["btc","eth"]). */
+function strOrStrArrayOrUndef(k: string, o: Record<string, unknown>): string[] | undefined {
+  if (!(k in o)) {
+    return undefined;
+  }
+  const v = o[k];
+  if (typeof v === "string") {
+    return [v];
+  }
+  if (Array.isArray(v) && v.every((x) => typeof x === "string")) {
+    return v as string[];
+  }
+  return undefined;
 }
 
 export async function parseCopyTargetsTomlFile(filePath: string): Promise<ParsedCopyTargetsToml> {
@@ -212,6 +235,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       sell_reprice_attempts: numOrUndef("sell_reprice_attempts", src),
       sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", src),
       sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", src),
+      market: strOrStrArrayOrUndef("market", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -259,6 +283,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       sell_reprice_attempts: numOrUndef("sell_reprice_attempts", row),
       sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", row),
       sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", row),
+      market: strOrStrArrayOrUndef("market", row),
       enabled: boolOrUndef("enabled", row),
     });
   }

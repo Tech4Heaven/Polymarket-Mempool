@@ -7,6 +7,7 @@ import { EXCHANGE_V2_ADDRESSES } from "./contracts.js";
 import { resolveCopyWalletPrivateKeyRaw, requirePrivateKeyHex } from "./copyWalletKeyJson.js";
 import { parseCopyTargetsTomlFile } from "./copyTargetsToml.js";
 import { fetchPolymarketProfileLabel } from "./polymarketProfile.js";
+import { normalizeAssetKey } from "./cryptoMarketPrewarm.js";
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -106,6 +107,8 @@ export type TargetCopyParams = {
   sellRepriceDeadlineMs?: number;
   /** Reprice slippage floor: never sell below implied × (1 − this). Omit = no floor. */
   sellMaxSlippageFrac?: number;
+  /** Restrict copies to these crypto asset keys (normalized, e.g. ["btc"]). Empty/undefined = no filter. */
+  marketFilter?: string[];
   copyTradeLogPath: string;
 };
 
@@ -150,6 +153,8 @@ export type CopyTradeConfig = CopyTradeShared & {
   sellRepriceDeadlineMs?: number;
   /** Per-target reprice slippage floor: never sell below implied × (1 − this). */
   sellMaxSlippageFrac?: number;
+  /** Per-target crypto asset filter (normalized keys, e.g. ["btc"]). Empty/undefined = copy all markets. */
+  marketFilter?: string[];
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -230,6 +235,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     sellRepriceAttempts: p.sellRepriceAttempts,
     sellRepriceDeadlineMs: p.sellRepriceDeadlineMs,
     sellMaxSlippageFrac: p.sellMaxSlippageFrac,
+    marketFilter: p.marketFilter,
     targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
@@ -598,6 +604,18 @@ export async function loadAppConfig(): Promise<AppConfig> {
           throw new Error(`targets ${row.address}: sell_max_slippage_frac must be a fraction in (0, 1) (e.g. 0.10)`);
         }
 
+        const marketRaw = row.market ?? defaults.market;
+        let marketFilter: string[] | undefined;
+        if (marketRaw !== undefined) {
+          const list = (Array.isArray(marketRaw) ? marketRaw : [marketRaw])
+            .map((s) => (typeof s === "string" ? normalizeAssetKey(s) : ""))
+            .filter((s) => s.length > 0);
+          if (list.length === 0) {
+            throw new Error(`targets ${row.address}: market must be a non-empty asset string or array (e.g. "btc" or ["btc","eth"])`);
+          }
+          marketFilter = [...new Set(list)];
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -624,6 +642,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           sellRepriceAttempts,
           sellRepriceDeadlineMs,
           sellMaxSlippageFrac,
+          marketFilter,
           copyTradeLogPath,
         });
       }

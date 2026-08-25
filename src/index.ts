@@ -15,6 +15,7 @@ import { startPolynodeWatcher, type PolynodeMatch } from "./polynodeWatcher.js";
 import { buildDigestsFromSettlement } from "./settlementDigest.js";
 import { aggregatePusdForTargets } from "./pusdTransfers.js";
 import { startWithdrawalWatcher } from "./withdrawalWatcher.js";
+import { startCryptoMarketPrewarm } from "./cryptoMarketPrewarm.js";
 
 function formatLogErr(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -185,6 +186,10 @@ async function logMinedTransfers(
 
 async function main() {
   const config = await loadAppConfig();
+
+  // Prewarm the crypto 5-minute market cache (tokenId → asset/name/outcome) so the copy hot path can
+  // filter by `market` and label trades without a per-trade gamma round-trip.
+  startCryptoMarketPrewarm();
 
   if (config.copyTradeShared) {
     const probe = config.targetCopyProfiles.values().next().value;

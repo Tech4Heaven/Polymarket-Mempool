@@ -19,7 +19,7 @@ import type { Ctf1155TransferRow } from "./ctf1155Inbound.js";
 import { appendLedger, readLedger, type LedgerRecord } from "./orderLedger.js";
 import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
-import { fetchPolymarketMarketLabels } from "./gammaEventName.js";
+import { lookupCryptoMarket, resolveCryptoAsset, resolveMarketLabelsFast } from "./cryptoMarketPrewarm.js";
 import { registerSimOrder } from "./fillSim.js";
 
 function aggregateOutcomeByTokenId(rows: Ctf1155TransferRow[]): Map<string, bigint> {
@@ -302,7 +302,7 @@ async function logCopySkip(
   cfg: CopyTradeConfig,
   sizing: SkipSizing = {}
 ): Promise<void> {
-  const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
+  const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
   const msg = `copy skip · ${reasonDetail} · ${formatSkipSizing(sizing)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tx=${txHash}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
@@ -1519,7 +1519,7 @@ async function recordOrderForPnl(args: {
     let outcome = args.outcome;
     let event = args.event;
     if (outcome === undefined || event === undefined) {
-      const labels = await fetchPolymarketMarketLabels(args.tokenId);
+      const labels = await resolveMarketLabelsFast(args.tokenId);
       outcome = outcome ?? labels.outcome;
       event = event ?? labels.event;
     }
@@ -1555,6 +1555,23 @@ export async function executeCopyTrade(
     const stop = isTargetStopped(cfg.targetAddress);
     if (stop) {
       await logCopySkip(`target auto-stopped (drawdown) · ${stop}`, digest, txHash, cfg);
+      return;
+    }
+  }
+
+  // Market filter: copy only the configured crypto 5-minute assets (e.g. btc). The asset is read from
+  // the prewarm cache (network-free); on a miss, one gamma lookup. A non-crypto or unknown market
+  // resolves to null and is skipped when a filter is set. Runs before any pricing work.
+  if (cfg.marketFilter && cfg.marketFilter.length > 0) {
+    const cached = lookupCryptoMarket(digest.tokenId);
+    const asset = cached?.asset ?? (await resolveCryptoAsset(digest.tokenId));
+    if (!asset || !cfg.marketFilter.includes(asset)) {
+      await logCopySkip(
+        `market filter · asset=${asset ?? "unknown"} not in [${cfg.marketFilter.join(",")}] · token=${digest.tokenId}`,
+        digest,
+        txHash,
+        cfg
+      );
       return;
     }
   }
@@ -1990,7 +2007,7 @@ export async function executeCopyTrade(
   }
 
   if (cfg.dryRun) {
-    const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
+    const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
     const pUsdForLog = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
     const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
     const msg =
@@ -2074,7 +2091,7 @@ export async function executeCopyTrade(
     if (reservedUsdc > 0) {
       addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
     }
-    const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
+    const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
     const fmsg = `copy REJECTED · ${digest.side} shares=${orderShares} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} tick=${postTick} · error=${JSON.stringify(postErr)} · tx=${txHash}`;
     console.warn(fmsg);
     void appendCopyTradeSuccessLine(fmsg, cfg.copyTradeLogPath);
@@ -2183,7 +2200,7 @@ export async function executeCopyTrade(
   // Order id the poller keeps watching for late fills (the final resting order; "" if abandoned).
   const postedOrderId = restingOrderId;
 
-  const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
+  const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
   const intendedPUsd = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
   const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
   const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)}${takerBumpNote}${repriceNote} · tx=${txHash}${flushSuffix} · ${JSON.stringify(resp)}`;
