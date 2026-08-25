@@ -79,6 +79,26 @@ export type TomlDefaultsSection = {
   taker_bump?: number;
   max_taker_bump_frac?: number;
   /**
+   * Sell fill improvement (mirror of taker_bump for exits). Post sells BELOW the best bid so they
+   * cross and fill instead of resting on top of a bid that may vanish in fast markets:
+   *  - sell_bump:          price amount (0–1 units, e.g. 0.02 = 2¢) subtracted below the bid.
+   *  - max_sell_bump_frac: caps the bump to this fraction of the bid (default 0.10). Tick-aware.
+   * Omit sell_bump (or 0) for maker-style sells at the top bid.
+   */
+  sell_bump?: number;
+  max_sell_bump_frac?: number;
+  /**
+   * Reprice-until-filled for sells. If a copied sell rests unfilled (bid moved/vanished), cancel the
+   * resting remainder and re-post at a fresh aggressive price, chasing the market down:
+   *  - sell_reprice_attempts:    max reprice cycles (0/omit = disabled; the sell posts once).
+   *  - sell_reprice_deadline_ms: stop repricing after this many ms since the first post (default 2500).
+   *  - sell_max_slippage_frac:   never reprice below implied × (1 − this); the remainder is abandoned
+   *                              instead of dumped at any price. Omit = no floor (chase to the book).
+   */
+  sell_reprice_attempts?: number;
+  sell_reprice_deadline_ms?: number;
+  sell_max_slippage_frac?: number;
+  /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
    */
@@ -108,6 +128,11 @@ export type TomlTargetRow = {
   max_drawdown_total?: number;
   taker_bump?: number;
   max_taker_bump_frac?: number;
+  sell_bump?: number;
+  max_sell_bump_frac?: number;
+  sell_reprice_attempts?: number;
+  sell_reprice_deadline_ms?: number;
+  sell_max_slippage_frac?: number;
   enabled?: boolean;
 };
 
@@ -182,6 +207,11 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       max_drawdown_total: numOrUndef("max_drawdown_total", src),
       taker_bump: numOrUndef("taker_bump", src),
       max_taker_bump_frac: numOrUndef("max_taker_bump_frac", src),
+      sell_bump: numOrUndef("sell_bump", src),
+      max_sell_bump_frac: numOrUndef("max_sell_bump_frac", src),
+      sell_reprice_attempts: numOrUndef("sell_reprice_attempts", src),
+      sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", src),
+      sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -224,6 +254,11 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       max_drawdown_total: numOrUndef("max_drawdown_total", row),
       taker_bump: numOrUndef("taker_bump", row),
       max_taker_bump_frac: numOrUndef("max_taker_bump_frac", row),
+      sell_bump: numOrUndef("sell_bump", row),
+      max_sell_bump_frac: numOrUndef("max_sell_bump_frac", row),
+      sell_reprice_attempts: numOrUndef("sell_reprice_attempts", row),
+      sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", row),
+      sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", row),
       enabled: boolOrUndef("enabled", row),
     });
   }

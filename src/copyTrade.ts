@@ -232,6 +232,38 @@ export function applyTakerBump(
   return baseLimit; // one tick would break the cap, or bump gives no improvement over base
 }
 
+/** Relative cap used for the sell bump when `sell_bump` is set but `max_sell_bump_frac` is omitted. */
+export const DEFAULT_MAX_SELL_BUMP_FRAC = 0.1;
+
+/**
+ * Sell limit price with the optional sell bump applied — the exit mirror of `applyTakerBump`. Posts
+ * BELOW the bid so the order crosses and fills as a taker (sweeping resting bids that may vanish in a
+ * fast market), but caps the bump to `maxFrac × bid` (so it can't give away more than a bounded slice
+ * of price) and stays tick-aware: if rounding the bump DOWN to the tick would break the cap, it falls
+ * back to `baseLimit` (post at the bid) rather than under-sell a whole tick. Returns `baseLimit`
+ * unchanged when the bump is disabled, and never returns a non-positive price.
+ */
+export function applySellBump(
+  bid: number,
+  baseLimit: number,
+  tick: TickSize,
+  sellBump: number | undefined,
+  maxSellBumpFrac: number | undefined
+): number {
+  if (sellBump === undefined || sellBump <= 0 || !(bid > 0)) {
+    return baseLimit;
+  }
+  const frac = maxSellBumpFrac ?? DEFAULT_MAX_SELL_BUMP_FRAC;
+  const cap = bid * frac;
+  const effBump = Math.min(sellBump, cap);
+  const bumped = roundToTick(bid - effBump, tick, "down");
+  const minAllowed = bid * (1 - frac);
+  if (bumped > 0 && bumped < baseLimit && bumped >= minAllowed - 1e-9) {
+    return bumped;
+  }
+  return baseLimit; // one tick would break the cap, or bump gives no improvement over base
+}
+
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
@@ -1220,7 +1252,13 @@ async function recordCopySellAndReconcile(
   sharesSold: number,
   txHash: string,
   orderId: string,
-  postedShares: number
+  postedShares: number,
+  /**
+   * Shares already sold by reprice attempts whose orders were cancelled (no longer on the book).
+   * Registered as a single terminal entry so the derived position reflects them but the poller
+   * never re-checks a dead order. Default 0 (single-post sell, no reprice).
+   */
+  terminalPriorFill = 0
 ): Promise<void> {
   const state = await getOrCreateHedgeState(cfg, soldTokenId);
   if (!state) {
@@ -1228,9 +1266,24 @@ async function recordCopySellAndReconcile(
   }
 
   await runExclusive(state, async () => {
+    // Reprice attempts that already filled and were cancelled: terminal, untrackable — record once.
+    if (terminalPriorFill > 1e-9) {
+      state.mainOrders.set(`SELL_REPRICED:${soldTokenId}:${state.mainOrders.size}`, {
+        tokenId: soldTokenId,
+        side: "sell",
+        postedSize: terminalPriorFill,
+        matched: terminalPriorFill,
+        terminal: true,
+      });
+    }
     // Sells are tracked as orders too, so a resting sell that fills later reduces the derived
-    // position on the next poll and the now-oversized hedge is resized.
-    registerMainOrder(state, orderId, soldTokenId, "sell", postedShares, sharesSold);
+    // position on the next poll and the now-oversized hedge is resized. Skip when the remainder was
+    // abandoned (no resting order and nothing filled) — the terminal entry above already covers it.
+    if (orderId !== "" || sharesSold > 1e-9) {
+      registerMainOrder(state, orderId, soldTokenId, "sell", postedShares, sharesSold);
+    } else {
+      recomputeShares(state);
+    }
     state.lastActivityMs = Date.now();
     // If THIS target sold the side we were considering "already absorbed" for them, clear THEIR
     // marker so a future re-entry on that side by them is copied normally. Other targets'
@@ -1752,13 +1805,16 @@ export async function executeCopyTrade(
       return;
     }
   } else {
-    // Sells: no drift check (per design). Just price to top of book.
+    // Sells: no drift check (per design). Price to top of book, then optionally cross BELOW the bid
+    // (sell_bump) so the exit fills as a taker instead of resting on a bid that can vanish in a fast
+    // market. The reprice loop after the post chases the bid down further if this still doesn't fill.
     const bid = bestBid(book);
     if (bid === null) {
       await logCopySkip("empty bids", digest, txHash, cfg, { implied: effectiveImplied });
       return;
     }
-    limitPrice = roundToTick(Math.min(currentPrice, bid), tickSize, "down");
+    const baseSellLimit = roundToTick(Math.min(currentPrice, bid), tickSize, "down");
+    limitPrice = applySellBump(bid, baseSellLimit, tickSize, cfg.sellBump, cfg.maxSellBumpFrac);
   }
 
   // Buy: size from clipped notional. Sell: immediately liquidate full token balance.
@@ -1974,9 +2030,9 @@ export async function executeCopyTrade(
 
   let postPrice = limitPrice;
   let postTick: TickSize = tickSize;
-  const postOnce = (price: number, tk: TickSize) =>
+  const postOnce = (price: number, tk: TickSize, size: number = orderShares) =>
     client.createAndPostOrder(
-      { tokenID: digest.tokenId, price, side, size: orderShares },
+      { tokenID: digest.tokenId, price, side, size },
       { tickSize: tk, negRisk },
       OrderType.GTC
     );
@@ -2032,19 +2088,111 @@ export async function executeCopyTrade(
   const respObj = resp as { takingAmount?: string; makingAmount?: string; orderID?: string };
   const taking = parseFloat(respObj.takingAmount ?? "0") || 0;
   const making = parseFloat(respObj.makingAmount ?? "0") || 0;
-  // Order id of THIS copy order — the hedge module polls its size_matched to learn about late fills.
-  const postedOrderId = respObj.orderID ?? "";
-  const filledShares = digest.side === "buy" ? taking : making;
-  const filledUsdc = digest.side === "buy" ? making : taking;
+  // The currently-resting order (id, its posted size, its immediate fill). The reprice loop below may
+  // supersede it: superseded fills accumulate into terminalFill* and the loop tracks the new order.
+  let restingOrderId = respObj.orderID ?? "";
+  let restingPosted = orderShares;
+  let restingFillShares = digest.side === "buy" ? taking : making;
+  let restingFillUsdc = digest.side === "buy" ? making : taking;
+  let terminalFillShares = 0; // shares filled by now-cancelled reprice attempts (no longer on book)
+  let terminalFillUsdc = 0;
+  // Every order we posted (each a unique orderID) — recorded once for P&L after the loop.
+  const postedResps: unknown[] = [resp];
+  let repriceNote = "";
+
+  // ── SELL reprice-until-filled ─────────────────────────────────────────────────────────────
+  // A GTC sell priced at the top bid can rest unfilled when the bid moves/vanishes (fast markets).
+  // Chase it: cancel the resting remainder, re-price aggressively off a FRESH book, and re-post —
+  // until filled, out of attempts, past the deadline, or the price would breach the slippage floor
+  // (then abandon the remainder rather than dump at any price). Live sells only; dry-run posts nothing.
+  if (digest.side === "sell" && (cfg.sellRepriceAttempts ?? 0) > 0 && restingOrderId) {
+    const startTs = Date.now();
+    const deadlineMs = cfg.sellRepriceDeadlineMs ?? 2500;
+    const floor =
+      cfg.sellMaxSlippageFrac !== undefined && effectiveImplied > 0
+        ? effectiveImplied * (1 - cfg.sellMaxSlippageFrac)
+        : 0;
+    let attempt = 0;
+    let repriced = 0;
+    while (
+      attempt < (cfg.sellRepriceAttempts ?? 0) &&
+      Date.now() - startTs < deadlineMs &&
+      orderShares - terminalFillShares - restingFillShares >= minOrder &&
+      restingOrderId
+    ) {
+      attempt++;
+      // Cancel the resting remainder first — never leave two orders for the same shares on the book.
+      try {
+        await client.cancelOrder({ orderID: restingOrderId });
+      } catch {
+        // Cancel failed → the order may have just filled; keep it as the final tracked order and stop.
+        break;
+      }
+      // Cancel succeeded → the old order is terminal. Fold its fill in (already in postedResps for P&L).
+      terminalFillShares += restingFillShares;
+      terminalFillUsdc += restingFillUsdc;
+      restingOrderId = "";
+      restingPosted = 0;
+      restingFillShares = 0;
+      restingFillUsdc = 0;
+      const remaining = orderShares - terminalFillShares;
+      if (remaining < minOrder) break; // enough sold
+      let freshBook;
+      try {
+        freshBook = await client.getOrderBook(digest.tokenId);
+      } catch {
+        break;
+      }
+      const freshBid = bestBid(freshBook);
+      if (freshBid === null || !(freshBid > 0)) break; // no bids to fill against — abandon remainder
+      const freshBase = roundToTick(freshBid, postTick, "down");
+      const freshPrice = applySellBump(freshBid, freshBase, postTick, cfg.sellBump, cfg.maxSellBumpFrac);
+      if (!(freshPrice > 0)) break;
+      if (floor > 0 && freshPrice < floor) {
+        repriceNote += ` floor-stop@${freshPrice.toFixed(4)}(floor ${floor.toFixed(4)})`;
+        break; // would sell too low — leave the remainder unsold
+      }
+      let rp;
+      try {
+        rp = await postOnce(freshPrice, postTick, remaining);
+      } catch {
+        break; // repost threw — remainder now un-posted; nothing resting to track
+      }
+      if (postErrorMessage(rp)) {
+        repriceNote += ` reject`;
+        break;
+      }
+      const rpObj = rp as { takingAmount?: string; makingAmount?: string; orderID?: string };
+      restingOrderId = rpObj.orderID ?? "";
+      restingPosted = remaining;
+      restingFillShares = parseFloat(rpObj.makingAmount ?? "0") || 0;
+      restingFillUsdc = parseFloat(rpObj.takingAmount ?? "0") || 0;
+      resp = rp;
+      postPrice = freshPrice;
+      limitPrice = freshPrice;
+      postedResps.push(rp);
+      repriced++;
+    }
+    if (repriced > 0 || repriceNote) {
+      repriceNote = ` · reprice×${repriced}${repriceNote}`;
+    }
+  }
+
+  const filledShares = terminalFillShares + restingFillShares;
+  const filledUsdc = terminalFillUsdc + restingFillUsdc;
+  // Order id the poller keeps watching for late fills (the final resting order; "" if abandoned).
+  const postedOrderId = restingOrderId;
 
   const { event, outcome } = await fetchPolymarketMarketLabels(digest.tokenId);
   const intendedPUsd = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
   const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
-  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)}${takerBumpNote} · tx=${txHash}${flushSuffix} · ${JSON.stringify(resp)}`;
+  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)}${takerBumpNote}${repriceNote} · tx=${txHash}${flushSuffix} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
-  // P&L ledger (fire-and-forget): record this order for per-target reconciliation at resolution.
-  void recordOrderForPnl({ cfg, resp, tokenId: digest.tokenId, side: digest.side, isHedge: false, limitPrice, outcome, event });
+  // P&L ledger (fire-and-forget): record EACH posted order (unique orderIds) for reconciliation.
+  for (const r of postedResps) {
+    void recordOrderForPnl({ cfg, resp: r, tokenId: digest.tokenId, side: digest.side, isHedge: false, limitPrice, outcome, event });
+  }
 
   // After a successful live BUY: add filled shares to sharesByToken and reconcile (hedge grows).
   // After a successful live SELL: subtract filled shares from sharesByToken and reconcile so
@@ -2067,7 +2215,19 @@ export async function executeCopyTrade(
     }
     await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash, postedOrderId, orderShares);
   } else {
-    await recordCopySellAndReconcile(cfg, client, digest.tokenId, filledShares, txHash, postedOrderId, orderShares);
+    // Register the FINAL resting order (restingFillShares/restingPosted) plus a terminal entry for the
+    // shares already sold by superseded reprice attempts, so the position reflects the full exit while
+    // the poller only re-checks the one order that can still fill.
+    await recordCopySellAndReconcile(
+      cfg,
+      client,
+      digest.tokenId,
+      restingFillShares,
+      txHash,
+      postedOrderId,
+      restingPosted,
+      terminalFillShares
+    );
     // Free the max_market_usdc bucket proportionally to the fraction sold (a full exit zeroes it).
     const spent = getSideSpent(cfg.targetAddress, digest.tokenId);
     addSideSpent(cfg.targetAddress, digest.tokenId, -(sellFraction * spent));

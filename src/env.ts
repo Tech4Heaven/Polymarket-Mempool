@@ -96,6 +96,16 @@ export type TargetCopyParams = {
   takerBump?: number;
   /** Cap on the taker bump as a fraction of the ask (default 0.10 when takerBump set). */
   maxTakerBumpFrac?: number;
+  /** Sell fill: price amount (0–1) subtracted below the bid so sells cross and fill. Omit/0 = maker-style. */
+  sellBump?: number;
+  /** Cap on the sell bump as a fraction of the bid (default 0.10 when sellBump set). */
+  maxSellBumpFrac?: number;
+  /** Reprice-until-filled for sells: max reprice cycles (0/omit = disabled). */
+  sellRepriceAttempts?: number;
+  /** Reprice deadline in ms since the first sell post (default 2500). */
+  sellRepriceDeadlineMs?: number;
+  /** Reprice slippage floor: never sell below implied × (1 − this). Omit = no floor. */
+  sellMaxSlippageFrac?: number;
   copyTradeLogPath: string;
 };
 
@@ -130,6 +140,16 @@ export type CopyTradeConfig = CopyTradeShared & {
   takerBump?: number;
   /** Per-target cap on the taker bump as a fraction of the ask. */
   maxTakerBumpFrac?: number;
+  /** Per-target sell bump (price subtracted below the bid so sells fill). */
+  sellBump?: number;
+  /** Per-target cap on the sell bump as a fraction of the bid. */
+  maxSellBumpFrac?: number;
+  /** Per-target reprice-until-filled: max reprice cycles for an unfilled sell (0 = disabled). */
+  sellRepriceAttempts?: number;
+  /** Per-target reprice deadline in ms since the first sell post (default 2500). */
+  sellRepriceDeadlineMs?: number;
+  /** Per-target reprice slippage floor: never sell below implied × (1 − this). */
+  sellMaxSlippageFrac?: number;
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -205,6 +225,11 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     maxDrawdownTotal: p.maxDrawdownTotal,
     takerBump: p.takerBump,
     maxTakerBumpFrac: p.maxTakerBumpFrac,
+    sellBump: p.sellBump,
+    maxSellBumpFrac: p.maxSellBumpFrac,
+    sellRepriceAttempts: p.sellRepriceAttempts,
+    sellRepriceDeadlineMs: p.sellRepriceDeadlineMs,
+    sellMaxSlippageFrac: p.sellMaxSlippageFrac,
     targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
@@ -552,6 +577,27 @@ export async function loadAppConfig(): Promise<AppConfig> {
           throw new Error(`targets ${row.address}: max_taker_bump_frac must be a fraction in (0, 1] (e.g. 0.10)`);
         }
 
+        const sellBump = row.sell_bump ?? defaults.sell_bump;
+        if (sellBump !== undefined && (!Number.isFinite(sellBump) || sellBump < 0 || sellBump >= 1)) {
+          throw new Error(`targets ${row.address}: sell_bump must be a price amount in [0, 1) (e.g. 0.02)`);
+        }
+        const maxSellBumpFrac = row.max_sell_bump_frac ?? defaults.max_sell_bump_frac;
+        if (maxSellBumpFrac !== undefined && (!Number.isFinite(maxSellBumpFrac) || maxSellBumpFrac <= 0 || maxSellBumpFrac > 1)) {
+          throw new Error(`targets ${row.address}: max_sell_bump_frac must be a fraction in (0, 1] (e.g. 0.10)`);
+        }
+        const sellRepriceAttempts = row.sell_reprice_attempts ?? defaults.sell_reprice_attempts;
+        if (sellRepriceAttempts !== undefined && (!Number.isInteger(sellRepriceAttempts) || sellRepriceAttempts < 0)) {
+          throw new Error(`targets ${row.address}: sell_reprice_attempts must be a non-negative integer`);
+        }
+        const sellRepriceDeadlineMs = row.sell_reprice_deadline_ms ?? defaults.sell_reprice_deadline_ms;
+        if (sellRepriceDeadlineMs !== undefined && (!Number.isFinite(sellRepriceDeadlineMs) || sellRepriceDeadlineMs <= 0)) {
+          throw new Error(`targets ${row.address}: sell_reprice_deadline_ms must be a positive number (ms)`);
+        }
+        const sellMaxSlippageFrac = row.sell_max_slippage_frac ?? defaults.sell_max_slippage_frac;
+        if (sellMaxSlippageFrac !== undefined && (!Number.isFinite(sellMaxSlippageFrac) || sellMaxSlippageFrac <= 0 || sellMaxSlippageFrac >= 1)) {
+          throw new Error(`targets ${row.address}: sell_max_slippage_frac must be a fraction in (0, 1) (e.g. 0.10)`);
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -573,6 +619,11 @@ export async function loadAppConfig(): Promise<AppConfig> {
           maxDrawdownTotal,
           takerBump,
           maxTakerBumpFrac,
+          sellBump,
+          maxSellBumpFrac,
+          sellRepriceAttempts,
+          sellRepriceDeadlineMs,
+          sellMaxSlippageFrac,
           copyTradeLogPath,
         });
       }
