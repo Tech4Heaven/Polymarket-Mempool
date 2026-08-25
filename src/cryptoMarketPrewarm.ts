@@ -1,15 +1,19 @@
 /**
- * Crypto 5-minute "Up or Down" market prewarm cache.
+ * Crypto "Up or Down" market prewarm cache.
  *
- * The 5-minute crypto markets roll every 5 minutes (e.g. "Bitcoin Up or Down - August 25,
- * 5:25PM-5:30PM ET"). Resolving a tokenId's market name via a gamma call ON the copy hot path adds
- * latency that can cost a fill. Instead we keep a rolling cache of the CURRENT + next several windows
- * for every asset, refreshed in the background, so a tokenId arriving from the PolyNode websocket maps
- * instantly to { asset, event, outcome } with no network round-trip.
+ * The crypto up/down markets roll on several cadences — 5m, 15m, 1h, 4h, daily (e.g. "Bitcoin Up or
+ * Down - August 25, 5:25PM-5:30PM ET"). Resolving a tokenId's market name via a gamma call ON the copy
+ * hot path adds latency that can cost a fill. Instead we keep a rolling cache of the live markets for
+ * every asset and cadence, refreshed in the background, so a tokenId arriving from the PolyNode
+ * websocket maps instantly to { asset, event, outcome } with no network round-trip.
  *
- * The gamma slug encodes the asset and series: `btc-updown-5m-<startUnix>`, `eth-updown-5m-…`, etc.
- * Ordering gamma's open markets by endDate ascending surfaces the imminent 5-minute crypto markets
- * first, so one request per refresh captures the whole live window across all assets.
+ * Source of truth (verified against gamma, not assumed): every up/down market carries the tag
+ * "Up or Down" (tag_id 102127), so `?tag_id=102127&closed=false` returns exactly this universe across
+ * ALL cadences with clobTokenIds. Two slug shapes exist and both put the asset first:
+ *   compact:   `<asset>-updown-<dur>-<startUnix>`      e.g. btc-updown-5m-…, sol-updown-15m-…, btc-updown-4h-…
+ *   full-word: `<asset>-up-or-down-<date>[-<hour>-et]` e.g. bitcoin-up-or-down-august-27-2026-5pm-et (hourly/daily)
+ * We take the asset as the first slug segment (duration-agnostic) and page through the tag so long
+ * cadences aren't crowded out by the many 5m windows.
  */
 
 import { fetchPolymarketMarketLabels, type PolymarketMarketLabels } from "./gammaEventName.js";
@@ -21,17 +25,34 @@ export type CryptoMarketInfo = {
   event: string;
   /** Outcome label for THIS tokenId ("Up" / "Down"). */
   outcome: string;
-  startMs: number;
   endMs: number;
 };
 
 const GAMMA_URL = "https://gamma-api.polymarket.com/markets";
-const SLUG_RE = /^([a-z0-9]+)-updown-5m-(\d+)$/;
-const DEFAULT_REFRESH_MS = 15_000;
+/** gamma tag id for the "Up or Down" tag — the precise server-side filter for this whole universe. */
+const UP_OR_DOWN_TAG_ID = "102127";
+const PAGE_SIZE = 100;
+const MAX_PAGES = 20; // hard bound; pagination also stops early on a short page
+const DEFAULT_REFRESH_MS = 20_000;
+
+/**
+ * Canonicalizes a CLOB tokenId so the map key is identical whether it arrived from PolyNode or gamma,
+ * regardless of leading zeros / `0x` / whitespace. BigInt normalizes decimal AND hex ids to one form.
+ */
+function normalizeTokenKey(id: string): string {
+  const s = id.trim();
+  try {
+    return BigInt(s).toString();
+  } catch {
+    return s.toLowerCase();
+  }
+}
 
 /** tokenId → market info. Swapped wholesale on each successful refresh; misses fall back to gamma. */
 let cache = new Map<string, CryptoMarketInfo>();
 let started = false;
+/** Flips true the first time the cache is populated — used to log a one-time "ready" line. */
+let everReady = false;
 
 /**
  * Alias table so config `market = "bitcoin"` and the slug prefix `btc` resolve to the same key.
@@ -75,116 +96,110 @@ function parseOutcomes(raw: unknown): string[] {
   return parseTokenIds(raw); // same shape: a JSON string array or an array
 }
 
-async function refreshOnce(): Promise<void> {
+/**
+ * Asset key from an up/down slug, duration-agnostic. Handles both `<asset>-updown-<dur>-<unix>` and
+ * `<asset>-up-or-down-…`, taking the first slug segment (e.g. "eth", "bitcoin", "spy") and normalizing
+ * it. Returns null for a slug with neither marker.
+ */
+function assetFromSlug(slug: string): string | null {
+  let cut = slug.indexOf("-updown-");
+  if (cut < 0) {
+    cut = slug.indexOf("-up-or-down");
+  }
+  if (cut <= 0) {
+    return null;
+  }
+  const first = slug.slice(0, cut).split("-")[0];
+  return first ? normalizeAssetKey(first) : null;
+}
+
+async function fetchPage(offset: number): Promise<Record<string, unknown>[] | null> {
   const url = new URL(GAMMA_URL);
   url.searchParams.set("closed", "false");
-  url.searchParams.set("limit", "150");
+  url.searchParams.set("tag_id", UP_OR_DOWN_TAG_ID);
+  url.searchParams.set("limit", String(PAGE_SIZE));
+  url.searchParams.set("offset", String(offset));
   url.searchParams.set("order", "endDate");
   url.searchParams.set("ascending", "true");
   const res = await fetch(url);
   if (!res.ok) {
-    return; // keep the previous cache; try again next tick
+    return null;
   }
   const data = (await res.json()) as unknown;
-  if (!Array.isArray(data)) {
-    return;
-  }
+  return Array.isArray(data) ? (data as Record<string, unknown>[]) : null;
+}
+
+async function refreshOnce(): Promise<void> {
   const now = Date.now();
   const next = new Map<string, CryptoMarketInfo>();
-  for (const raw of data) {
-    const m = raw as Record<string, unknown>;
-    const slug = typeof m["slug"] === "string" ? (m["slug"] as string) : "";
-    const mm = SLUG_RE.exec(slug);
-    if (!mm) {
-      continue;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const rows = await fetchPage(page * PAGE_SIZE);
+    if (rows === null) {
+      // On the very first page failing we keep the previous cache (return without swapping); a later
+      // page failing just caps this refresh at what we already gathered.
+      if (page === 0) {
+        return;
+      }
+      break;
     }
-    const asset = normalizeAssetKey(mm[1]!);
-    const startMs = Number(mm[2]) * 1000;
-    const parsedEnd = m["endDate"] ? Date.parse(String(m["endDate"])) : NaN;
-    const endMs = Number.isFinite(parsedEnd) ? parsedEnd : now + 300_000;
-    // No end-time prune: the map is rebuilt fresh each refresh and `closed=false` already excludes
-    // resolved markets, so stale windows can't accumulate — and this stays robust to clock skew.
-    const event = typeof m["question"] === "string" ? (m["question"] as string).trim() : "";
-    const tokenIds = parseTokenIds(m["clobTokenIds"]);
-    const outcomes = parseOutcomes(m["outcomes"]);
-    for (let i = 0; i < tokenIds.length; i++) {
-      const tid = tokenIds[i]!;
-      const outcome = i < outcomes.length ? outcomes[i]! : "(unknown)";
-      next.set(tid, { asset, event, outcome, startMs, endMs });
+    for (const m of rows) {
+      const slug = typeof m["slug"] === "string" ? (m["slug"] as string) : "";
+      const asset = assetFromSlug(slug);
+      if (!asset) {
+        continue;
+      }
+      const parsedEnd = m["endDate"] ? Date.parse(String(m["endDate"])) : NaN;
+      const endMs = Number.isFinite(parsedEnd) ? parsedEnd : now + 300_000;
+      const event = typeof m["question"] === "string" ? (m["question"] as string).trim() : "";
+      const tokenIds = parseTokenIds(m["clobTokenIds"]);
+      const outcomes = parseOutcomes(m["outcomes"]);
+      for (let i = 0; i < tokenIds.length; i++) {
+        const tid = normalizeTokenKey(tokenIds[i]!);
+        const outcome = i < outcomes.length ? outcomes[i]! : "(unknown)";
+        next.set(tid, { asset, event, outcome, endMs });
+      }
+    }
+    if (rows.length < PAGE_SIZE) {
+      break; // last page — no end-time prune needed; the map is rebuilt fresh each refresh
     }
   }
   if (next.size > 0) {
     cache = next;
+    if (!everReady) {
+      everReady = true;
+      const assets = [...new Set([...next.values()].map((v) => v.asset))].sort();
+      console.info(
+        `crypto market cache ready · ${next.size} tokens · ${assets.length} assets [${assets.join(",")}]`
+      );
+    }
   }
 }
 
-/** Starts the background refresh loop (idempotent). Kicks an immediate refresh, then every `intervalMs`. */
-export function startCryptoMarketPrewarm(intervalMs: number = DEFAULT_REFRESH_MS): void {
-  if (started) {
-    return;
-  }
-  started = true;
-  void refreshOnce().catch(() => undefined);
-  setInterval(() => {
-    void refreshOnce().catch(() => undefined);
-  }, intervalMs).unref();
-}
-
-/** Fast, network-free lookup of a crypto 5-minute market by tokenId. undefined = not in the cache. */
-export function lookupCryptoMarket(tokenId: string): CryptoMarketInfo | undefined {
-  return cache.get(tokenId);
+/** True once the prewarm cache has been populated at least once. */
+export function isCryptoCacheReady(): boolean {
+  return everReady;
 }
 
 /**
- * Resolves the asset key for a tokenId. Cache first (instant); on a miss, one gamma lookup that also
- * seeds the cache. Returns null when the market isn't a crypto up/down market (or can't be resolved),
- * so a `market` filter treats it as "not my asset". Used only when a target has a market filter set.
+ * Starts the background refresh loop (idempotent) and returns a promise that resolves once the FIRST
+ * refresh has completed, so callers can await a warm cache before processing trades (kills the cold-
+ * start miss window). Subsequent refreshes run every `intervalMs`.
  */
-export async function resolveCryptoAsset(tokenId: string): Promise<string | null> {
-  const hit = cache.get(tokenId);
-  if (hit) {
-    return hit.asset;
+export function startCryptoMarketPrewarm(intervalMs: number = DEFAULT_REFRESH_MS): Promise<void> {
+  if (started) {
+    return Promise.resolve();
   }
-  try {
-    const url = new URL(GAMMA_URL);
-    url.searchParams.set("clob_token_ids", tokenId);
-    url.searchParams.set("limit", "1");
-    const res = await fetch(url);
-    if (!res.ok) {
-      return null;
-    }
-    const data = (await res.json()) as unknown;
-    if (!Array.isArray(data) || data.length === 0) {
-      return null;
-    }
-    const m = data[0] as Record<string, unknown>;
-    const slug = typeof m["slug"] === "string" ? (m["slug"] as string) : "";
-    const mm = SLUG_RE.exec(slug);
-    if (!mm) {
-      return null; // not a 5-minute crypto up/down market
-    }
-    const asset = normalizeAssetKey(mm[1]!);
-    // Seed the cache so a repeat within this window is instant.
-    const startMs = Number(mm[2]) * 1000;
-    const endMs = m["endDate"] ? Date.parse(String(m["endDate"])) : Date.now() + 300_000;
-    const event = typeof m["question"] === "string" ? (m["question"] as string).trim() : "";
-    const tokenIds = parseTokenIds(m["clobTokenIds"]);
-    const outcomes = parseOutcomes(m["outcomes"]);
-    const seeded = new Map(cache);
-    for (let i = 0; i < tokenIds.length; i++) {
-      seeded.set(tokenIds[i]!, {
-        asset,
-        event,
-        outcome: i < outcomes.length ? outcomes[i]! : "(unknown)",
-        startMs,
-        endMs,
-      });
-    }
-    cache = seeded;
-    return asset;
-  } catch {
-    return null;
-  }
+  started = true;
+  const first = refreshOnce().catch(() => undefined);
+  setInterval(() => {
+    void refreshOnce().catch(() => undefined);
+  }, intervalMs).unref();
+  return first.then(() => undefined);
+}
+
+/** Fast, network-free lookup of a crypto up/down market (any cadence) by tokenId. undefined = miss. */
+export function lookupCryptoMarket(tokenId: string): CryptoMarketInfo | undefined {
+  return cache.get(normalizeTokenKey(tokenId));
 }
 
 /**

@@ -15,7 +15,7 @@ import { startPolynodeWatcher, type PolynodeMatch } from "./polynodeWatcher.js";
 import { buildDigestsFromSettlement } from "./settlementDigest.js";
 import { aggregatePusdForTargets } from "./pusdTransfers.js";
 import { startWithdrawalWatcher } from "./withdrawalWatcher.js";
-import { startCryptoMarketPrewarm } from "./cryptoMarketPrewarm.js";
+import { startCryptoMarketPrewarm, isCryptoCacheReady } from "./cryptoMarketPrewarm.js";
 
 function formatLogErr(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -188,8 +188,24 @@ async function main() {
   const config = await loadAppConfig();
 
   // Prewarm the crypto 5-minute market cache (tokenId → asset/name/outcome) so the copy hot path can
-  // filter by `market` and label trades without a per-trade gamma round-trip.
-  startCryptoMarketPrewarm();
+  // filter by `market` and label trades without a per-trade gamma round-trip. Await the FIRST load
+  // (capped) so the cache is warm before the watcher can deliver a trade — no cold-start miss — while
+  // a slow/unreachable gamma still can't block boot (the background loop keeps retrying).
+  await Promise.race([
+    startCryptoMarketPrewarm(),
+    new Promise<void>((r) => {
+      const t = setTimeout(r, 5000);
+      t.unref();
+    }),
+  ]);
+  // The module logs "crypto market cache ready · N tokens · …" the moment it populates (boot or later
+  // recovery). If it's still empty here, gamma was slow/unreachable at boot — say so; the background
+  // loop keeps retrying and `market` filters pass through (copy) until it warms.
+  if (!isCryptoCacheReady()) {
+    console.warn(
+      "crypto market cache NOT ready at boot (gamma slow/unreachable) — market filters pass through until it warms; background refresh continues"
+    );
+  }
 
   if (config.copyTradeShared) {
     const probe = config.targetCopyProfiles.values().next().value;

@@ -19,7 +19,7 @@ import type { Ctf1155TransferRow } from "./ctf1155Inbound.js";
 import { appendLedger, readLedger, type LedgerRecord } from "./orderLedger.js";
 import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
-import { lookupCryptoMarket, resolveCryptoAsset, resolveMarketLabelsFast } from "./cryptoMarketPrewarm.js";
+import { lookupCryptoMarket, resolveMarketLabelsFast } from "./cryptoMarketPrewarm.js";
 import { registerSimOrder } from "./fillSim.js";
 
 function aggregateOutcomeByTokenId(rows: Ctf1155TransferRow[]): Map<string, bigint> {
@@ -1560,14 +1560,14 @@ export async function executeCopyTrade(
   }
 
   // Market filter: copy only the configured crypto 5-minute assets (e.g. btc). The asset is read from
-  // the prewarm cache (network-free); on a miss, one gamma lookup. A non-crypto or unknown market
-  // resolves to null and is skipped when a filter is set. Runs before any pricing work.
+  // the prewarm cache ONLY (network-free) — never a gamma call on the hot path, which would add fill-
+  // costing latency. A cache HIT for a different asset is skipped; a cache MISS is copied (we'd rather
+  // take an unclassified trade than either stall on gamma or drop it). Runs before any pricing work.
   if (cfg.marketFilter && cfg.marketFilter.length > 0) {
     const cached = lookupCryptoMarket(digest.tokenId);
-    const asset = cached?.asset ?? (await resolveCryptoAsset(digest.tokenId));
-    if (!asset || !cfg.marketFilter.includes(asset)) {
+    if (cached && !cfg.marketFilter.includes(cached.asset)) {
       await logCopySkip(
-        `market filter · asset=${asset ?? "unknown"} not in [${cfg.marketFilter.join(",")}] · token=${digest.tokenId}`,
+        `market filter · asset=${cached.asset} not in [${cfg.marketFilter.join(",")}] · token=${digest.tokenId}`,
         digest,
         txHash,
         cfg
