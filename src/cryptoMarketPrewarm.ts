@@ -7,9 +7,11 @@
  * every asset and cadence, refreshed in the background, so a tokenId arriving from the PolyNode
  * websocket maps instantly to { asset, event, outcome } with no network round-trip.
  *
- * Source of truth (verified against gamma, not assumed): every up/down market carries the tag
- * "Up or Down" (tag_id 102127), so `?tag_id=102127&closed=false` returns exactly this universe across
- * ALL cadences with clobTokenIds. Two slug shapes exist and both put the asset first:
+ * Source of truth (verified against gamma, not assumed): every crypto up/down market carries the tag
+ * "crypto-prices" (tag_id 1312), so `?tag_id=1312&closed=false` returns exactly the CRYPTO up/down
+ * universe across ALL cadences with clobTokenIds — no forex / indices / commodities (those live under
+ * the broader "up-or-down" tag 102127, which we deliberately do NOT use). A few non-up/down crypto
+ * price markets share the tag; the slug filter below drops them. Two slug shapes exist, asset first:
  *   compact:   `<asset>-updown-<dur>-<startUnix>`      e.g. btc-updown-5m-…, sol-updown-15m-…, btc-updown-4h-…
  *   full-word: `<asset>-up-or-down-<date>[-<hour>-et]` e.g. bitcoin-up-or-down-august-27-2026-5pm-et (hourly/daily)
  * We take the asset as the first slug segment (duration-agnostic) and page through the tag so long
@@ -29,10 +31,18 @@ export type CryptoMarketInfo = {
 };
 
 const GAMMA_URL = "https://gamma-api.polymarket.com/markets";
-/** gamma tag id for the "Up or Down" tag — the precise server-side filter for this whole universe. */
-const UP_OR_DOWN_TAG_ID = "102127";
+/** gamma tag id for "crypto-prices" — the precise server-side filter for crypto up/down markets only. */
+const CRYPTO_UPDOWN_TAG_ID = "1312";
 const PAGE_SIZE = 100;
-const MAX_PAGES = 20; // hard bound; pagination also stops early on a short page
+const MAX_PAGES = 20; // hard bound; pagination also stops early on a short page / the horizon
+/**
+ * Only cache markets ending within this window. The fetch is endDate-ascending, so once a market ends
+ * beyond the horizon we stop paging — this drops the many far-future 5-minute windows (that won't be
+ * traded until they roll into range) and keeps the background fetch to a few pages.
+ * Trade-off: currently-active markets that END beyond the horizon (e.g. a 4h/daily window already in
+ * progress) aren't cached; a trade on one is a cache miss → copied (the safe fallback).
+ */
+const HORIZON_MS = 2 * 60 * 60 * 1000; // 2 hours
 const DEFAULT_REFRESH_MS = 20_000;
 
 /**
@@ -116,7 +126,7 @@ function assetFromSlug(slug: string): string | null {
 async function fetchPage(offset: number): Promise<Record<string, unknown>[] | null> {
   const url = new URL(GAMMA_URL);
   url.searchParams.set("closed", "false");
-  url.searchParams.set("tag_id", UP_OR_DOWN_TAG_ID);
+  url.searchParams.set("tag_id", CRYPTO_UPDOWN_TAG_ID);
   url.searchParams.set("limit", String(PAGE_SIZE));
   url.searchParams.set("offset", String(offset));
   url.searchParams.set("order", "endDate");
@@ -131,8 +141,10 @@ async function fetchPage(offset: number): Promise<Record<string, unknown>[] | nu
 
 async function refreshOnce(): Promise<void> {
   const now = Date.now();
+  const horizon = now + HORIZON_MS;
   const next = new Map<string, CryptoMarketInfo>();
-  for (let page = 0; page < MAX_PAGES; page++) {
+  let reachedHorizon = false;
+  for (let page = 0; page < MAX_PAGES && !reachedHorizon; page++) {
     const rows = await fetchPage(page * PAGE_SIZE);
     if (rows === null) {
       // On the very first page failing we keep the previous cache (return without swapping); a later
@@ -143,13 +155,18 @@ async function refreshOnce(): Promise<void> {
       break;
     }
     for (const m of rows) {
+      const parsedEnd = m["endDate"] ? Date.parse(String(m["endDate"])) : NaN;
+      const endMs = Number.isFinite(parsedEnd) ? parsedEnd : now + 300_000;
+      // endDate-ascending: the first market past the horizon means every later one is too — stop.
+      if (endMs > horizon) {
+        reachedHorizon = true;
+        break;
+      }
       const slug = typeof m["slug"] === "string" ? (m["slug"] as string) : "";
       const asset = assetFromSlug(slug);
       if (!asset) {
-        continue;
+        continue; // a non-up/down crypto price market sharing the tag — skip, but it still counted toward the horizon
       }
-      const parsedEnd = m["endDate"] ? Date.parse(String(m["endDate"])) : NaN;
-      const endMs = Number.isFinite(parsedEnd) ? parsedEnd : now + 300_000;
       const event = typeof m["question"] === "string" ? (m["question"] as string).trim() : "";
       const tokenIds = parseTokenIds(m["clobTokenIds"]);
       const outcomes = parseOutcomes(m["outcomes"]);
