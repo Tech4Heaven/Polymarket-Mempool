@@ -1689,6 +1689,21 @@ export async function executeCopyTrade(
   if (digest.tickSize) {
     tickSizeByToken.set(digest.tokenId, digest.tickSize);
   }
+  // Sell-path reads (our balance, the target's on-chain balance, our tracked position) are independent
+  // of the order book and of each other. Start them NOW so they run concurrently with the book fetch
+  // instead of sequentially after it — cutting a sell's time-to-post from ~4 round-trips to ~1. They're
+  // read-only, so firing them before the (rare) empty-book/empty-bids skip only wastes throwaway work.
+  // Each is made non-rejecting so an early return before they're awaited can't orphan a rejection.
+  const sellReads =
+    digest.side === "sell"
+      ? {
+          bal: client
+            .getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: digest.tokenId })
+            .catch(() => null),
+          targetBefore: fetchTargetTokenBalance(cfg, cfg.targetAddress, digest.tokenId), // already catches → null
+          tracked: getTargetPosition(cfg, digest.tokenId), // never rejects (reads local state)
+        }
+      : null;
   const [tickSize, negRisk, book] = await Promise.all([
     digest.tickSize ?? getTickSizeCached(client, digest.tokenId),
     getNegRiskCached(client, digest.tokenId),
@@ -1840,14 +1855,13 @@ export async function executeCopyTrade(
   if (digest.side === "buy") {
     orderShares = (clippedUsdc ?? 0) / limitPrice;
   } else {
-    const bal = await client.getBalanceAllowance({
-      asset_type: AssetType.CONDITIONAL,
-      token_id: digest.tokenId,
-    });
+    // Pre-started concurrently with the book fetch (see sellReads above) — these awaits resolve
+    // in-flight results, not fresh sequential round-trips.
+    const bal = await sellReads!.bal;
     /** CLOB returns conditional balance in raw 6-decimal units; `createAndPostOrder` size is decimal shares (same scale as buys). */
     let fullBalance: number;
     try {
-      fullBalance = parseFloat(formatUnits(BigInt(String(bal.balance)), 6));
+      fullBalance = parseFloat(formatUnits(BigInt(String(bal?.balance)), 6));
     } catch {
       await logCopySkip(`invalid balance response · token=${digest.tokenId}`, digest, txHash, cfg, {
         limitPrice,
@@ -1872,8 +1886,8 @@ export async function executeCopyTrade(
     //                 so a sell never touches shares another target filled in the same market. Capped
     //                 by the real wallet balance (can't sell more than the wallet holds). Falls back to
     //                 the wallet balance only when there's no tracked state (e.g. across a restart).
-    const targetBefore = await fetchTargetTokenBalance(cfg, cfg.targetAddress, digest.tokenId);
-    const tracked = await getTargetPosition(cfg, digest.tokenId);
+    const targetBefore = await sellReads!.targetBefore;
+    const tracked = await sellReads!.tracked;
     const ourPosition = tracked === null ? fullBalance : Math.min(tracked, fullBalance);
     orderShares = proportionalSellShares(originShares, targetBefore, ourPosition);
     sellFraction = ourPosition > 0 ? orderShares / ourPosition : 1;
