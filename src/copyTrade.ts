@@ -1559,15 +1559,17 @@ export async function executeCopyTrade(
     }
   }
 
-  // Market filter: copy only the configured crypto 5-minute assets (e.g. btc). The asset is read from
-  // the prewarm cache ONLY (network-free) — never a gamma call on the hot path, which would add fill-
-  // costing latency. A cache HIT for a different asset is skipped; a cache MISS is copied (we'd rather
-  // take an unclassified trade than either stall on gamma or drop it). Runs before any pricing work.
+  // Market filter (ALLOWLIST): copy ONLY the configured crypto assets (e.g. btc). The asset is read
+  // from the prewarm cache ONLY (network-free) — never a gamma call on the hot path. Copy only on a
+  // cache HIT whose asset is in the allowlist; SKIP everything else — other coins, non-crypto markets,
+  // and anything not in the cache (unknown). This is deliberate: when copying a fresh/unknown wallet
+  // you don't know what it will trade, so only confirmed-asset trades should go through. The prewarm
+  // reliably holds every live crypto market for the next ~2h, so a real btc trade is a hit in practice.
   if (cfg.marketFilter && cfg.marketFilter.length > 0) {
-    const cached = lookupCryptoMarket(digest.tokenId);
-    if (cached && !cfg.marketFilter.includes(cached.asset)) {
+    const asset = lookupCryptoMarket(digest.tokenId)?.asset;
+    if (!asset || !cfg.marketFilter.includes(asset)) {
       await logCopySkip(
-        `market filter · asset=${cached.asset} not in [${cfg.marketFilter.join(",")}] · token=${digest.tokenId}`,
+        `market filter · asset=${asset ?? "unknown"} not in [${cfg.marketFilter.join(",")}] · token=${digest.tokenId}`,
         digest,
         txHash,
         cfg
