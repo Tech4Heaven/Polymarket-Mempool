@@ -115,6 +115,13 @@ export type TomlDefaultsSection = {
   /** USD floor for the new-wallet first trade (default 150 when new_wallet is set). */
   new_wallet_min_usd?: number;
   /**
+   * Protective take-profit. When set to a price in (0,1) — typically 0.99 — after each copied BUY fills
+   * we post a resting GTC SELL of that position at this price. A maker order (no fee) that locks the
+   * value if the price spikes there, dodging the 99c->1c flip at resolution. If the target sells first,
+   * the resting order is cancelled and his sell is copied. Omit to disable.
+   */
+  safe_sell?: number;
+  /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
    */
@@ -152,6 +159,7 @@ export type TomlTargetRow = {
   market?: string | string[];
   new_wallet?: boolean;
   new_wallet_min_usd?: number;
+  safe_sell?: number;
   enabled?: boolean;
 };
 
@@ -249,6 +257,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       market: strOrStrArrayOrUndef("market", src),
       new_wallet: boolOrUndef("new_wallet", src),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", src),
+      safe_sell: numOrUndef("safe_sell", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -299,6 +308,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       market: strOrStrArrayOrUndef("market", row),
       new_wallet: boolOrUndef("new_wallet", row),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", row),
+      safe_sell: numOrUndef("safe_sell", row),
       enabled: boolOrUndef("enabled", row),
     });
   }

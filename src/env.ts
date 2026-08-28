@@ -113,6 +113,8 @@ export type TargetCopyParams = {
   newWallet?: boolean;
   /** USD floor for the new-wallet first trade (default 150 when newWallet set). */
   newWalletMinUsd?: number;
+  /** Protective take-profit: after each copied buy fills, rest a GTC SELL of it at this price (0,1). */
+  safeSell?: number;
   copyTradeLogPath: string;
 };
 
@@ -163,6 +165,8 @@ export type CopyTradeConfig = CopyTradeShared & {
   newWallet?: boolean;
   /** Per-target USD floor for the new-wallet first trade (default 150). */
   newWalletMinUsd?: number;
+  /** Per-target protective take-profit price (0,1): rest a GTC sell of each copied buy here. */
+  safeSell?: number;
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -246,6 +250,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     marketFilter: p.marketFilter,
     newWallet: p.newWallet,
     newWalletMinUsd: p.newWalletMinUsd,
+    safeSell: p.safeSell,
     targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
@@ -632,6 +637,14 @@ export async function loadAppConfig(): Promise<AppConfig> {
           throw new Error(`targets ${row.address}: new_wallet_min_usd must be a positive USD amount (e.g. 150)`);
         }
 
+        const safeSell = row.safe_sell ?? defaults.safe_sell;
+        if (safeSell !== undefined && (!Number.isFinite(safeSell) || safeSell <= 0 || safeSell >= 1)) {
+          throw new Error(`targets ${row.address}: safe_sell must be a price in (0, 1) (e.g. 0.99)`);
+        }
+        if (safeSell !== undefined && hedgePrice !== undefined) {
+          throw new Error(`targets ${row.address}: safe_sell and hedge_price can't be combined on one target (both manage the position's protective order)`);
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -661,6 +674,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           marketFilter,
           newWallet,
           newWalletMinUsd,
+          safeSell,
           copyTradeLogPath,
         });
       }

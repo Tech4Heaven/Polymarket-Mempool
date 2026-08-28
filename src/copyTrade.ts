@@ -496,6 +496,84 @@ function newWalletTestGuardDecision(
   return { skip: true, cumUsd: st.cumUsd };
 }
 
+// ── Safe-sell (protective take-profit) ─────────────────────────────────────────────────────────────
+// When `safe_sell` is set, each copied BUY that fills gets a resting GTC SELL at that price (e.g. 0.99)
+// — a maker order (no fee) that locks the value if the price spikes there, dodging the 99c->1c flip. If
+// the target sells first, the resting order(s) are cancelled and his sell is copied. Order ids are held
+// in memory per (target, tokenId); not persisted — the startup GTC cleanup cancels orphans after a
+// restart (a SELL at a safe_sell price), so a stale protective order can't linger.
+const safeSellOrdersByTargetToken = new Map<string, string[]>();
+
+function safeSellKey(target: string, tokenId: string): string {
+  return `${target.toLowerCase()}|${tokenId}`;
+}
+
+/** Post a resting protective sell for a just-filled copy buy. Best-effort — never throws to the caller. */
+async function placeSafeSell(
+  cfg: CopyTradeConfig,
+  client: ClobClient,
+  tokenId: string,
+  shares: number,
+  tick: TickSize,
+  negRisk: boolean,
+  minOrder: number,
+  txHash: string
+): Promise<void> {
+  if (cfg.safeSell === undefined || !(shares > 0) || shares < minOrder) {
+    return; // feature off, nothing filled, or below the market's share floor
+  }
+  const price = roundToTick(cfg.safeSell, tick, "down");
+  if (!(price > 0) || price >= 1) {
+    return;
+  }
+  try {
+    const resp = await client.createAndPostOrder(
+      { tokenID: tokenId, price, side: Side.SELL, size: shares },
+      { tickSize: tick, negRisk },
+      OrderType.GTC
+    );
+    const err = postErrorMessage(resp);
+    const orderId = (resp as { orderID?: string })?.orderID;
+    if (err || !orderId) {
+      const warn = `safe-sell REJECTED · ${shares} @ ${price} · token=${tokenId} · ${JSON.stringify(err ?? "no orderID")} · tx=${txHash}`;
+      console.warn(warn);
+      void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
+      return;
+    }
+    const key = safeSellKey(cfg.targetAddress, tokenId);
+    const list = safeSellOrdersByTargetToken.get(key) ?? [];
+    list.push(orderId);
+    safeSellOrdersByTargetToken.set(key, list);
+    const msg = `safe-sell posted · ${shares} sh @ ${price} (resting take-profit) · token=${tokenId} · tx=${txHash}`;
+    console.log(msg);
+    void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+  } catch (e) {
+    const warn = `safe-sell post failed · token=${tokenId}: ${e instanceof Error ? e.message : String(e)} · tx=${txHash}`;
+    console.warn(warn);
+    void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
+  }
+}
+
+/** Cancel all resting safe-sell orders for a (target, tokenId) so the shares are freed for a copy sell. */
+async function cancelSafeSells(cfg: CopyTradeConfig, client: ClobClient, tokenId: string): Promise<void> {
+  const key = safeSellKey(cfg.targetAddress, tokenId);
+  const ids = safeSellOrdersByTargetToken.get(key);
+  if (!ids || ids.length === 0) {
+    return;
+  }
+  safeSellOrdersByTargetToken.delete(key);
+  for (const id of ids) {
+    try {
+      await client.cancelOrder({ orderID: id });
+    } catch {
+      // already filled / cancelled / gone — nothing to free
+    }
+  }
+  const msg = `safe-sell cancelled ${ids.length} resting order(s) · token=${tokenId} (target sold / exiting)`;
+  console.log(msg);
+  void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+}
+
 setInterval(() => {
   ensureSideSpendLoaded();
   const now = Date.now();
@@ -1527,7 +1605,11 @@ async function checkRestingHedgeSuppression(
  * A hedge is identified by the P&L ledger (`isHedge` for that orderId) and, as a fallback for
  * orders not in the ledger, a BUY resting at one of the configured `hedgePrices`.
  */
-export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig, hedgePrices: number[] = []): Promise<void> {
+export async function cancelAllStaleGtcOrders(
+  cfg: CopyTradeConfig,
+  hedgePrices: number[] = [],
+  safeSellPrices: number[] = []
+): Promise<void> {
   try {
     const client = await ensureClobClient(cfg);
     const orders = await client.getOpenOrders();
@@ -1537,26 +1619,30 @@ export async function cancelAllStaleGtcOrders(cfg: CopyTradeConfig, hedgePrices:
     }
     const ledger = await readLedger();
     const hedgeIds = new Set(ledger.filter((r) => r.isHedge).map((r) => r.orderId));
+    // Stale = a hedge order (ledger-tagged, or a BUY at a hedge price) OR an orphan safe-sell (a SELL at
+    // a safe_sell price) left resting from a prior run — the in-memory id tracking resets on restart.
     const isHedgeOrder = (o: { id?: string; side?: string; price?: string }): boolean => {
       if (o.id && hedgeIds.has(o.id)) {
         return true;
       }
-      if ((o.side ?? "").toUpperCase() === "BUY") {
-        const p = parseFloat(o.price ?? "");
-        if (Number.isFinite(p) && hedgePrices.some((hp) => Math.abs(hp - p) < 1e-9)) {
-          return true;
-        }
+      const side = (o.side ?? "").toUpperCase();
+      const p = parseFloat(o.price ?? "");
+      if (side === "BUY" && Number.isFinite(p) && hedgePrices.some((hp) => Math.abs(hp - p) < 1e-9)) {
+        return true;
+      }
+      if (side === "SELL" && Number.isFinite(p) && safeSellPrices.some((sp) => Math.abs(sp - p) < 1e-9)) {
+        return true;
       }
       return false;
     };
 
     const hedges = orders.filter(isHedgeOrder);
     if (hedges.length === 0) {
-      console.log(`startup: ${orders.length} open order(s), none are hedges — leaving all copy orders resting`);
+      console.log(`startup: ${orders.length} open order(s), none are stale hedge/safe-sell — leaving all copy orders resting`);
       return;
     }
     console.log(
-      `startup: cancelling ${hedges.length} stale hedge order(s); leaving ${orders.length - hedges.length} copy order(s) resting`
+      `startup: cancelling ${hedges.length} stale hedge/safe-sell order(s); leaving ${orders.length - hedges.length} copy order(s) resting`
     );
     for (const o of hedges) {
       const id = (o as { id?: string }).id;
@@ -1781,6 +1867,13 @@ export async function executeCopyTrade(
   }
 
   const client = await ensureClobClient(cfg);
+
+  // Safe-sell: the target is exiting, so cancel our resting protective sell(s) FIRST — this frees the
+  // escrowed shares back to the wallet balance before the sell path reads it (sellReads, below), so the
+  // copied sell can size against the full position. Done here (before the book/balance fetch) for sells.
+  if (digest.side === "sell" && cfg.safeSell !== undefined) {
+    await cancelSafeSells(cfg, client, digest.tokenId);
+  }
 
   // EARLY suppression: cheap local absorbedSide check only. The resting-hedge interaction is
   // deferred to LATE (just before createAndPostOrder) so we don't cancel a hedge for a copy
@@ -2364,6 +2457,9 @@ export async function executeCopyTrade(
       }
     }
     await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash, postedOrderId, orderShares);
+    // Protective take-profit: rest a GTC SELL of the just-filled position at safe_sell (e.g. 0.99), so a
+    // spike there exits fee-free before a possible 99c->1c flip. Best-effort; never blocks the copy.
+    await placeSafeSell(cfg, client, digest.tokenId, filledShares, postTick, negRisk, minOrder, txHash);
   } else {
     // Register the FINAL resting order (restingFillShares/restingPosted) plus a terminal entry for the
     // shares already sold by superseded reprice attempts, so the position reflects the full exit while

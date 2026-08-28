@@ -219,21 +219,24 @@ async function main() {
       } catch (e) {
         console.error(`CLOB: createOrDeriveApiKey failed — copy trades will fail until auth succeeds: ${formatLogErr(e)}`);
       }
-      // Restart safety: cancel orphan GTC orders from a prior run so they can't fill behind
-      // the (now-empty) in-memory hedge state and create double-hedge / unexpected exposure.
-      // Only runs if any target uses hedging — otherwise the bot doesn't post GTC itself either.
+      // Restart safety: cancel orphan GTC orders from a prior run so they can't fill behind the
+      // (now-empty) in-memory state and create double-hedge / unexpected exposure. Covers hedge orders
+      // AND safe-sell take-profit orders — both are GTC orders the bot posts and tracks only in memory.
       const hedgePrices = [...config.targetCopyProfiles.values()]
         .map((p) => p.hedgePrice)
         .filter((x): x is number => x !== undefined);
-      const anyHedging = hedgePrices.length > 0;
-      if (anyHedging && !probeCfg.dryRun) {
-        // Cancels ONLY stale hedge orders; every target's resting copy orders are left alone.
-        await cancelAllStaleGtcOrders(probeCfg, hedgePrices);
+      const safeSellPrices = [...config.targetCopyProfiles.values()]
+        .map((p) => p.safeSell)
+        .filter((x): x is number => x !== undefined);
+      const anyGtc = hedgePrices.length > 0 || safeSellPrices.length > 0;
+      if (anyGtc && !probeCfg.dryRun) {
+        // Cancels ONLY stale hedge / safe-sell orders; every target's resting copy orders are left alone.
+        await cancelAllStaleGtcOrders(probeCfg, hedgePrices, safeSellPrices);
       }
       // Mark the boot in every per-target log. Without this, a restart looks identical to
       // continuous operation when reading a per-target file later — and lost in-memory state
       // (absorbed-side markers, accumulator buffers, hedge tracking) looks like a code bug.
-      const gtcNote = anyHedging && !probeCfg.dryRun ? "ran" : "skipped (no hedging or dry-run)";
+      const gtcNote = anyGtc && !probeCfg.dryRun ? "ran" : "skipped (no hedging/safe-sell or dry-run)";
       await appendWatcherLineToAllTargetLogs(
         `bot started · pid=${process.pid} · in-memory state cleared (hedge tracking, absorbed-side markers, accumulator buffers all empty) · GTC cleanup ${gtcNote}`,
         config
