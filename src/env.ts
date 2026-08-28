@@ -109,6 +109,10 @@ export type TargetCopyParams = {
   sellMaxSlippageFrac?: number;
   /** Restrict copies to these crypto asset keys (normalized, e.g. ["btc"]). Empty/undefined = no filter. */
   marketFilter?: string[];
+  /** Fresh-wallet bait guard: skip the target's first trade if it's a buy below newWalletMinUsd. */
+  newWallet?: boolean;
+  /** USD floor for the new-wallet first trade (default 150 when newWallet set). */
+  newWalletMinUsd?: number;
   copyTradeLogPath: string;
 };
 
@@ -155,6 +159,10 @@ export type CopyTradeConfig = CopyTradeShared & {
   sellMaxSlippageFrac?: number;
   /** Per-target crypto asset filter (normalized keys, e.g. ["btc"]). Empty/undefined = copy all markets. */
   marketFilter?: string[];
+  /** Per-target fresh-wallet bait guard: skip the first trade if it's a buy below newWalletMinUsd. */
+  newWallet?: boolean;
+  /** Per-target USD floor for the new-wallet first trade (default 150). */
+  newWalletMinUsd?: number;
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -236,6 +244,8 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     sellRepriceDeadlineMs: p.sellRepriceDeadlineMs,
     sellMaxSlippageFrac: p.sellMaxSlippageFrac,
     marketFilter: p.marketFilter,
+    newWallet: p.newWallet,
+    newWalletMinUsd: p.newWalletMinUsd,
     targetAddress: p.address,
     copyTradeLogPath: p.copyTradeLogPath,
   };
@@ -616,6 +626,12 @@ export async function loadAppConfig(): Promise<AppConfig> {
           marketFilter = [...new Set(list)];
         }
 
+        const newWallet = row.new_wallet ?? defaults.new_wallet;
+        const newWalletMinUsd = row.new_wallet_min_usd ?? defaults.new_wallet_min_usd;
+        if (newWalletMinUsd !== undefined && (!Number.isFinite(newWalletMinUsd) || newWalletMinUsd <= 0)) {
+          throw new Error(`targets ${row.address}: new_wallet_min_usd must be a positive USD amount (e.g. 150)`);
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           copyRatio,
@@ -643,6 +659,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
           sellRepriceDeadlineMs,
           sellMaxSlippageFrac,
           marketFilter,
+          newWallet,
+          newWalletMinUsd,
           copyTradeLogPath,
         });
       }

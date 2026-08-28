@@ -402,6 +402,100 @@ function persistSideSpend(): void {
   }
 }
 
+// ── New-wallet test-position guard ───────────────────────────────────────────────────────────────
+// Defends against the fresh-wallet bait: a trader opens small "test" positions to lure copiers, then
+// withdraws. Observed patterns share one signature — EVERY market he touches stays small (built from
+// one or more trades: $47+$53=$100, or just $5), and he never makes a real-size position before pulling
+// funds. So we aggregate his spend PER market and skip every trade in ANY market whose running total is
+// below the threshold. The guard finishes (copies from then on) only when SOME market reaches the
+// threshold — proof he's actually trading, not baiting. State is persisted so a restart resumes the
+// current market's tally instead of re-arming.
+export const DEFAULT_NEW_WALLET_MIN_USD = 150;
+
+/** Per-target guard state. market = the market currently being tallied; cumUsd = his total in it; done = guard off. */
+type NewWalletState = { market: string | null; cumUsd: number; done: boolean };
+const newWalletState = new Map<string, NewWalletState>();
+let newWalletLoaded = false;
+
+function newWalletPath(): string {
+  return process.env["NEW_WALLET_STATE_PATH"]?.trim() || "logs/new-wallet-guard.json";
+}
+
+function ensureNewWalletLoaded(): void {
+  if (newWalletLoaded) {
+    return;
+  }
+  newWalletLoaded = true;
+  try {
+    const obj = JSON.parse(readFileSync(newWalletPath(), "utf8")) as Record<string, Partial<NewWalletState>>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (v && typeof v === "object") {
+        newWalletState.set(k.toLowerCase(), {
+          market: typeof v.market === "string" ? v.market : null,
+          cumUsd: Number(v.cumUsd) || 0,
+          done: !!v.done,
+        });
+      }
+    }
+  } catch {
+    // no file yet / unreadable → start empty
+  }
+}
+
+function persistNewWallet(): void {
+  try {
+    const obj: Record<string, NewWalletState> = {};
+    for (const [k, v] of newWalletState) {
+      obj[k] = v;
+    }
+    const p = newWalletPath();
+    const tmp = `${p}.tmp`;
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, p);
+  } catch {
+    // best effort — an unwritable path must not break trading
+  }
+}
+
+/**
+ * Test-position guard decision for a BUY. Tallies the target's spend PER market (resetting when he
+ * moves to a new market) and returns whether to SKIP this trade — i.e. the current market's running
+ * total is still below the threshold — plus that total for logging. The guard turns off permanently
+ * only when SOME market reaches the threshold (a real position). Every small market before that is
+ * fully skipped. Mutates + persists per-target state.
+ */
+function newWalletTestGuardDecision(
+  target: string,
+  marketKey: string,
+  tradeUsd: number,
+  minUsd: number
+): { skip: boolean; cumUsd: number } {
+  ensureNewWalletLoaded();
+  const key = target.toLowerCase();
+  let st = newWalletState.get(key);
+  if (!st) {
+    st = { market: null, cumUsd: 0, done: false };
+    newWalletState.set(key, st);
+  }
+  if (st.done) {
+    return { skip: false, cumUsd: st.cumUsd };
+  }
+  if (marketKey !== st.market) {
+    // New market → start a fresh per-market tally (the guard spans every market, not just the first).
+    st.market = marketKey;
+    st.cumUsd = 0;
+  }
+  st.cumUsd += tradeUsd;
+  if (st.cumUsd >= minUsd) {
+    // This market reached a real size — proof he's trading, not baiting. Copy it and disable the guard.
+    st.done = true;
+    persistNewWallet();
+    return { skip: false, cumUsd: st.cumUsd };
+  }
+  persistNewWallet();
+  return { skip: true, cumUsd: st.cumUsd };
+}
+
 setInterval(() => {
   ensureSideSpendLoaded();
   const now = Date.now();
@@ -1584,6 +1678,29 @@ export async function executeCopyTrade(
   if (!Number.isFinite(implied) || implied <= 0) {
     await logCopySkip(`bad implied on-chain price · token=${digest.tokenId}`, digest, txHash, cfg);
     return;
+  }
+
+  // New-wallet test-position guard: the fresh-wallet bait opens small positions (one or more trades per
+  // market — $47+$53=$100, or just $5) across several markets, then withdraws. We tally his spend PER
+  // market and skip every trade in ANY market whose running total stays below the threshold, for every
+  // market — until SOME market reaches the threshold (proof he's trading), after which we copy normally.
+  // Buys only — a sell can't precede a position, and if we skipped the buys a copied sell finds nothing.
+  // Market key is the prewarm cache's market name (both Up/Down tokens share it), network-free; falls
+  // back to the tokenId on a cache miss. Uses HIS spend (originPusd), independent of copy_ratio.
+  if (cfg.newWallet && digest.side === "buy") {
+    const minUsd = cfg.newWalletMinUsd ?? DEFAULT_NEW_WALLET_MIN_USD;
+    const marketKey = lookupCryptoMarket(digest.tokenId)?.event ?? `token:${digest.tokenId}`;
+    const d = newWalletTestGuardDecision(cfg.targetAddress, marketKey, originPusd, minUsd);
+    if (d.skip) {
+      await logCopySkip(
+        `new-wallet guard · test market total $${d.cumUsd.toFixed(2)} < $${minUsd} (possible bait) · token=${digest.tokenId}`,
+        digest,
+        txHash,
+        cfg,
+        { copyUsd: originPusd * cfg.copyRatio, implied }
+      );
+      return;
+    }
   }
 
   // Effective values — overwritten when the below-min accumulator combines this trade with

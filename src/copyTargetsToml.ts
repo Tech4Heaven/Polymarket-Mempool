@@ -106,6 +106,15 @@ export type TomlDefaultsSection = {
    */
   market?: string | string[];
   /**
+   * Fresh-wallet bait guard. When true, this target's FIRST observed trade is skipped if it's a buy
+   * below `new_wallet_min_usd` (default 150) — the classic "open a tiny test position to lure copiers,
+   * then withdraw" tactic. Only the first trade is gated; every later trade copies normally. Omit/false
+   * to disable.
+   */
+  new_wallet?: boolean;
+  /** USD floor for the new-wallet first trade (default 150 when new_wallet is set). */
+  new_wallet_min_usd?: number;
+  /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
    */
@@ -141,6 +150,8 @@ export type TomlTargetRow = {
   sell_reprice_deadline_ms?: number;
   sell_max_slippage_frac?: number;
   market?: string | string[];
+  new_wallet?: boolean;
+  new_wallet_min_usd?: number;
   enabled?: boolean;
 };
 
@@ -236,6 +247,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", src),
       sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", src),
       market: strOrStrArrayOrUndef("market", src),
+      new_wallet: boolOrUndef("new_wallet", src),
+      new_wallet_min_usd: numOrUndef("new_wallet_min_usd", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -284,6 +297,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", row),
       sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", row),
       market: strOrStrArrayOrUndef("market", row),
+      new_wallet: boolOrUndef("new_wallet", row),
+      new_wallet_min_usd: numOrUndef("new_wallet_min_usd", row),
       enabled: boolOrUndef("enabled", row),
     });
   }
