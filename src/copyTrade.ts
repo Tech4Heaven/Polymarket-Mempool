@@ -303,9 +303,14 @@ async function logCopySkip(
   sizing: SkipSizing = {}
 ): Promise<void> {
   const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
-  const msg = `copy skip · ${reasonDetail} · ${formatSkipSizing(sizing)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tx=${txHash}`;
+  const msg = `copy skip · ${reasonDetail} · ${formatSkipSizing(sizing)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tx=${txHash}${targetTag(cfg)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
+}
+
+/** ` · target=<addr> (<username>)` — appended to copy log lines so a mixed log shows which target each is for. */
+function targetTag(cfg: CopyTradeConfig): string {
+  return ` · target=${cfg.targetAddress}${cfg.username ? ` (${cfg.username})` : ""}`;
 }
 
 let cachedClient: ClobClient | null = null;
@@ -2318,7 +2323,7 @@ export async function executeCopyTrade(
       addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
     }
     const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
-    const fmsg = `copy REJECTED · ${digest.side} shares=${orderShares} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} tick=${postTick} · error=${JSON.stringify(postErr)} · tx=${txHash}`;
+    const fmsg = `copy REJECTED · ${digest.side} shares=${orderShares} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} tick=${postTick} · error=${JSON.stringify(postErr)} · tx=${txHash}${targetTag(cfg)}`;
     console.warn(fmsg);
     void appendCopyTradeSuccessLine(fmsg, cfg.copyTradeLogPath);
     return;
@@ -2429,7 +2434,7 @@ export async function executeCopyTrade(
   const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
   const intendedPUsd = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
   const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
-  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)}${takerBumpNote}${repriceNote} · tx=${txHash}${flushSuffix} · ${JSON.stringify(resp)}`;
+  const msg = `copy posted · ${digest.side} submitted=${orderShares} sh ($${intendedPUsd.toFixed(6)}) filled=${filledShares} sh ($${filledUsdc.toFixed(6)}) · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} implied=${effectiveImplied.toFixed(4)}${takerBumpNote}${repriceNote} · tx=${txHash}${flushSuffix}${targetTag(cfg)} · ${JSON.stringify(resp)}`;
   console.log(msg);
   void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
   // P&L ledger (fire-and-forget): record EACH posted order (unique orderIds) for reconciliation.

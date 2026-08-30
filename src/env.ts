@@ -44,6 +44,8 @@ export type CopyTradeShared = {
 /** Per-target sizing and dedicated copy-trade log path (absolute). */
 export type TargetCopyParams = {
   address: string;
+  /** Optional Polymarket username from the toml — shown in log lines alongside the address. */
+  username?: string;
   copyRatio: number;
   maxPriceDifference: number;
   /** Buy only: skip if (implied - effectivePrice) > this. Undefined = no underbid skip. */
@@ -172,6 +174,8 @@ export type CopyTradeConfig = CopyTradeShared & {
    * can attribute spend to the right target across the shared copy wallet.
    */
   targetAddress: string;
+  /** Optional Polymarket username (from toml) — shown next to the address in copy log lines. */
+  username?: string;
   /**
    * When set, copy-trade lines go here; otherwise {@link appendCopyTradeSuccessLine} uses env / default file.
    */
@@ -252,6 +256,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     newWalletMinUsd: p.newWalletMinUsd,
     safeSell: p.safeSell,
     targetAddress: p.address,
+    username: p.username,
     copyTradeLogPath: p.copyTradeLogPath,
   };
 }
@@ -647,6 +652,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
 
         targetCopyProfiles.set(row.address, {
           address: row.address,
+          username: row.username,
           copyRatio,
           maxPriceDifference,
           maxUnderbidDifference,
