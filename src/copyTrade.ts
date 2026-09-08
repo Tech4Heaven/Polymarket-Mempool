@@ -629,6 +629,55 @@ function addSideSpent(targetAddress: string, tokenId: string, usdcDelta: number)
   persistSideSpend();
 }
 
+/**
+ * Total committed USDC on `tokenId` summed across ALL targets on this wallet — the denominator for the
+ * account-wide per-market cap (maxMarketUsdcAccount). Keys are `${target}:${tokenId}`, so we match the
+ * `:${tokenId}` suffix. Purely synchronous (in-memory), so it stays inside the atomic reserve block.
+ */
+function accountSpentForToken(tokenId: string): number {
+  ensureSideSpendLoaded();
+  const now = Date.now();
+  const suffix = `:${tokenId}`;
+  let sum = 0;
+  for (const [k, e] of sideSpendByTargetToken) {
+    if (k.endsWith(suffix) && now - e.lastUpdated <= SIDE_SPEND_TTL_MS) {
+      sum += e.spent;
+    }
+  }
+  return sum;
+}
+
+/**
+ * Remaining USDC capacity for a buy on `tokenId`, honoring BOTH the per-target cap (max_market_usdc)
+ * and the account-wide per-market cap (maxMarketUsdcAccount, summed across all targets). The binding
+ * constraint is the smaller of the two; an unset cap contributes Infinity. `bound` names whichever is
+ * tighter, for logging. Returns Infinity when neither cap is set (caller gates on that).
+ */
+function marketUsdcRemaining(cfg: CopyTradeConfig, tokenId: string): { remaining: number; bound: string } {
+  let remaining = Infinity;
+  let bound = "none";
+  if (cfg.maxMarketUsdc !== undefined) {
+    const r = cfg.maxMarketUsdc - getSideSpent(cfg.targetAddress, tokenId);
+    if (r < remaining) {
+      remaining = r;
+      bound = `per-target cap=$${cfg.maxMarketUsdc}`;
+    }
+  }
+  if (cfg.maxMarketUsdcAccount !== undefined) {
+    const r = cfg.maxMarketUsdcAccount - accountSpentForToken(tokenId);
+    if (r < remaining) {
+      remaining = r;
+      bound = `account cap=$${cfg.maxMarketUsdcAccount}`;
+    }
+  }
+  return { remaining, bound };
+}
+
+/** True when any max_market_usdc cap (per-target or account-wide) applies to this target. */
+function marketUsdcCapActive(cfg: CopyTradeConfig): boolean {
+  return cfg.maxMarketUsdc !== undefined || cfg.maxMarketUsdcAccount !== undefined;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Below-min accumulator — buffer per (target, tokenId) for `accumulate_below_min`
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1264,22 +1313,21 @@ async function reconcileHedge(
     return;
   }
 
-  // Cap-aware sizing: clip the hedge to fit the opposite side's max_market_usdc bucket.
-  // If even one tick of hedge would overflow the bucket, we skip the hedge entirely.
+  // Cap-aware sizing: clip the hedge to fit the opposite side's max_market_usdc bucket (per-target AND
+  // account-wide, whichever is tighter). If even one tick of hedge would overflow, we skip the hedge.
   let sizeToPlace = ideal.size;
-  if (cfg.maxMarketUsdc !== undefined) {
-    const alreadySpent = getSideSpent(cfg.targetAddress, ideal.tokenId);
-    const remaining = cfg.maxMarketUsdc - alreadySpent;
+  if (marketUsdcCapActive(cfg)) {
+    const { remaining, bound } = marketUsdcRemaining(cfg, ideal.tokenId);
     const desiredCost = ideal.price * ideal.size;
     if (desiredCost > remaining) {
       const maxAffordableSize = remaining / ideal.price;
       if (maxAffordableSize <= 0) {
-        const skipMsg = `hedge skipped · max_market_usdc bucket full on opposite side · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} hedgeToken=${ideal.tokenId} · tx=${txHash}`;
+        const skipMsg = `hedge skipped · max_market_usdc bucket full on opposite side · ${bound} · hedgeToken=${ideal.tokenId} · tx=${txHash}`;
         console.log(skipMsg);
         void appendCopyTradeSuccessLine(skipMsg, cfg.copyTradeLogPath);
         return;
       }
-      const clipMsg = `hedge clipped by max_market_usdc · desired=${ideal.size.toFixed(2)} sh → ${maxAffordableSize.toFixed(2)} sh · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} · tx=${txHash}`;
+      const clipMsg = `hedge clipped by max_market_usdc · desired=${ideal.size.toFixed(2)} sh → ${maxAffordableSize.toFixed(2)} sh · ${bound} · tx=${txHash}`;
       console.log(clipMsg);
       void appendCopyTradeSuccessLine(clipMsg, cfg.copyTradeLogPath);
       sizeToPlace = maxAffordableSize;
@@ -1840,14 +1888,13 @@ export async function executeCopyTrade(
 
     clippedUsdc = clamp(combinedNotional, cfg.minPositionUsdc, cfg.maxPositionUsdc);
 
-    // Per-target per-side cap: clip down to remaining bucket capacity. Skip if remaining
-    // wouldn't satisfy min_position_usdc — we don't post sub-min orders.
-    if (cfg.maxMarketUsdc !== undefined) {
-      const alreadySpent = getSideSpent(cfg.targetAddress, digest.tokenId);
-      const remaining = cfg.maxMarketUsdc - alreadySpent;
+    // max_market_usdc cap (per-target AND/OR account-wide): clip down to the tighter remaining bucket.
+    // Skip if remaining wouldn't satisfy min_position_usdc — we don't post sub-min orders.
+    if (marketUsdcCapActive(cfg)) {
+      const { remaining, bound } = marketUsdcRemaining(cfg, digest.tokenId);
       if (remaining <= 0) {
         await logCopySkip(
-          `max_market_usdc cap reached · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+          `max_market_usdc cap reached · ${bound} · token=${digest.tokenId}`,
           digest,
           txHash,
           cfg,
@@ -1858,7 +1905,7 @@ export async function executeCopyTrade(
       if (clippedUsdc > remaining) {
         if (remaining < cfg.minPositionUsdc) {
           await logCopySkip(
-            `max_market_usdc remaining $${remaining.toFixed(2)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+            `max_market_usdc remaining $${remaining.toFixed(2)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · ${bound} · token=${digest.tokenId}`,
             digest,
             txHash,
             cfg,
@@ -2195,12 +2242,12 @@ export async function executeCopyTrade(
   // collectively exceed the cap. Only reached after all skip checks, so a copy that bails
   // earlier never reserves; the sole refund path is a post that throws (below).
   let reservedUsdc = 0;
-  if (digest.side === "buy" && cfg.maxMarketUsdc !== undefined) {
-    const alreadySpent = getSideSpent(cfg.targetAddress, digest.tokenId);
-    const remaining = cfg.maxMarketUsdc - alreadySpent;
+  if (digest.side === "buy" && marketUsdcCapActive(cfg)) {
+    // Tighter of the per-target and account-wide (summed across targets) remaining capacity.
+    const { remaining, bound } = marketUsdcRemaining(cfg, digest.tokenId);
     if (remaining <= 0) {
       await logCopySkip(
-        `max_market_usdc cap reached · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+        `max_market_usdc cap reached · ${bound} · token=${digest.tokenId}`,
         digest,
         txHash,
         cfg,
@@ -2211,7 +2258,7 @@ export async function executeCopyTrade(
     if ((clippedUsdc ?? 0) > remaining) {
       if (remaining < cfg.minPositionUsdc) {
         await logCopySkip(
-          `max_market_usdc remaining $${remaining.toFixed(2)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+          `max_market_usdc remaining $${remaining.toFixed(2)} < MIN_POSITION_USDC ${cfg.minPositionUsdc} · ${bound} · token=${digest.tokenId}`,
           digest,
           txHash,
           cfg,
@@ -2223,7 +2270,7 @@ export async function executeCopyTrade(
       orderShares = clippedUsdc / limitPrice;
       if (orderShares < minOrder) {
         await logCopySkip(
-          `max_market_usdc clip → size ${orderShares.toFixed(4)} < min_order_size ${minOrder} · remaining $${remaining.toFixed(2)} spent=$${alreadySpent.toFixed(2)} cap=$${cfg.maxMarketUsdc} token=${digest.tokenId}`,
+          `max_market_usdc clip → size ${orderShares.toFixed(4)} < min_order_size ${minOrder} · remaining $${remaining.toFixed(2)} · ${bound} · token=${digest.tokenId}`,
           digest,
           txHash,
           cfg,
@@ -2232,7 +2279,8 @@ export async function executeCopyTrade(
         return;
       }
     }
-    // Commit the reservation — atomic w.r.t. the getSideSpent read above (no await between).
+    // Commit to THIS target's bucket — atomic w.r.t. the reads above (no await between). The commit
+    // raises both the per-target spend AND the account-wide sum (which is derived from all buckets).
     addSideSpent(cfg.targetAddress, digest.tokenId, clippedUsdc ?? 0);
     reservedUsdc = clippedUsdc ?? 0;
   }

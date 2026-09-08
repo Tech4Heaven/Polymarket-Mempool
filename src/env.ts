@@ -39,6 +39,12 @@ export type CopyTradeShared = {
   funderAddress?: string;
   polygonHttpUrl: string;
   clobHost: string;
+  /**
+   * Account-wide per-market USDC cap: the most USDC committed to a single outcome token summed across
+   * ALL targets on this wallet. Enforced ALONGSIDE each target's own max_market_usdc (whichever binds
+   * first). From env MAX_MARKET_USDC_ACCOUNT. Omit = no account-wide cap.
+   */
+  maxMarketUsdcAccount?: number;
 };
 
 /** Per-target sizing and dedicated copy-trade log path (absolute). */
@@ -227,6 +233,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     funderAddress: shared.funderAddress,
     polygonHttpUrl: shared.polygonHttpUrl,
     clobHost: shared.clobHost,
+    maxMarketUsdcAccount: shared.maxMarketUsdcAccount,
     copyRatio: p.copyRatio,
     maxPriceDifference: p.maxPriceDifference,
     maxUnderbidDifference: p.maxUnderbidDifference,
@@ -304,12 +311,23 @@ export async function loadCopyTradeSharedCredentials(): Promise<CopyTradeShared>
     process.env["POLYGON_HTTP_URL"]?.trim() || "https://polygon-bor.publicnode.com";
   const clobHost = process.env["CLOB_HOST"]?.trim() || "https://clob.polymarket.com";
 
+  const maxMarketUsdcAccountRaw = process.env["MAX_MARKET_USDC_ACCOUNT"]?.trim();
+  let maxMarketUsdcAccount: number | undefined;
+  if (maxMarketUsdcAccountRaw) {
+    const v = Number(maxMarketUsdcAccountRaw);
+    if (!Number.isFinite(v) || v <= 0) {
+      throw new Error("MAX_MARKET_USDC_ACCOUNT must be a positive number (account-wide per-market USDC cap)");
+    }
+    maxMarketUsdcAccount = v;
+  }
+
   return {
     privateKey: pk,
     signatureType,
     funderAddress,
     polygonHttpUrl,
     clobHost,
+    maxMarketUsdcAccount,
   };
 }
 
