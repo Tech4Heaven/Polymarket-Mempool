@@ -1,6 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyTakerBump, DEFAULT_MAX_TAKER_BUMP_FRAC, proportionalSellShares, idealHedgeSize } from "./copyTrade.js";
+import {
+  applyTakerBump,
+  DEFAULT_MAX_TAKER_BUMP_FRAC,
+  proportionalSellShares,
+  idealHedgeSize,
+  postOnlyBuyPrice,
+} from "./copyTrade.js";
+import type { TickSize } from "@polymarket/clob-client-v2";
+
+const T01 = "0.01" as TickSize;
+const T001 = "0.001" as TickSize;
+
+test("postOnlyBuyPrice: one tick below ask", () => {
+  const p = postOnlyBuyPrice(0.58, T01);
+  assert.ok(p !== null && Math.abs(p - 0.57) < 1e-9, `got ${p}`);
+});
+
+test("postOnlyBuyPrice: rejects when ask is one tick (no room below)", () => {
+  assert.equal(postOnlyBuyPrice(0.01, T01), null);
+});
+
+test("postOnlyBuyPrice: respects buy_price_min / buy_price_max", () => {
+  assert.equal(postOnlyBuyPrice(0.2, T01, 0.25, 0.5), null); // 0.19 < min
+  assert.equal(postOnlyBuyPrice(0.6, T01, 0.01, 0.5), null); // 0.59 > max
+  const ok = postOnlyBuyPrice(0.4, T01, 0.01, 0.5);
+  assert.ok(ok !== null && Math.abs(ok - 0.39) < 1e-9, `got ${ok}`);
+});
+
+test("postOnlyBuyPrice: fine tick", () => {
+  const p = postOnlyBuyPrice(0.123, T001);
+  assert.ok(p !== null && Math.abs(p - 0.122) < 1e-9, `got ${p}`);
+});
 
 test("hedge size: percent 1.0 fully balances (100 main, 0 held → 100)", () => {
   assert.equal(idealHedgeSize(100, 0, 1), 100);
@@ -37,10 +68,6 @@ test("proportional sell: fraction clamped to 1 if target sold ≥ held", () => {
 test("proportional sell: zero/negative target holding → full exit", () => {
   assert.equal(proportionalSellShares(10, 0, 90), 90);
 });
-import type { TickSize } from "@polymarket/clob-client-v2";
-
-const T01 = "0.01" as TickSize; // 1¢ tick
-const T001 = "0.001" as TickSize; // 0.1¢ tick
 
 // helper: base limit is roundUp(ask) at the tick (what the code passes in)
 const base = (ask: number, tick: TickSize) => applyTakerBump(ask, ask, tick, undefined, undefined);

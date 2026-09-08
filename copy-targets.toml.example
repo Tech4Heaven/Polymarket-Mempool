@@ -7,6 +7,9 @@
 copy_ratio = 1
 # Overbid skip: when effective ask > target's implied by more than this, skip the copy
 # (market moved up faster than us — we'd pay too much).
+# For order_type = "maker": also used while a resting maker bid is open — every ~1s the bot
+# checks fill status; if unfilled it reprices to ask−1 tick; if the live ask drifts above
+# implied by more than this, the resting order is cancelled.
 max_price_difference = 0.1
 # Underbid skip (optional): when effective ask < target's implied by more than this, skip the copy
 # (market re-priced AWAY from target's side in the gap between their fill and ours — strong
@@ -85,6 +88,11 @@ max_position_usdc = 100
 # Applied after the drift check; buy_price_max still caps the final price.
 # taker_bump = 0.02
 # max_taker_bump_frac = 0.10
+# Order style for copy posts (per target or defaults):
+#   order_type = "maker" | "post_only" — GTC post-only at ask−1 tick on live crypto 5m/15m/1h only
+#                 (slug discovery + ask cache, same pattern as speed-outcome-entry). Non-5m/15m/1h skipped.
+#   order_type = "taker" | omit — legacy GTC; use taker_bump / sell_bump to cross.
+# order_type = "maker"
 # Master enable/disable for the row. When false, the bot does NOTHING for this address — no copy,
 # no mempool match, no withdrawal poll. Default true. Handy to temporarily pause a target without
 # deleting its config.

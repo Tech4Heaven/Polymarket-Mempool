@@ -16,6 +16,7 @@ import { buildDigestsFromSettlement } from "./settlementDigest.js";
 import { aggregatePusdForTargets } from "./pusdTransfers.js";
 import { startWithdrawalWatcher } from "./withdrawalWatcher.js";
 import { startCryptoMarketPrewarm, isCryptoCacheReady } from "./cryptoMarketPrewarm.js";
+import { startCryptoLiveMarkets, isCryptoLiveMarketsReady } from "./cryptoLiveMarkets.js";
 
 function formatLogErr(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -205,6 +206,36 @@ async function main() {
     console.warn(
       "crypto market cache NOT ready at boot (gamma slow/unreachable) — market filters pass through until it warms; background refresh continues"
     );
+  }
+
+  // Maker targets need live 5m/15m/1h slug discovery + ask cache (speed-outcome-entry pattern).
+  const makerAssets = [
+    ...new Set(
+      [...config.targetCopyProfiles.values()]
+        .filter((p) => p.orderType === "maker")
+        .flatMap((p) => p.marketFilter ?? [])
+    ),
+  ];
+  const anyMaker = [...config.targetCopyProfiles.values()].some((p) => p.orderType === "maker");
+  if (anyMaker) {
+    await Promise.race([
+      startCryptoLiveMarkets(makerAssets.length > 0 ? { assets: makerAssets } : undefined),
+      new Promise<void>((r) => {
+        const t = setTimeout(r, 8000);
+        t.unref();
+      }),
+    ]);
+    if (!isCryptoLiveMarketsReady()) {
+      console.warn(
+        "crypto live 5m/15m/1h cache NOT ready at boot — maker copies will skip until markets hydrate; background refresh continues"
+      );
+    } else {
+      console.info(
+        `maker order_type enabled for ${
+          [...config.targetCopyProfiles.values()].filter((p) => p.orderType === "maker").length
+        } target(s) · live 5m/15m/1h ask cache active`
+      );
+    }
   }
 
   if (config.copyTradeShared) {

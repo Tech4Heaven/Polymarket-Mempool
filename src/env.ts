@@ -123,6 +123,11 @@ export type TargetCopyParams = {
   newWalletMinUsd?: number;
   /** Protective take-profit: after each copied buy fills, rest a GTC SELL of it at this price (0,1). */
   safeSell?: number;
+  /**
+   * Copy post style. `"maker"` = GTC post-only at ask−1 tick on live crypto 5m/15m/1h only.
+   * `"taker"` / undefined = legacy GTC (optional taker_bump / sell_bump).
+   */
+  orderType?: "maker" | "taker";
   copyTradeLogPath: string;
 };
 
@@ -175,6 +180,8 @@ export type CopyTradeConfig = CopyTradeShared & {
   newWalletMinUsd?: number;
   /** Per-target protective take-profit price (0,1): rest a GTC sell of each copied buy here. */
   safeSell?: number;
+  /** Per-target copy post style (`maker` = post-only ask−1 tick on 5m/15m/1h crypto). */
+  orderType?: "maker" | "taker";
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -262,6 +269,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     newWallet: p.newWallet,
     newWalletMinUsd: p.newWalletMinUsd,
     safeSell: p.safeSell,
+    orderType: p.orderType,
     targetAddress: p.address,
     username: p.username,
     copyTradeLogPath: p.copyTradeLogPath,
@@ -668,6 +676,20 @@ export async function loadAppConfig(): Promise<AppConfig> {
           throw new Error(`targets ${row.address}: safe_sell and hedge_price can't be combined on one target (both manage the position's protective order)`);
         }
 
+        const orderTypeRaw = (row.order_type ?? defaults.order_type)?.trim().toLowerCase();
+        let orderType: "maker" | "taker" | undefined;
+        if (orderTypeRaw !== undefined && orderTypeRaw.length > 0) {
+          if (orderTypeRaw === "maker" || orderTypeRaw === "post_only" || orderTypeRaw === "postonly") {
+            orderType = "maker";
+          } else if (orderTypeRaw === "taker" || orderTypeRaw === "gtc") {
+            orderType = "taker";
+          } else {
+            throw new Error(
+              `targets ${row.address}: order_type must be "maker" (or post_only) or "taker" (got ${JSON.stringify(row.order_type ?? defaults.order_type)})`
+            );
+          }
+        }
+
         targetCopyProfiles.set(row.address, {
           address: row.address,
           username: row.username,
@@ -699,6 +721,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           newWallet,
           newWalletMinUsd,
           safeSell,
+          orderType,
           copyTradeLogPath,
         });
       }
