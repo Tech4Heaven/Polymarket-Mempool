@@ -20,7 +20,7 @@ import { appendLedger, readLedger, type LedgerRecord } from "./orderLedger.js";
 import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { lookupCryptoMarket, resolveMarketLabelsFast } from "./cryptoMarketPrewarm.js";
-import { lookupLiveCryptoToken } from "./cryptoLiveMarkets.js";
+import { lookupLiveCryptoToken, refreshLiveCryptoTokenBook } from "./cryptoLiveMarkets.js";
 import { registerSimOrder } from "./fillSim.js";
 
 function aggregateOutcomeByTokenId(rows: Ctf1155TransferRow[]): Map<string, bigint> {
@@ -180,6 +180,11 @@ function postErrorMessage(resp: unknown): string | null {
     return `HTTP ${r.status}`;
   }
   return null;
+}
+
+/** Post-only buy rejected because the bid would take the ask (stale ask / book moved). */
+function isPostOnlyCrossesBook(err: string): boolean {
+  return /crosses book/i.test(err);
 }
 
 /**
@@ -2520,16 +2525,85 @@ export async function executeCopyTrade(
   // A rejected order (error / 4xx in the response, not a throw) is NOT on the book — do not log it as
   // "posted", do not record it for P&L, and release the max_market_usdc reservation so a rejection
   // can't permanently consume the cap.
-  const postErr = postErrorMessage(resp);
+  //
+  // Maker post-only exception: "order crosses book" usually means the live ask was 1+ ticks stale.
+  // Force-refresh that token in the live market cache, recompute ask−1 tick, retry a few times.
+  let postErr = postErrorMessage(resp);
+  let crossRetryNote = "";
+  const MAKER_CROSS_RETRIES = 3;
+  if (
+    postErr &&
+    isMaker &&
+    postOnly &&
+    digest.side === "buy" &&
+    isPostOnlyCrossesBook(postErr)
+  ) {
+    for (let attempt = 1; attempt <= MAKER_CROSS_RETRIES && postErr && isPostOnlyCrossesBook(postErr); attempt++) {
+      const refreshed = await refreshLiveCryptoTokenBook(digest.tokenId);
+      const freshAsk = refreshed?.bestAsk ?? lookupLiveCryptoToken(digest.tokenId)?.bestAsk ?? null;
+      if (freshAsk === null || !(freshAsk > 0)) {
+        crossRetryNote += ` cross-retry${attempt}-no-ask`;
+        break;
+      }
+      const drift = freshAsk - effectiveImplied;
+      if (drift > cfg.maxPriceDifference) {
+        crossRetryNote += ` cross-retry${attempt}-drift ask=${freshAsk.toFixed(4)} drift=${drift.toFixed(4)}`;
+        break;
+      }
+      let freshPx = postOnlyBuyPrice(freshAsk, postTick, cfg.buyPriceMin, cfg.buyPriceMax);
+      // Live ask still implies the same bid that just crossed → step one more tick under it.
+      if (freshPx !== null && Math.abs(freshPx - postPrice) < 1e-12) {
+        const t = parseFloat(postTick);
+        const stepped = roundToTick(postPrice - t, postTick, "down");
+        if (
+          stepped > 0 &&
+          stepped < freshAsk &&
+          (cfg.buyPriceMin === undefined || stepped >= cfg.buyPriceMin) &&
+          (cfg.buyPriceMax === undefined || stepped <= cfg.buyPriceMax)
+        ) {
+          freshPx = stepped;
+        }
+      }
+      if (freshPx === null) {
+        crossRetryNote += ` cross-retry${attempt}-no-px ask=${freshAsk.toFixed(4)}`;
+        break;
+      }
+      const prev = postPrice;
+      try {
+        resp = await postOnce(freshPx, postTick);
+      } catch {
+        crossRetryNote += ` cross-retry${attempt}-throw`;
+        break;
+      }
+      postPrice = freshPx;
+      limitPrice = freshPx;
+      postErr = postErrorMessage(resp);
+      crossRetryNote += ` cross-retry${attempt} ${prev.toFixed(4)}→${freshPx.toFixed(4)}(ask=${freshAsk.toFixed(4)} askSrc=cache)`;
+      if (!postErr) {
+        crossRetryNote += ` ok`;
+        break;
+      }
+    }
+  }
+
   if (postErr) {
     if (reservedUsdc > 0) {
       addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
     }
     const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
-    const fmsg = `copy REJECTED · ${digest.side} shares=${orderShares} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} tick=${postTick} · error=${JSON.stringify(postErr)} · tx=${txHash}${targetTag(cfg)}`;
+    const fmsg =
+      `copy REJECTED · ${digest.side} shares=${orderShares} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)}` +
+      ` · limit=${limitPrice} tick=${postTick} · error=${JSON.stringify(postErr)}` +
+      `${crossRetryNote ? ` ·${crossRetryNote}` : ""} · tx=${txHash}${targetTag(cfg)}`;
     console.warn(fmsg);
     void appendCopyTradeSuccessLine(fmsg, cfg.copyTradeLogPath);
     return;
+  }
+
+  if (crossRetryNote) {
+    const note = `maker cross-book retry succeeded ·${crossRetryNote} · tx=${txHash}${targetTag(cfg)}`;
+    console.info(note);
+    void appendCopyTradeSuccessLine(note, cfg.copyTradeLogPath);
   }
 
   // Actual fill from the CLOB response. The labels flip by side:
@@ -2734,17 +2808,31 @@ export async function executeCopyTrade(
         continue;
       }
 
-      // Ask moved → cancel and reprice the unfilled remainder at the new maker bid.
+      // Ask moved → refresh live monitor ask, then cancel+replace. Never abandon the book on a
+      // transient post-only reject (that left filled=0 on btc-updown-5m-1789010400).
+      const refreshed = await refreshLiveCryptoTokenBook(digest.tokenId);
+      const refreshAsk = refreshed?.bestAsk ?? freshAsk;
+      let replacePx = postOnlyBuyPrice(refreshAsk, postTick, cfg.buyPriceMin, cfg.buyPriceMax);
+      if (replacePx === null) {
+        replacePx = freshMakerPx;
+      }
+      // Still same as resting → nothing to do this tick.
+      if (Math.abs(replacePx - postPrice) < tickNum / 2) {
+        continue;
+      }
+
+      const prevPrice = postPrice;
+      const prevOrderId = restingOrderId;
       try {
         await client.cancelOrder({ orderID: restingOrderId });
       } catch {
         break;
       }
       // Re-read match in case a fill landed between the poll and cancel.
-      const matchedAfter = await readOrderMatched(client, restingOrderId);
+      const matchedAfter = await readOrderMatched(client, prevOrderId);
       if (matchedAfter !== null && matchedAfter > restingFillShares) {
         restingFillShares = matchedAfter;
-        restingFillUsdc = matchedAfter * postPrice;
+        restingFillUsdc = matchedAfter * prevPrice;
       }
       terminalFillShares += restingFillShares;
       terminalFillUsdc += restingFillUsdc;
@@ -2758,25 +2846,86 @@ export async function executeCopyTrade(
         break;
       }
 
-      let rp;
-      try {
-        rp = await postOnce(freshMakerPx, postTick, remaining);
-      } catch {
-        makerLoopNote += ` reprice-throw`;
-        break;
+      const MAKER_REPRICE_POST_RETRIES = 3;
+      let rp: unknown = null;
+      let postedPx = replacePx;
+      let replaceOk = false;
+      for (let attempt = 1; attempt <= MAKER_REPRICE_POST_RETRIES; attempt++) {
+        let tryAsk = refreshAsk;
+        if (attempt > 1) {
+          const again = await refreshLiveCryptoTokenBook(digest.tokenId);
+          tryAsk = again?.bestAsk ?? tryAsk;
+          let nextPx = postOnlyBuyPrice(tryAsk, postTick, cfg.buyPriceMin, cfg.buyPriceMax);
+          if (nextPx !== null && Math.abs(nextPx - postedPx) < 1e-12) {
+            const stepped = roundToTick(postedPx - tickNum, postTick, "down");
+            if (
+              stepped > 0 &&
+              stepped < tryAsk &&
+              (cfg.buyPriceMin === undefined || stepped >= cfg.buyPriceMin) &&
+              (cfg.buyPriceMax === undefined || stepped <= cfg.buyPriceMax)
+            ) {
+              nextPx = stepped;
+            }
+          }
+          if (nextPx === null) {
+            makerLoopNote += ` reprice-retry${attempt}-no-px`;
+            break;
+          }
+          const drift2 = tryAsk - effectiveImplied;
+          if (drift2 > cfg.maxPriceDifference) {
+            makerLoopNote += ` reprice-retry${attempt}-drift`;
+            break;
+          }
+          postedPx = nextPx;
+        }
+        try {
+          rp = await postOnce(postedPx, postTick, remaining);
+        } catch {
+          makerLoopNote += ` reprice-throw`;
+          rp = null;
+          break;
+        }
+        const err = postErrorMessage(rp);
+        if (!err) {
+          replaceOk = true;
+          if (attempt > 1) {
+            makerLoopNote += ` reprice-retry${attempt}-ok`;
+          }
+          break;
+        }
+        if (!isPostOnlyCrossesBook(err)) {
+          makerLoopNote += ` reprice-reject`;
+          break;
+        }
+        makerLoopNote += ` reprice-cross${attempt}`;
       }
-      if (postErrorMessage(rp)) {
-        makerLoopNote += ` reprice-reject`;
-        break;
+
+      // Replacement failed → try to put the old maker bid back so we don't sit flat.
+      if (!replaceOk) {
+        try {
+          rp = await postOnce(prevPrice, postTick, remaining);
+          if (!postErrorMessage(rp)) {
+            postedPx = prevPrice;
+            replaceOk = true;
+            makerLoopNote += ` reprice-restore@${prevPrice.toFixed(4)}`;
+          } else {
+            makerLoopNote += ` reprice-reject-abandoned`;
+            break;
+          }
+        } catch {
+          makerLoopNote += ` reprice-reject-abandoned`;
+          break;
+        }
       }
+
       const rpObj = rp as { takingAmount?: string; makingAmount?: string; orderID?: string };
       restingOrderId = rpObj.orderID ?? "";
       restingPosted = remaining;
       restingFillShares = parseFloat(rpObj.takingAmount ?? "0") || 0;
       restingFillUsdc = parseFloat(rpObj.makingAmount ?? "0") || 0;
       resp = rp;
-      postPrice = freshMakerPx;
-      limitPrice = freshMakerPx;
+      postPrice = postedPx;
+      limitPrice = postedPx;
       postedResps.push(rp);
       repriced++;
     }

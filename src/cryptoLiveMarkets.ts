@@ -8,6 +8,8 @@
  * Resolve token IDs via Gamma `GET /markets/slug/{slug}`, then keep best asks
  * fresh via CLOB REST `/book`.
  *
+ * Window coverage (all intervals): current + next.
+ *
  * Used by `order_type = "maker"` copy targets so PolyNode fires can price from a
  * pre-warmed ask without a cold gamma lookup, and so non-5m/15m/1h markets are skipped.
  */
@@ -258,6 +260,41 @@ export function listLiveCryptoTokens(): LiveCryptoTokenInfo[] {
   return [...cache.values()];
 }
 
+/**
+ * Force-refresh one token's ask/bid in the live monitor cache (same `/book` source as the
+ * background poll). Used when a maker post-only crosses — reprice off an updated cache entry
+ * rather than a separate CLOB client path.
+ */
+export async function refreshLiveCryptoTokenBook(
+  tokenId: string
+): Promise<LiveCryptoTokenInfo | undefined> {
+  const key = normalizeTokenKey(tokenId);
+  const cur = cache.get(key);
+  if (!cur) {
+    return undefined;
+  }
+  try {
+    const { bestAsk, bestBid, minOrderSize } = await fetchClobBook(key);
+    const latest = cache.get(key);
+    if (!latest) {
+      return undefined;
+    }
+    if (bestAsk !== undefined) {
+      latest.bestAsk = bestAsk;
+    }
+    if (bestBid !== undefined) {
+      latest.bestBid = bestBid;
+    }
+    if (minOrderSize !== undefined) {
+      latest.minOrderSize = minOrderSize;
+    }
+    latest.updatedAtMs = Date.now();
+    return latest;
+  } catch {
+    return cache.get(key);
+  }
+}
+
 type DiscoverWindow = {
   asset: string;
   interval: MarketInterval;
@@ -318,7 +355,14 @@ function ingestMarket(
   row: GammaMarketRow,
   nowMs: number
 ): void {
-  if (row.closed === true || row.acceptingOrders === false || row.enableOrderBook === false) {
+  // Pre-open / upcoming windows may briefly report acceptingOrders=false before the book
+  // lights up — still cache token IDs so maker copies on the next candle resolve instantly.
+  // Skip only truly dead markets (closed / no order book) or ended windows.
+  if (row.closed === true || row.enableOrderBook === false) {
+    return;
+  }
+  const notStartedYet = nowMs < win.start * 1000;
+  if (row.acceptingOrders === false && !notStartedYet) {
     return;
   }
   const tokenIds = parseJsonStringArray(row.clobTokenIds);
@@ -391,9 +435,17 @@ async function discoverOnce(): Promise<void> {
       for (const v of next.values()) {
         byIv[v.interval]++;
       }
+      const btc5m = [
+        ...new Set(
+          [...next.values()]
+            .filter((v) => v.asset === "btc" && v.interval === "5m")
+            .map((v) => v.slug)
+        ),
+      ].sort();
       console.info(
         `crypto live 5m/15m/1h cache ready · ${next.size} tokens · ${slugs.length} markets` +
-          ` · 5m=${byIv["5m"] / 2} 15m=${byIv["15m"] / 2} 1h=${byIv["1h"] / 2}`
+          ` · 5m=${byIv["5m"] / 2} 15m=${byIv["15m"] / 2} 1h=${byIv["1h"] / 2}` +
+          (btc5m.length ? ` · btc5m=[${btc5m.join(", ")}]` : "")
       );
     }
   }
