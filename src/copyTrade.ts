@@ -2808,8 +2808,9 @@ export async function executeCopyTrade(
         continue;
       }
 
-      // Ask moved → refresh live monitor ask, then cancel+replace. Never abandon the book on a
-      // transient post-only reject (that left filled=0 on btc-updown-5m-1789010400).
+      // Ask moved → refresh live monitor ask, then cancel+replace.
+      // Critical: re-read size_matched BEFORE cancel. After cancel, getOrder often returns null —
+      // treating that as 0 fill and reposting full orderShares doubles the buy (~2× vs copy_ratio).
       const refreshed = await refreshLiveCryptoTokenBook(digest.tokenId);
       const refreshAsk = refreshed?.bestAsk ?? freshAsk;
       let replacePx = postOnlyBuyPrice(refreshAsk, postTick, cfg.buyPriceMin, cfg.buyPriceMax);
@@ -2823,17 +2824,34 @@ export async function executeCopyTrade(
 
       const prevPrice = postPrice;
       const prevOrderId = restingOrderId;
+      const matchedPreCancel = await readOrderMatched(client, prevOrderId);
+      if (matchedPreCancel !== null) {
+        restingFillShares = matchedPreCancel;
+        restingFillUsdc = matchedPreCancel * prevPrice;
+      }
+      if (orderShares - terminalFillShares - restingFillShares < minOrder) {
+        // Already filled enough while deciding to reprice — leave resting order alone.
+        continue;
+      }
+
       try {
-        await client.cancelOrder({ orderID: restingOrderId });
+        await client.cancelOrder({ orderID: prevOrderId });
       } catch {
+        // Cancel failed → may have just filled; stop rather than posting a second size.
         break;
       }
-      // Re-read match in case a fill landed between the poll and cancel.
+      await new Promise((r) => setTimeout(r, 50));
+
       const matchedAfter = await readOrderMatched(client, prevOrderId);
-      if (matchedAfter !== null && matchedAfter > restingFillShares) {
-        restingFillShares = matchedAfter;
-        restingFillUsdc = matchedAfter * prevPrice;
-      }
+      // null after cancel = unknown. Prefer pre-cancel match; never invent 0 and double-post.
+      const filledOnCancelled =
+        matchedAfter !== null
+          ? matchedAfter
+          : matchedPreCancel !== null
+            ? matchedPreCancel
+            : restingFillShares;
+      restingFillShares = filledOnCancelled;
+      restingFillUsdc = filledOnCancelled * prevPrice;
       terminalFillShares += restingFillShares;
       terminalFillUsdc += restingFillUsdc;
       restingOrderId = "";
@@ -2843,6 +2861,10 @@ export async function executeCopyTrade(
 
       const remaining = orderShares - terminalFillShares;
       if (remaining < minOrder) {
+        break;
+      }
+      if (matchedAfter === null && matchedPreCancel === null) {
+        makerLoopNote += ` reprice-skip-unknown-match`;
         break;
       }
 
