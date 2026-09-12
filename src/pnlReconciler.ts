@@ -17,7 +17,8 @@ import { isTelegramEnabled, sendTelegram, tgCode, tgEsc } from "./telegram.js";
  * CRITICAL: fills come from the TRUE, final fill of each order — NOT the ledger's post-time fill. A
  * resting order shows `filled=0` at post time but often fills seconds/minutes later; the ledger never
  * sees that. So for every ledger order we look up its real `size_matched` via the CLOB by `orderId`
- * (`client.getOrder`). If that lookup is unavailable, we fall back to the wallet's on-chain trades for
+ * (`client.getOrder`), keeping the post-time USDC actually paid and pricing only later fills at the
+ * order price (see `trueFillUsdc`). If that lookup is unavailable, we fall back to the wallet's on-chain trades for
  * the whole condition (data-api). Either way the numbers reflect what actually filled and redeemed.
  *
  * P&L per (target, condition):
@@ -266,8 +267,24 @@ export function computeTargetPnl(
 }
 
 /**
- * Replace each record's post-time fill with its TRUE final fill from the CLOB (`getOrder.size_matched`).
- * Cost per order ≈ matched × order price (marketable copies fill at/near their limit). Returns null if
+ * USDC for an order's TRUE final fill of `matched` shares. The part filled at post time keeps the CLOB
+ * response's actual amount (`postUsdc`): a marketable order sweeps the book at or BELOW its limit, so
+ * pricing it at the limit overstated cost by roughly the taker bump (~2% of volume). Only shares matched
+ * AFTER posting are priced at `orderPrice` — a resting order fills as maker at exactly its own price.
+ */
+export function trueFillUsdc(postShares: number, postUsdc: number, matched: number, orderPrice: number): number {
+  if (postShares <= 0 || postUsdc <= 0) {
+    return matched * orderPrice;
+  }
+  if (matched <= postShares) {
+    return postUsdc * (matched / postShares); // CLOB reports less than post time — scale the actual amount
+  }
+  return postUsdc + (matched - postShares) * orderPrice;
+}
+
+/**
+ * Replace each record's post-time fill with its TRUE final fill from the CLOB (`getOrder.size_matched`),
+ * costed by `trueFillUsdc` (actual post-time amount + late fills at the order price). Returns null if
  * any order can't be looked up, so the caller can fall back to the on-chain condition total.
  */
 async function correctFillsViaOrders(client: ClobClient, records: LedgerRecord[]): Promise<LedgerRecord[] | null> {
@@ -278,7 +295,7 @@ async function correctFillsViaOrders(client: ClobClient, records: LedgerRecord[]
       const matched = parseFloat(o.size_matched ?? "0") || 0;
       const p = parseFloat(o.price ?? "");
       const price = Number.isFinite(p) && p > 0 ? p : r.limitPrice;
-      out.push({ ...r, filledShares: matched, filledUsdc: matched * price });
+      out.push({ ...r, filledShares: matched, filledUsdc: trueFillUsdc(r.filledShares, r.filledUsdc, matched, price) });
     } catch {
       return null; // order not queryable → fall back to on-chain for the whole condition
     }
