@@ -123,6 +123,8 @@ export type TargetCopyParams = {
   newWalletMinUsd?: number;
   /** Protective take-profit: after each copied buy fills, rest a GTC SELL of it at this price (0,1). */
   safeSell?: number;
+  /** Copy only the target's first (main) outcome per market; skip the opposite (hedge) side. */
+  mainSideOnly?: boolean;
   copyTradeLogPath: string;
 };
 
@@ -175,6 +177,8 @@ export type CopyTradeConfig = CopyTradeShared & {
   newWalletMinUsd?: number;
   /** Per-target protective take-profit price (0,1): rest a GTC sell of each copied buy here. */
   safeSell?: number;
+  /** Per-target: copy only the first (main) outcome per market; skip the opposite (hedge) side. */
+  mainSideOnly?: boolean;
   /**
    * Target wallet address (checksum). Needed so per-target trackers (max_market_usdc, etc.)
    * can attribute spend to the right target across the shared copy wallet.
@@ -262,6 +266,7 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     newWallet: p.newWallet,
     newWalletMinUsd: p.newWalletMinUsd,
     safeSell: p.safeSell,
+    mainSideOnly: p.mainSideOnly,
     targetAddress: p.address,
     username: p.username,
     copyTradeLogPath: p.copyTradeLogPath,
@@ -699,6 +704,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
           newWallet,
           newWalletMinUsd,
           safeSell,
+          mainSideOnly: row.main_side_only ?? defaults.main_side_only,
           copyTradeLogPath,
         });
       }

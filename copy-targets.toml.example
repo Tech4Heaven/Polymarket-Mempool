@@ -44,6 +44,9 @@ max_position_usdc = 100
 # (Up and Down each get their own bucket — total per market can reach 2× this value).
 # Buys are clipped to fit; full sells reset the side. Omit = no cap.
 # max_market_usdc = 100
+# ACCOUNT-WIDE per-market cap (env, not toml): set MAX_MARKET_USDC_ACCOUNT in .env to cap the combined
+# USDC on a single outcome token summed across ALL targets on this wallet. Enforced alongside each
+# target's max_market_usdc (whichever binds first). Omit = no account-wide cap.
 # Whether the withdrawal watcher polls this wallet for fund outflows (alerts if funds drain out —
 # a sign the trader may be rotating to a new address). Default false — opt in per target.
 # watch_withdrawals = true
@@ -85,6 +88,47 @@ max_position_usdc = 100
 # Applied after the drift check; buy_price_max still caps the final price.
 # taker_bump = 0.02
 # max_taker_bump_frac = 0.10
+# Sell fill improvement — the EXIT mirror of taker_bump. Make copied sells cross BELOW the bid and fill
+# instead of resting on a bid that can vanish in fast markets (which would leave you holding a position
+# the target already sold). Omit/0 = maker-style (post at the top bid).
+#   sell_bump:          price subtracted BELOW the best bid (0-1 units; 0.02 = 2 cents).
+#   max_sell_bump_frac: caps the bump to this fraction of the bid (default 0.10). Tick-aware.
+# sell_bump = 0.02
+# max_sell_bump_frac = 0.10
+# Reprice-until-filled for sells. If a copied sell still rests unfilled, cancel the remainder and
+# re-post at a fresh aggressive price, chasing the market down until filled / out of attempts / past the
+# deadline / below the slippage floor (then the remainder is abandoned rather than dumped at any price).
+#   sell_reprice_attempts:    max reprice cycles (0/omit = disabled; the sell posts once).
+#   sell_reprice_deadline_ms: stop repricing this many ms after the first post (default 2500).
+#   sell_max_slippage_frac:   never reprice below implied × (1 - this). Omit = no floor (chase to book).
+# sell_reprice_attempts = 4
+# sell_reprice_deadline_ms = 2500
+# sell_max_slippage_frac = 0.15
+# Restrict copying to specific crypto "Up or Down" assets (ALLOWLIST). A single asset or a list; values
+# match the market slug prefix, long names aliased (bitcoin→btc, ethereum→eth, …). When set, trades on
+# any other asset — and any non-crypto market — are skipped (a cache miss is skipped too). Resolved
+# network-free from a background cache (no gamma call on the copy path). Omit = copy every market.
+# market = "btc"                  # or:  market = ["btc", "eth"]
+# Fresh-wallet bait guard. Skips a target's small "test" positions until he opens a real one: his spend
+# is tallied PER market and every trade in a market whose running total stays below new_wallet_min_usd
+# is skipped — across every market — until SOME market reaches the threshold (proof he's really trading),
+# after which all his trades copy normally. Defeats the "open a tiny position to lure copiers, then
+# withdraw" tactic. Persisted across restarts. Uses HIS spend, not your copy size (copy_ratio doesn't
+# affect it). Omit/false = copy from the first trade.
+#   new_wallet_min_usd: USD threshold that marks a market as "real" (default 150).
+# new_wallet = true
+# new_wallet_min_usd = 150
+# Protective take-profit. After each copied BUY fills, rest a GTC SELL of that position at this price
+# (0,1) — typically 0.99. A maker order (no fee) that locks the value if the price spikes there, dodging
+# the 99¢→1¢ flip at resolution. If the target sells first, the resting order is cancelled and his sell
+# is copied. Cannot be combined with hedge_price (both manage the position's protective order). Omit = off.
+# safe_sell = 0.99
+# Copy only the target's MAIN side. Some traders buy BOTH outcomes of a market (a self-hedge); copying
+# both guarantees a losing leg. When true, copy the FIRST outcome he buys in each market and SKIP any buy
+# on the opposite outcome (his hedge/second leg) — a clean directional copy. Pair with hedge_price to add
+# your OWN protective hedge instead of mirroring his. Persisted per market across restarts. Omit/false =
+# copy both sides.
+# main_side_only = true
 # Master enable/disable for the row. When false, the bot does NOTHING for this address — no copy,
 # no mempool match, no withdrawal poll. Default true. Handy to temporarily pause a target without
 # deleting its config.

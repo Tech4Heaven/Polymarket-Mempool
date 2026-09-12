@@ -122,6 +122,13 @@ export type TomlDefaultsSection = {
    */
   safe_sell?: number;
   /**
+   * Copy only the target's MAIN side. Some traders buy BOTH outcomes of a market (a self-hedge);
+   * copying both guarantees a losing leg. When true, we copy the FIRST outcome the target buys in each
+   * market and SKIP any buy on the opposite outcome (his hedge/second leg) — a clean directional copy.
+   * Pair with hedge_price to add our own protective hedge instead. Omit/false to copy both sides.
+   */
+  main_side_only?: boolean;
+  /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
    */
@@ -160,6 +167,7 @@ export type TomlTargetRow = {
   new_wallet?: boolean;
   new_wallet_min_usd?: number;
   safe_sell?: number;
+  main_side_only?: boolean;
   enabled?: boolean;
 };
 
@@ -258,6 +266,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       new_wallet: boolOrUndef("new_wallet", src),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", src),
       safe_sell: numOrUndef("safe_sell", src),
+      main_side_only: boolOrUndef("main_side_only", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -309,6 +318,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       new_wallet: boolOrUndef("new_wallet", row),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", row),
       safe_sell: numOrUndef("safe_sell", row),
+      main_side_only: boolOrUndef("main_side_only", row),
       enabled: boolOrUndef("enabled", row),
     });
   }

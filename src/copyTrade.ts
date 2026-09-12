@@ -678,6 +678,77 @@ function marketUsdcCapActive(cfg: CopyTradeConfig): boolean {
   return cfg.maxMarketUsdc !== undefined || cfg.maxMarketUsdcAccount !== undefined;
 }
 
+// ── Main-side-only tracking ────────────────────────────────────────────────────────────────────
+// Records the FIRST outcome token a target buys in each market, so a later buy on the OPPOSITE outcome
+// (his self-hedge / second leg) can be skipped — copying only his main directional side. Persisted so a
+// restart mid-market doesn't flip which side we treat as "main"; TTL-pruned (5-min markets resolve fast).
+type MainSideEntry = { token: string; ts: number };
+const mainSideByTargetMarket = new Map<string, MainSideEntry>();
+let mainSideLoaded = false;
+const MAIN_SIDE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function mainSidePath(): string {
+  return process.env["MAIN_SIDE_STATE_PATH"]?.trim() || "logs/main-side.json";
+}
+function mainSideStateKey(target: string, marketKey: string): string {
+  return `${target.toLowerCase()}|${marketKey}`;
+}
+function ensureMainSideLoaded(): void {
+  if (mainSideLoaded) {
+    return;
+  }
+  mainSideLoaded = true;
+  try {
+    const obj = JSON.parse(readFileSync(mainSidePath(), "utf8")) as Record<string, MainSideEntry>;
+    const now = Date.now();
+    for (const [k, e] of Object.entries(obj)) {
+      if (e && typeof e.token === "string" && typeof e.ts === "number" && now - e.ts <= MAIN_SIDE_TTL_MS) {
+        mainSideByTargetMarket.set(k, e);
+      }
+    }
+  } catch {
+    // no file yet / unreadable → start empty
+  }
+}
+function persistMainSide(): void {
+  try {
+    const obj: Record<string, MainSideEntry> = {};
+    for (const [k, e] of mainSideByTargetMarket) {
+      obj[k] = e;
+    }
+    const p = mainSidePath();
+    const tmp = `${p}.tmp`;
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, p);
+  } catch {
+    // best effort
+  }
+}
+/** The main (first-bought) outcome token for a (target, market), or undefined if none recorded yet. */
+function getMainSide(target: string, marketKey: string): string | undefined {
+  ensureMainSideLoaded();
+  const k = mainSideStateKey(target, marketKey);
+  const e = mainSideByTargetMarket.get(k);
+  if (!e) {
+    return undefined;
+  }
+  if (Date.now() - e.ts > MAIN_SIDE_TTL_MS) {
+    mainSideByTargetMarket.delete(k);
+    return undefined;
+  }
+  return e.token;
+}
+/** Record `token` as the main side for (target, market) — first writer wins (idempotent). */
+function recordMainSide(target: string, marketKey: string, token: string): void {
+  ensureMainSideLoaded();
+  const k = mainSideStateKey(target, marketKey);
+  if (mainSideByTargetMarket.has(k)) {
+    return;
+  }
+  mainSideByTargetMarket.set(k, { token, ts: Date.now() });
+  persistMainSide();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Below-min accumulator — buffer per (target, tokenId) for `accumulate_below_min`
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1839,6 +1910,33 @@ export async function executeCopyTrade(
         { copyUsd: originPusd * cfg.copyRatio, implied }
       );
       return;
+    }
+  }
+
+  // Main-side-only: some targets buy BOTH outcomes of a market (a self-hedge), which guarantees a
+  // losing leg if copied whole. Copy only the FIRST outcome the target takes in each market; skip any
+  // buy on the opposite outcome (his hedge / second leg) — a clean directional copy. Pair with
+  // hedge_price to add our own protective hedge instead. Buys only (a sell of a side we never took
+  // finds no balance and no-ops). Market identity is the prewarm cache name (network-free for crypto),
+  // falling back to the conditionId (both outcomes share it) so Up/Down group correctly off-cache.
+  if (cfg.mainSideOnly && digest.side === "buy") {
+    const mkKey =
+      lookupCryptoMarket(digest.tokenId)?.event ??
+      (await resolveMarketTokens(digest.tokenId))?.conditionId ??
+      `token:${digest.tokenId}`;
+    const main = getMainSide(cfg.targetAddress, mkKey);
+    if (main !== undefined && main !== digest.tokenId) {
+      await logCopySkip(
+        `main-side-only · target's main side already taken (${main.slice(0, 12)}…) — skipping opposite (hedge) side · token=${digest.tokenId}`,
+        digest,
+        txHash,
+        cfg,
+        { copyUsd: originPusd * cfg.copyRatio, implied }
+      );
+      return;
+    }
+    if (main === undefined) {
+      recordMainSide(cfg.targetAddress, mkKey, digest.tokenId);
     }
   }
 
