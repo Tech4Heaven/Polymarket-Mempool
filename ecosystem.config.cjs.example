@@ -10,6 +10,13 @@
  * Stop:         pm2 stop bot
  * Restart:      pm2 restart bot   (reuses cached env; no re-prompt needed)
  * Delete:       pm2 delete bot    (next start needs ./start-bot.sh again)
+ *
+ * The `relay` app is the shared PolyNode fan-out (src/polynodeRelay.ts) — run it on ONE host only
+ * (the one whose .env has POLYNODE_API_KEY); every bot connects to it via POLYNODE_RELAY_URL. It
+ * needs no wallet passphrase, so start it on its own and BEFORE the bots:
+ *   pm2 start ecosystem.config.cjs --only relay
+ *   pm2 logs relay
+ * On hosts that only run bots (no key), delete the `relay` app entry below.
  */
 
 const path = require("path");
@@ -39,6 +46,30 @@ module.exports = {
         // your wallet has a different name; defaults inside the bot use euqoriueusu.json.
         // COPY_WALLET_KEY_JSON: "euqoriueusu.json",
         COPY_WALLET_KEY_PASSPHRASE: process.env.COPY_WALLET_KEY_PASSPHRASE,
+      },
+    },
+    {
+      // Shared PolyNode fan-out relay. Run on the key-holding host only (delete elsewhere).
+      name: "relay",
+      script: path.join(cwd, "node_modules", "tsx", "dist", "cli.mjs"),
+      args: "src/polynodeRelay.ts",
+      cwd,
+      interpreter: "node",
+      instances: 1,
+      exec_mode: "fork",
+      max_restarts: 50,
+      restart_delay: 5_000,
+      min_uptime: "30s",
+      out_file: path.join(cwd, "logs", "pm2-relay-out.log"),
+      error_file: path.join(cwd, "logs", "pm2-relay-err.log"),
+      merge_logs: true,
+      time: true,
+      max_memory_restart: "512M",
+      env: {
+        NODE_ENV: "production",
+        // Relay reads POLYNODE_API_KEY from .env. Optionally override listen host/port:
+        // POLYNODE_RELAY_PORT: "8787",
+        // POLYNODE_RELAY_HOST: "127.0.0.1",
       },
     },
   ],

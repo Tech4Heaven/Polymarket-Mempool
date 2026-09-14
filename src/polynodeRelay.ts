@@ -55,6 +55,17 @@ wss.on("listening", () => {
 });
 
 wss.on("error", (err) => {
+  // Port already bound = another relay is already running on this host. Exit LOUDLY rather than sit
+  // "online" but not listening (a silent duplicate that serves no clients). One relay per host: run it
+  // in the key-holding folder only; a new bot's ecosystem must NOT include the relay app.
+  const code = (err as NodeJS.ErrnoException)?.code;
+  if (code === "EADDRINUSE") {
+    console.error(
+      `[relay] port ${port} already in use — another relay is running on this host. ` +
+        `Only ONE relay is needed for the whole fleet. Not starting a second. Exiting.`
+    );
+    process.exit(1);
+  }
   console.error(`[relay] fan-out server error: ${err instanceof Error ? err.message : String(err)}`);
 });
 
