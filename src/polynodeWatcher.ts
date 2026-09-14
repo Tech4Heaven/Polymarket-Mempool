@@ -52,11 +52,18 @@ export function startPolynodeWatcher(
   onMatch: (m: PolynodeMatch) => void,
   onError: (err: unknown, context: string) => void
 ): PolynodeWatcher {
+  // Relay mode: when POLYNODE_RELAY_URL is set, connect to the LOCAL fan-out relay instead of PolyNode
+  // directly. The relay holds the single shared upstream connection (and the API key); this bot needs
+  // no key. Everything downstream — subscribe frame, local target matching, dedupe, heartbeat,
+  // reconnect — is identical, so the relay is a drop-in for the direct connection.
+  const relayUrl = config.polynodeRelayUrl;
   const apiKey = config.polynodeApiKey;
-  if (!apiKey) {
-    onError(new Error("POLYNODE_API_KEY missing"), "polynode config");
+  if (!relayUrl && !apiKey) {
+    onError(new Error("POLYNODE_API_KEY missing (or set POLYNODE_RELAY_URL to use the shared relay)"), "polynode config");
     return { stop: () => undefined, lastMessageAt: () => 0 };
   }
+  const endpointUrl = relayUrl ? relayUrl : `${WS_URL}?key=${apiKey}`;
+  const endpointDesc = relayUrl ? `relay ${relayUrl}` : "PolyNode";
 
   const targetsLower = new Set(config.targetTraderAddresses.map((a) => a.toLowerCase()));
   if (targetsLower.size === 0) {
@@ -183,9 +190,9 @@ export function startPolynodeWatcher(
       );
       armStability();
       if (wasReconnect) {
-        console.log(`[polynode] reconnected · resubscribed after ${attemptAtBind} attempt(s)`);
+        console.log(`[polynode] reconnected to ${endpointDesc} · resubscribed after ${attemptAtBind} attempt(s)`);
       } else {
-        console.log(`[polynode] connected · pending-settlement firehose · filtering ${targetsLower.size} target(s) locally`);
+        console.log(`[polynode] connected to ${endpointDesc} · pending-settlement firehose · filtering ${targetsLower.size} target(s) locally`);
       }
     });
 
@@ -250,7 +257,7 @@ export function startPolynodeWatcher(
     if (stopped || fatal) {
       return;
     }
-    ws = new WebSocket(`${WS_URL}?key=${apiKey}`, {
+    ws = new WebSocket(endpointUrl, {
       perMessageDeflate: false,
       handshakeTimeout: 10_000,
     });

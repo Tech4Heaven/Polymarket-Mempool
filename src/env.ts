@@ -212,8 +212,14 @@ export type AppConfig = {
   polygonMempoolHttpUrl: string;
   /** Detection strategy (default `both`). */
   detectionSource: DetectionSource;
-  /** PolyNode API key (`pn_live_...`); required when detectionSource includes PolyNode. */
+  /** PolyNode API key (`pn_live_...`); required when detectionSource includes PolyNode UNLESS relaying. */
   polynodeApiKey?: string;
+  /**
+   * Local fan-out relay URL (e.g. `ws://127.0.0.1:8787`). When set, the watcher connects here instead
+   * of directly to PolyNode — the relay holds the single shared upstream connection and the API key, so
+   * this deployment needs no POLYNODE_API_KEY. Omit = connect to PolyNode directly (legacy).
+   */
+  polynodeRelayUrl?: string;
   /** Trader wallets to watch in the mempool matcher. */
   targetTraderAddresses: string[];
   /** Subset of targets the withdrawal watcher polls (per-target `watch_withdrawals`, default false). */
@@ -421,6 +427,7 @@ function loadRpcOnly(): Pick<
   | "polygonMempoolHttpUrl"
   | "detectionSource"
   | "polynodeApiKey"
+  | "polynodeRelayUrl"
   | "exchangeAddresses"
   | "maxConcurrentTxLookups"
   | "withdrawalPollMinutes"
@@ -428,9 +435,11 @@ function loadRpcOnly(): Pick<
 > {
   const detectionSource = parseDetectionSource();
   const polynodeApiKey = process.env["POLYNODE_API_KEY"]?.trim() || undefined;
-  if ((detectionSource === "polynode" || detectionSource === "both") && !polynodeApiKey) {
+  const polynodeRelayUrl = process.env["POLYNODE_RELAY_URL"]?.trim() || undefined;
+  // With a relay, the bot needs no key (the relay holds the single shared upstream connection + key).
+  if ((detectionSource === "polynode" || detectionSource === "both") && !polynodeApiKey && !polynodeRelayUrl) {
     throw new Error(
-      `DETECTION_SOURCE=${detectionSource} requires POLYNODE_API_KEY (pn_live_...) in the environment`
+      `DETECTION_SOURCE=${detectionSource} requires POLYNODE_API_KEY (pn_live_...) or POLYNODE_RELAY_URL in the environment`
     );
   }
   // On-chain-only deployments don't need a Polygon WSS at all; require it otherwise.
@@ -459,6 +468,7 @@ function loadRpcOnly(): Pick<
     polygonMempoolHttpUrl,
     detectionSource,
     polynodeApiKey,
+    polynodeRelayUrl,
     exchangeAddresses,
     maxConcurrentTxLookups,
     withdrawalPollMinutes,
