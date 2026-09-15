@@ -229,9 +229,10 @@ export type AppConfig = {
    */
   polynodeRelayUrl?: string;
   /**
-   * When true, run the crypto order-book WS feed (pre-subscribe live books for the rolling crypto
-   * up/down universe) so the copy path reads those books from memory instead of a REST round-trip.
-   * Crypto markets only; non-crypto always uses REST. From env CRYPTO_BOOK_WS. Default false.
+   * Run the crypto order-book WS feed (pre-subscribe live books for the rolling crypto up/down
+   * universe) so the copy path reads those books from memory instead of a REST round-trip. Crypto
+   * markets only; non-crypto always uses REST. From env CRYPTO_BOOK_WS. Default ON — set
+   * CRYPTO_BOOK_WS=false to disable.
    */
   cryptoBookWsEnabled: boolean;
   /** Trader wallets to watch in the mempool matcher. */
@@ -453,8 +454,9 @@ function loadRpcOnly(): Pick<
   const detectionSource = parseDetectionSource();
   const polynodeApiKey = process.env["POLYNODE_API_KEY"]?.trim() || undefined;
   const polynodeRelayUrl = process.env["POLYNODE_RELAY_URL"]?.trim() || undefined;
+  // Default ON: only an explicit false/0/no/off disables the crypto book WS feed.
   const cbw = process.env["CRYPTO_BOOK_WS"]?.trim().toLowerCase();
-  const cryptoBookWsEnabled = cbw === "true" || cbw === "1";
+  const cryptoBookWsEnabled = !(cbw === "false" || cbw === "0" || cbw === "no" || cbw === "off");
   // With a relay, the bot needs no key (the relay holds the single shared upstream connection + key).
   if ((detectionSource === "polynode" || detectionSource === "both") && !polynodeApiKey && !polynodeRelayUrl) {
     throw new Error(
