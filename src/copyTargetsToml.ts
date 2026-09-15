@@ -99,6 +99,17 @@ export type TomlDefaultsSection = {
   sell_reprice_deadline_ms?: number;
   sell_max_slippage_frac?: number;
   /**
+   * Reprice-until-filled for BUYS (mirror of the sell reprice loop). If a copied buy rests unfilled
+   * (ask moved up in a fast market), cancel the resting remainder and re-post at a fresh ask + bump,
+   * chasing UP until filled / out of attempts / past the deadline / above the ceiling. The ceiling is
+   * reused from the existing filters — min(buy_price_max, implied + max_price_difference) — so a chase
+   * never pays more than your entry filter already allows.
+   *  - buy_reprice_attempts:    max reprice cycles (0/omit = disabled; the buy posts once).
+   *  - buy_reprice_deadline_ms: stop repricing after this many ms since the first post (default 2500).
+   */
+  buy_reprice_attempts?: number;
+  buy_reprice_deadline_ms?: number;
+  /**
    * Restrict copying to specific crypto 5-minute "Up or Down" markets by asset. A single asset
    * (market = "btc") or a list (market = ["btc", "eth"]). Values match the market slug prefix; long
    * names are aliased (bitcoin→btc, ethereum→eth, …). When set, trades on any other asset — and any
@@ -163,6 +174,8 @@ export type TomlTargetRow = {
   sell_reprice_attempts?: number;
   sell_reprice_deadline_ms?: number;
   sell_max_slippage_frac?: number;
+  buy_reprice_attempts?: number;
+  buy_reprice_deadline_ms?: number;
   market?: string | string[];
   new_wallet?: boolean;
   new_wallet_min_usd?: number;
@@ -262,6 +275,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       sell_reprice_attempts: numOrUndef("sell_reprice_attempts", src),
       sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", src),
       sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", src),
+      buy_reprice_attempts: numOrUndef("buy_reprice_attempts", src),
+      buy_reprice_deadline_ms: numOrUndef("buy_reprice_deadline_ms", src),
       market: strOrStrArrayOrUndef("market", src),
       new_wallet: boolOrUndef("new_wallet", src),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", src),
@@ -314,6 +329,8 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       sell_reprice_attempts: numOrUndef("sell_reprice_attempts", row),
       sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", row),
       sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", row),
+      buy_reprice_attempts: numOrUndef("buy_reprice_attempts", row),
+      buy_reprice_deadline_ms: numOrUndef("buy_reprice_deadline_ms", row),
       market: strOrStrArrayOrUndef("market", row),
       new_wallet: boolOrUndef("new_wallet", row),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", row),

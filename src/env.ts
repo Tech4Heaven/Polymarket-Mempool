@@ -115,6 +115,10 @@ export type TargetCopyParams = {
   sellRepriceDeadlineMs?: number;
   /** Reprice slippage floor: never sell below implied × (1 − this). Omit = no floor. */
   sellMaxSlippageFrac?: number;
+  /** Reprice-until-filled for BUYS: max reprice cycles chasing the ask up (0/omit = disabled). */
+  buyRepriceAttempts?: number;
+  /** Buy reprice deadline in ms since the first buy post (default 2500). */
+  buyRepriceDeadlineMs?: number;
   /** Restrict copies to these crypto asset keys (normalized, e.g. ["btc"]). Empty/undefined = no filter. */
   marketFilter?: string[];
   /** Fresh-wallet bait guard: skip the target's first trade if it's a buy below newWalletMinUsd. */
@@ -169,6 +173,10 @@ export type CopyTradeConfig = CopyTradeShared & {
   sellRepriceDeadlineMs?: number;
   /** Per-target reprice slippage floor: never sell below implied × (1 − this). */
   sellMaxSlippageFrac?: number;
+  /** Per-target reprice-until-filled for buys: max reprice cycles chasing the ask up (0 = disabled). */
+  buyRepriceAttempts?: number;
+  /** Per-target buy reprice deadline in ms since the first buy post (default 2500). */
+  buyRepriceDeadlineMs?: number;
   /** Per-target crypto asset filter (normalized keys, e.g. ["btc"]). Empty/undefined = copy all markets. */
   marketFilter?: string[];
   /** Per-target fresh-wallet bait guard: skip the first trade if it's a buy below newWalletMinUsd. */
@@ -220,6 +228,12 @@ export type AppConfig = {
    * this deployment needs no POLYNODE_API_KEY. Omit = connect to PolyNode directly (legacy).
    */
   polynodeRelayUrl?: string;
+  /**
+   * When true, run the crypto order-book WS feed (pre-subscribe live books for the rolling crypto
+   * up/down universe) so the copy path reads those books from memory instead of a REST round-trip.
+   * Crypto markets only; non-crypto always uses REST. From env CRYPTO_BOOK_WS. Default false.
+   */
+  cryptoBookWsEnabled: boolean;
   /** Trader wallets to watch in the mempool matcher. */
   targetTraderAddresses: string[];
   /** Subset of targets the withdrawal watcher polls (per-target `watch_withdrawals`, default false). */
@@ -268,6 +282,8 @@ export function mergeCopyTradeConfig(shared: CopyTradeShared, p: TargetCopyParam
     sellRepriceAttempts: p.sellRepriceAttempts,
     sellRepriceDeadlineMs: p.sellRepriceDeadlineMs,
     sellMaxSlippageFrac: p.sellMaxSlippageFrac,
+    buyRepriceAttempts: p.buyRepriceAttempts,
+    buyRepriceDeadlineMs: p.buyRepriceDeadlineMs,
     marketFilter: p.marketFilter,
     newWallet: p.newWallet,
     newWalletMinUsd: p.newWalletMinUsd,
@@ -428,6 +444,7 @@ function loadRpcOnly(): Pick<
   | "detectionSource"
   | "polynodeApiKey"
   | "polynodeRelayUrl"
+  | "cryptoBookWsEnabled"
   | "exchangeAddresses"
   | "maxConcurrentTxLookups"
   | "withdrawalPollMinutes"
@@ -436,6 +453,8 @@ function loadRpcOnly(): Pick<
   const detectionSource = parseDetectionSource();
   const polynodeApiKey = process.env["POLYNODE_API_KEY"]?.trim() || undefined;
   const polynodeRelayUrl = process.env["POLYNODE_RELAY_URL"]?.trim() || undefined;
+  const cbw = process.env["CRYPTO_BOOK_WS"]?.trim().toLowerCase();
+  const cryptoBookWsEnabled = cbw === "true" || cbw === "1";
   // With a relay, the bot needs no key (the relay holds the single shared upstream connection + key).
   if ((detectionSource === "polynode" || detectionSource === "both") && !polynodeApiKey && !polynodeRelayUrl) {
     throw new Error(
@@ -469,6 +488,7 @@ function loadRpcOnly(): Pick<
     detectionSource,
     polynodeApiKey,
     polynodeRelayUrl,
+    cryptoBookWsEnabled,
     exchangeAddresses,
     maxConcurrentTxLookups,
     withdrawalPollMinutes,
@@ -656,6 +676,14 @@ export async function loadAppConfig(): Promise<AppConfig> {
         if (sellMaxSlippageFrac !== undefined && (!Number.isFinite(sellMaxSlippageFrac) || sellMaxSlippageFrac <= 0 || sellMaxSlippageFrac >= 1)) {
           throw new Error(`targets ${row.address}: sell_max_slippage_frac must be a fraction in (0, 1) (e.g. 0.10)`);
         }
+        const buyRepriceAttempts = row.buy_reprice_attempts ?? defaults.buy_reprice_attempts;
+        if (buyRepriceAttempts !== undefined && (!Number.isInteger(buyRepriceAttempts) || buyRepriceAttempts < 0)) {
+          throw new Error(`targets ${row.address}: buy_reprice_attempts must be a non-negative integer`);
+        }
+        const buyRepriceDeadlineMs = row.buy_reprice_deadline_ms ?? defaults.buy_reprice_deadline_ms;
+        if (buyRepriceDeadlineMs !== undefined && (!Number.isFinite(buyRepriceDeadlineMs) || buyRepriceDeadlineMs <= 0)) {
+          throw new Error(`targets ${row.address}: buy_reprice_deadline_ms must be a positive number (ms)`);
+        }
 
         const marketRaw = row.market ?? defaults.market;
         let marketFilter: string[] | undefined;
@@ -710,6 +738,8 @@ export async function loadAppConfig(): Promise<AppConfig> {
           sellRepriceAttempts,
           sellRepriceDeadlineMs,
           sellMaxSlippageFrac,
+          buyRepriceAttempts,
+          buyRepriceDeadlineMs,
           marketFilter,
           newWallet,
           newWalletMinUsd,

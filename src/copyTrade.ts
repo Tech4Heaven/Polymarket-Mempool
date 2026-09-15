@@ -20,6 +20,7 @@ import { appendLedger, readLedger, type LedgerRecord } from "./orderLedger.js";
 import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { lookupCryptoMarket, resolveMarketLabelsFast } from "./cryptoMarketPrewarm.js";
+import { getCryptoBook } from "./cryptoBookFeed.js";
 import { registerSimOrder } from "./fillSim.js";
 
 function aggregateOutcomeByTokenId(rows: Ctf1155TransferRow[]): Map<string, bigint> {
@@ -344,6 +345,21 @@ async function getNegRiskCached(client: ClobClient, tokenId: string): Promise<bo
   const fresh = await client.getNegRisk(tokenId);
   negRiskByToken.set(tokenId, fresh);
   return fresh;
+}
+
+type OrderBookResult = Awaited<ReturnType<ClobClient["getOrderBook"]>>;
+
+/**
+ * Order book read: prefer the in-memory crypto WS book (pre-subscribed, ~0 ms) when it can be served
+ * (crypto token, feed healthy, ready), else the REST `getOrderBook` round-trip (~37 ms). The WS view
+ * carries best bid/ask + min_order_size — the only fields the copy path reads — so it's a drop-in.
+ */
+async function readBook(client: ClobClient, tokenId: string): Promise<OrderBookResult> {
+  const ws = getCryptoBook(tokenId);
+  if (ws) {
+    return ws as unknown as OrderBookResult;
+  }
+  return client.getOrderBook(tokenId);
 }
 
 /**
@@ -2069,7 +2085,7 @@ export async function executeCopyTrade(
   const [tickSize, negRisk, book] = await Promise.all([
     digest.tickSize ?? getTickSizeCached(client, digest.tokenId),
     getNegRiskCached(client, digest.tokenId),
-    client.getOrderBook(digest.tokenId),
+    readBook(client, digest.tokenId),
   ]);
 
   const topBid = bestBid(book);
@@ -2533,7 +2549,7 @@ export async function executeCopyTrade(
       if (remaining < minOrder) break; // enough sold
       let freshBook;
       try {
-        freshBook = await client.getOrderBook(digest.tokenId);
+        freshBook = await readBook(client, digest.tokenId);
       } catch {
         break;
       }
@@ -2561,6 +2577,90 @@ export async function executeCopyTrade(
       restingPosted = remaining;
       restingFillShares = parseFloat(rpObj.makingAmount ?? "0") || 0;
       restingFillUsdc = parseFloat(rpObj.takingAmount ?? "0") || 0;
+      resp = rp;
+      postPrice = freshPrice;
+      limitPrice = freshPrice;
+      postedResps.push(rp);
+      repriced++;
+    }
+    if (repriced > 0 || repriceNote) {
+      repriceNote = ` · reprice×${repriced}${repriceNote}`;
+    }
+  }
+
+  // ── BUY reprice-until-filled ──────────────────────────────────────────────────────────────
+  // A GTC buy priced at ask + bump can rest unfilled when the ask climbs in the latency window (fast
+  // markets). Chase it UP: cancel the resting remainder, re-price off a FRESH book (WS book for crypto,
+  // else REST) at the new ask + bump, and re-post the remaining BUDGET — until filled, out of attempts,
+  // past the deadline, or the price would breach the CEILING. The ceiling reuses the existing entry
+  // filters — min(buy_price_max, implied + max_price_difference) — so a chase never pays more than the
+  // drift/price checks already allow. Budget-sized: each re-post buys (remaining USDC ÷ new price)
+  // shares, so total spend stays within the reserved notional. Live buys only; dry-run posts nothing.
+  if (digest.side === "buy" && (cfg.buyRepriceAttempts ?? 0) > 0 && restingOrderId) {
+    const startTs = Date.now();
+    const deadlineMs = cfg.buyRepriceDeadlineMs ?? 2500;
+    const budget = clippedUsdc ?? 0;
+    const driftCeil = effectiveImplied + cfg.maxPriceDifference;
+    const ceiling = cfg.buyPriceMax !== undefined ? Math.min(cfg.buyPriceMax, driftCeil) : driftCeil;
+    let attempt = 0;
+    let repriced = 0;
+    while (
+      attempt < (cfg.buyRepriceAttempts ?? 0) &&
+      Date.now() - startTs < deadlineMs &&
+      budget - terminalFillUsdc - restingFillUsdc > 0 &&
+      restingOrderId
+    ) {
+      attempt++;
+      // Cancel the resting remainder first — never leave two orders for the same budget on the book.
+      try {
+        await client.cancelOrder({ orderID: restingOrderId });
+      } catch {
+        // Cancel failed → the order may have just filled; keep it as the final tracked order and stop.
+        break;
+      }
+      terminalFillShares += restingFillShares;
+      terminalFillUsdc += restingFillUsdc;
+      restingOrderId = "";
+      restingPosted = 0;
+      restingFillShares = 0;
+      restingFillUsdc = 0;
+      const remainingUsdc = budget - terminalFillUsdc;
+      if (!(remainingUsdc > 0)) break; // budget spent
+      let freshBook;
+      try {
+        freshBook = await readBook(client, digest.tokenId);
+      } catch {
+        break;
+      }
+      const freshAsk = bestAsk(freshBook);
+      if (freshAsk === null || !(freshAsk > 0)) break; // no asks to fill against
+      if (freshAsk > ceiling) {
+        repriceNote += ` ceil-stop@${freshAsk.toFixed(4)}(ceil ${ceiling.toFixed(4)})`;
+        break; // market ran above our max acceptable price — abandon the remainder
+      }
+      const freshBase = roundToTick(freshAsk, postTick, "up");
+      let freshPrice = applyTakerBump(freshAsk, freshBase, postTick, cfg.takerBump, cfg.maxTakerBumpFrac);
+      if (freshPrice > ceiling) {
+        freshPrice = roundToTick(ceiling, postTick, "down"); // cap the bump at the ceiling
+      }
+      if (!(freshPrice > 0) || freshPrice < freshAsk) break; // can't cross the ask within the ceiling
+      const remainingShares = remainingUsdc / freshPrice;
+      if (remainingShares < minOrder) break; // remainder too small to post
+      let rp;
+      try {
+        rp = await postOnce(freshPrice, postTick, remainingShares);
+      } catch {
+        break; // repost threw — remainder now un-posted; nothing resting to track
+      }
+      if (postErrorMessage(rp)) {
+        repriceNote += ` reject`;
+        break;
+      }
+      const rpObj = rp as { takingAmount?: string; makingAmount?: string; orderID?: string };
+      restingOrderId = rpObj.orderID ?? "";
+      restingPosted = remainingShares;
+      restingFillShares = parseFloat(rpObj.takingAmount ?? "0") || 0; // BUY: takingAmount = shares
+      restingFillUsdc = parseFloat(rpObj.makingAmount ?? "0") || 0; //  BUY: makingAmount = USDC paid
       resp = rp;
       postPrice = freshPrice;
       limitPrice = freshPrice;
@@ -2607,7 +2707,9 @@ export async function executeCopyTrade(
         void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
       }
     }
-    await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash, postedOrderId, orderShares);
+    // postedShares = the FINAL resting order's size (restingPosted): equals orderShares when the buy
+    // didn't reprice, or the last re-posted remainder when it did — so the poller tracks the right order.
+    await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash, postedOrderId, restingPosted);
     // Protective take-profit: rest a GTC SELL of the just-filled position at safe_sell (e.g. 0.99), so a
     // spike there exits fee-free before a possible 99c->1c flip. Best-effort; never blocks the copy.
     await placeSafeSell(cfg, client, digest.tokenId, filledShares, postTick, negRisk, minOrder, txHash);

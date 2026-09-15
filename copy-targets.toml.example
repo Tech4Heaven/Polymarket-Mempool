@@ -104,6 +104,18 @@ max_position_usdc = 100
 # sell_reprice_attempts = 4
 # sell_reprice_deadline_ms = 2500
 # sell_max_slippage_frac = 0.15
+# Reprice-until-filled for BUYS — the ENTRY mirror of the sell reprice loop. On a fast market the ask
+# can climb above your posted limit in the latency window, so a single taker_bump buy rests unfilled.
+# When set, if a copied buy still rests, cancel the remainder and re-post at a FRESH ask + taker_bump,
+# chasing UP until filled / out of attempts / past the deadline / above the ceiling. The ceiling is
+# reused from your existing filters — min(buy_price_max, implied + max_price_difference) — so a chase
+# never pays more than the drift/price checks already allow (no separate ceiling knob needed). Each
+# re-post is budget-sized: it buys (remaining USDC ÷ new price) shares, so total spend stays within the
+# reserved notional / max_market_usdc. Pairs with taker_bump (that sets the per-post aggression).
+#   buy_reprice_attempts:    max reprice cycles (0/omit = disabled; the buy posts once).
+#   buy_reprice_deadline_ms: stop repricing this many ms after the first post (default 2500).
+# buy_reprice_attempts = 4
+# buy_reprice_deadline_ms = 2500
 # Restrict copying to specific crypto "Up or Down" assets (ALLOWLIST). A single asset or a list; values
 # match the market slug prefix, long names aliased (bitcoin→btc, ethereum→eth, …). When set, trades on
 # any other asset — and any non-crypto market — are skipped (a cache miss is skipped too). Resolved
