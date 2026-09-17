@@ -21,6 +21,7 @@ import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { lookupCryptoMarket, resolveMarketLabelsFast } from "./cryptoMarketPrewarm.js";
 import { lookupLiveCryptoToken, refreshLiveCryptoTokenBook } from "./cryptoLiveMarkets.js";
+import { getCryptoBook } from "./cryptoBookFeed.js";
 import { registerSimOrder } from "./fillSim.js";
 
 function aggregateOutcomeByTokenId(rows: Ctf1155TransferRow[]): Map<string, bigint> {
@@ -379,6 +380,21 @@ async function getNegRiskCached(client: ClobClient, tokenId: string): Promise<bo
   return fresh;
 }
 
+type OrderBookResult = Awaited<ReturnType<ClobClient["getOrderBook"]>>;
+
+/**
+ * Order book read: prefer the in-memory crypto WS book (pre-subscribed, ~0 ms) when it can be served
+ * (crypto token, feed healthy, ready), else the REST `getOrderBook` round-trip (~37 ms). The WS view
+ * carries best bid/ask + min_order_size — the only fields the copy path reads — so it's a drop-in.
+ */
+async function readBook(client: ClobClient, tokenId: string): Promise<OrderBookResult> {
+  const ws = getCryptoBook(tokenId);
+  if (ws) {
+    return ws as unknown as OrderBookResult;
+  }
+  return client.getOrderBook(tokenId);
+}
+
 /**
  * Per-target per-side spend tracker for `max_market_usdc`. Key = `${targetAddrLc}:${tokenId}`.
  * Each tokenId is unique per market+side, so per-side semantics fall out naturally.
@@ -709,6 +725,77 @@ function marketUsdcRemaining(cfg: CopyTradeConfig, tokenId: string): { remaining
 /** True when any max_market_usdc cap (per-target or account-wide) applies to this target. */
 function marketUsdcCapActive(cfg: CopyTradeConfig): boolean {
   return cfg.maxMarketUsdc !== undefined || cfg.maxMarketUsdcAccount !== undefined;
+}
+
+// ── Main-side-only tracking ────────────────────────────────────────────────────────────────────
+// Records the FIRST outcome token a target buys in each market, so a later buy on the OPPOSITE outcome
+// (his self-hedge / second leg) can be skipped — copying only his main directional side. Persisted so a
+// restart mid-market doesn't flip which side we treat as "main"; TTL-pruned (5-min markets resolve fast).
+type MainSideEntry = { token: string; ts: number };
+const mainSideByTargetMarket = new Map<string, MainSideEntry>();
+let mainSideLoaded = false;
+const MAIN_SIDE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function mainSidePath(): string {
+  return process.env["MAIN_SIDE_STATE_PATH"]?.trim() || "logs/main-side.json";
+}
+function mainSideStateKey(target: string, marketKey: string): string {
+  return `${target.toLowerCase()}|${marketKey}`;
+}
+function ensureMainSideLoaded(): void {
+  if (mainSideLoaded) {
+    return;
+  }
+  mainSideLoaded = true;
+  try {
+    const obj = JSON.parse(readFileSync(mainSidePath(), "utf8")) as Record<string, MainSideEntry>;
+    const now = Date.now();
+    for (const [k, e] of Object.entries(obj)) {
+      if (e && typeof e.token === "string" && typeof e.ts === "number" && now - e.ts <= MAIN_SIDE_TTL_MS) {
+        mainSideByTargetMarket.set(k, e);
+      }
+    }
+  } catch {
+    // no file yet / unreadable → start empty
+  }
+}
+function persistMainSide(): void {
+  try {
+    const obj: Record<string, MainSideEntry> = {};
+    for (const [k, e] of mainSideByTargetMarket) {
+      obj[k] = e;
+    }
+    const p = mainSidePath();
+    const tmp = `${p}.tmp`;
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, p);
+  } catch {
+    // best effort
+  }
+}
+/** The main (first-bought) outcome token for a (target, market), or undefined if none recorded yet. */
+function getMainSide(target: string, marketKey: string): string | undefined {
+  ensureMainSideLoaded();
+  const k = mainSideStateKey(target, marketKey);
+  const e = mainSideByTargetMarket.get(k);
+  if (!e) {
+    return undefined;
+  }
+  if (Date.now() - e.ts > MAIN_SIDE_TTL_MS) {
+    mainSideByTargetMarket.delete(k);
+    return undefined;
+  }
+  return e.token;
+}
+/** Record `token` as the main side for (target, market) — first writer wins (idempotent). */
+function recordMainSide(target: string, marketKey: string, token: string): void {
+  ensureMainSideLoaded();
+  const k = mainSideStateKey(target, marketKey);
+  if (mainSideByTargetMarket.has(k)) {
+    return;
+  }
+  mainSideByTargetMarket.set(k, { token, ts: Date.now() });
+  persistMainSide();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1909,6 +1996,33 @@ export async function executeCopyTrade(
     }
   }
 
+  // Main-side-only: some targets buy BOTH outcomes of a market (a self-hedge), which guarantees a
+  // losing leg if copied whole. Copy only the FIRST outcome the target takes in each market; skip any
+  // buy on the opposite outcome (his hedge / second leg) — a clean directional copy. Pair with
+  // hedge_price to add our own protective hedge instead. Buys only (a sell of a side we never took
+  // finds no balance and no-ops). Market identity is the prewarm cache name (network-free for crypto),
+  // falling back to the conditionId (both outcomes share it) so Up/Down group correctly off-cache.
+  if (cfg.mainSideOnly && digest.side === "buy") {
+    const mkKey =
+      lookupCryptoMarket(digest.tokenId)?.event ??
+      (await resolveMarketTokens(digest.tokenId))?.conditionId ??
+      `token:${digest.tokenId}`;
+    const main = getMainSide(cfg.targetAddress, mkKey);
+    if (main !== undefined && main !== digest.tokenId) {
+      await logCopySkip(
+        `main-side-only · target's main side already taken (${main.slice(0, 12)}…) — skipping opposite (hedge) side · token=${digest.tokenId}`,
+        digest,
+        txHash,
+        cfg,
+        { copyUsd: originPusd * cfg.copyRatio, implied }
+      );
+      return;
+    }
+    if (main === undefined) {
+      recordMainSide(cfg.targetAddress, mkKey, digest.tokenId);
+    }
+  }
+
   // Effective values — overwritten when the below-min accumulator combines this trade with
   // previously-buffered sub-min trades. For drift checks and logging we want the COMBINED
   // implied (weighted by origin USDC) and the COMBINED origin pUSD/shares.
@@ -2054,7 +2168,6 @@ export async function executeCopyTrade(
           tracked: getTargetPosition(cfg, digest.tokenId), // never rejects (reads local state)
         }
       : null;
-
   type BookSnap = {
     asks: { price: string; size: string }[];
     bids: { price: string; size: string }[];
@@ -2085,7 +2198,7 @@ export async function executeCopyTrade(
     const [tk, nr, clobBook] = await Promise.all([
       digest.tickSize ?? getTickSizeCached(client, digest.tokenId),
       getNegRiskCached(client, digest.tokenId),
-      client.getOrderBook(digest.tokenId),
+      readBook(client, digest.tokenId),
     ]);
     tickSize = tk;
     negRisk = nr;
@@ -2664,7 +2777,7 @@ export async function executeCopyTrade(
       if (remaining < minOrder) break; // enough sold
       let freshBook;
       try {
-        freshBook = await client.getOrderBook(digest.tokenId);
+        freshBook = await readBook(client, digest.tokenId);
       } catch {
         break;
       }
@@ -2978,6 +3091,90 @@ export async function executeCopyTrade(
     }
   }
 
+  // ── BUY reprice-until-filled ──────────────────────────────────────────────────────────────
+  // A GTC buy priced at ask + bump can rest unfilled when the ask climbs in the latency window (fast
+  // markets). Chase it UP: cancel the resting remainder, re-price off a FRESH book (WS book for crypto,
+  // else REST) at the new ask + bump, and re-post the remaining BUDGET — until filled, out of attempts,
+  // past the deadline, or the price would breach the CEILING. The ceiling reuses the existing entry
+  // filters — min(buy_price_max, implied + max_price_difference) — so a chase never pays more than the
+  // drift/price checks already allow. Budget-sized: each re-post buys (remaining USDC ÷ new price)
+  // shares, so total spend stays within the reserved notional. Live buys only; dry-run posts nothing.
+  if (!isMaker && digest.side === "buy" && (cfg.buyRepriceAttempts ?? 0) > 0 && restingOrderId) {
+    const startTs = Date.now();
+    const deadlineMs = cfg.buyRepriceDeadlineMs ?? 2500;
+    const budget = clippedUsdc ?? 0;
+    const driftCeil = effectiveImplied + cfg.maxPriceDifference;
+    const ceiling = cfg.buyPriceMax !== undefined ? Math.min(cfg.buyPriceMax, driftCeil) : driftCeil;
+    let attempt = 0;
+    let repriced = 0;
+    while (
+      attempt < (cfg.buyRepriceAttempts ?? 0) &&
+      Date.now() - startTs < deadlineMs &&
+      budget - terminalFillUsdc - restingFillUsdc > 0 &&
+      restingOrderId
+    ) {
+      attempt++;
+      // Cancel the resting remainder first — never leave two orders for the same budget on the book.
+      try {
+        await client.cancelOrder({ orderID: restingOrderId });
+      } catch {
+        // Cancel failed → the order may have just filled; keep it as the final tracked order and stop.
+        break;
+      }
+      terminalFillShares += restingFillShares;
+      terminalFillUsdc += restingFillUsdc;
+      restingOrderId = "";
+      restingPosted = 0;
+      restingFillShares = 0;
+      restingFillUsdc = 0;
+      const remainingUsdc = budget - terminalFillUsdc;
+      if (!(remainingUsdc > 0)) break; // budget spent
+      let freshBook;
+      try {
+        freshBook = await readBook(client, digest.tokenId);
+      } catch {
+        break;
+      }
+      const freshAsk = bestAsk(freshBook);
+      if (freshAsk === null || !(freshAsk > 0)) break; // no asks to fill against
+      if (freshAsk > ceiling) {
+        repriceNote += ` ceil-stop@${freshAsk.toFixed(4)}(ceil ${ceiling.toFixed(4)})`;
+        break; // market ran above our max acceptable price — abandon the remainder
+      }
+      const freshBase = roundToTick(freshAsk, postTick, "up");
+      let freshPrice = applyTakerBump(freshAsk, freshBase, postTick, cfg.takerBump, cfg.maxTakerBumpFrac);
+      if (freshPrice > ceiling) {
+        freshPrice = roundToTick(ceiling, postTick, "down"); // cap the bump at the ceiling
+      }
+      if (!(freshPrice > 0) || freshPrice < freshAsk) break; // can't cross the ask within the ceiling
+      const remainingShares = remainingUsdc / freshPrice;
+      if (remainingShares < minOrder) break; // remainder too small to post
+      let rp;
+      try {
+        rp = await postOnce(freshPrice, postTick, remainingShares);
+      } catch {
+        break; // repost threw — remainder now un-posted; nothing resting to track
+      }
+      if (postErrorMessage(rp)) {
+        repriceNote += ` reject`;
+        break;
+      }
+      const rpObj = rp as { takingAmount?: string; makingAmount?: string; orderID?: string };
+      restingOrderId = rpObj.orderID ?? "";
+      restingPosted = remainingShares;
+      restingFillShares = parseFloat(rpObj.takingAmount ?? "0") || 0; // BUY: takingAmount = shares
+      restingFillUsdc = parseFloat(rpObj.makingAmount ?? "0") || 0; //  BUY: makingAmount = USDC paid
+      resp = rp;
+      postPrice = freshPrice;
+      limitPrice = freshPrice;
+      postedResps.push(rp);
+      repriced++;
+    }
+    if (repriced > 0 || repriceNote) {
+      repriceNote = ` · reprice×${repriced}${repriceNote}`;
+    }
+  }
+
   const filledShares = terminalFillShares + restingFillShares;
   const filledUsdc = terminalFillUsdc + restingFillUsdc;
   // Order id the poller keeps watching for late fills (the final resting order; "" if abandoned).
@@ -3013,11 +3210,12 @@ export async function executeCopyTrade(
         void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
       }
     }
-    // Maker reprice may have cancelled an unfilled remainder — refund that slice of the reservation
+    // Maker/taker reprice may have cancelled an unfilled remainder — refund that slice of the reservation
     // so max_market_usdc isn't stuck holding cancelled USDC.
     if (reservedUsdc > 0 && filledUsdc + 1e-9 < reservedUsdc) {
       addSideSpent(cfg.targetAddress, digest.tokenId, -(reservedUsdc - filledUsdc));
     }
+    // postedShares = the FINAL resting order's size; terminalPriorFill covers superseded reprice fills.
     await recordCopyBuyAndReconcile(
       cfg,
       client,

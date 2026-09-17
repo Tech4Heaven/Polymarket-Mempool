@@ -17,6 +17,7 @@ import { aggregatePusdForTargets } from "./pusdTransfers.js";
 import { startWithdrawalWatcher } from "./withdrawalWatcher.js";
 import { startCryptoMarketPrewarm, isCryptoCacheReady } from "./cryptoMarketPrewarm.js";
 import { startCryptoLiveMarkets, isCryptoLiveMarketsReady } from "./cryptoLiveMarkets.js";
+import { startCryptoBookFeed, isCryptoBookFeedHealthy } from "./cryptoBookFeed.js";
 
 function formatLogErr(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -236,6 +237,16 @@ async function main() {
         } target(s) · live 5m/15m/1h ask cache active`
       );
     }
+  }
+
+  // Crypto order-book WS feed (opt-in via CRYPTO_BOOK_WS): pre-subscribe live books for the crypto
+  // universe so the copy path reads them from memory (~0 ms) instead of a REST round-trip. Crypto only;
+  // non-crypto markets always use REST. Starts after the prewarm cache so it has tokens to subscribe.
+  if (config.cryptoBookWsEnabled) {
+    startCryptoBookFeed();
+    setTimeout(() => {
+      console.info(`crypto book WS feed: ${isCryptoBookFeedHealthy() ? "connected" : "connecting…"} (CRYPTO_BOOK_WS=on)`);
+    }, 3000).unref();
   }
 
   if (config.copyTradeShared) {

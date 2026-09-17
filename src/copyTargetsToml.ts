@@ -99,6 +99,17 @@ export type TomlDefaultsSection = {
   sell_reprice_deadline_ms?: number;
   sell_max_slippage_frac?: number;
   /**
+   * Reprice-until-filled for BUYS (mirror of the sell reprice loop). If a copied buy rests unfilled
+   * (ask moved up in a fast market), cancel the resting remainder and re-post at a fresh ask + bump,
+   * chasing UP until filled / out of attempts / past the deadline / above the ceiling. The ceiling is
+   * reused from the existing filters — min(buy_price_max, implied + max_price_difference) — so a chase
+   * never pays more than your entry filter already allows.
+   *  - buy_reprice_attempts:    max reprice cycles (0/omit = disabled; the buy posts once).
+   *  - buy_reprice_deadline_ms: stop repricing after this many ms since the first post (default 2500).
+   */
+  buy_reprice_attempts?: number;
+  buy_reprice_deadline_ms?: number;
+  /**
    * Restrict copying to specific crypto 5-minute "Up or Down" markets by asset. A single asset
    * (market = "btc") or a list (market = ["btc", "eth"]). Values match the market slug prefix; long
    * names are aliased (bitcoin→btc, ethereum→eth, …). When set, trades on any other asset — and any
@@ -128,6 +139,13 @@ export type TomlDefaultsSection = {
    *  - "taker" / omit: existing behavior (GTC; optional taker_bump / sell_bump to cross).
    */
   order_type?: string;
+  /**
+   * Copy only the target's MAIN side. Some traders buy BOTH outcomes of a market (a self-hedge);
+   * copying both guarantees a losing leg. When true, we copy the FIRST outcome the target buys in each
+   * market and SKIP any buy on the opposite outcome (his hedge/second leg) — a clean directional copy.
+   * Pair with hedge_price to add our own protective hedge instead. Omit/false to copy both sides.
+   */
+  main_side_only?: boolean;
   /**
    * Master enable/disable for this target. When false, the bot does NOTHING for the address —
    * not copy trading, not withdrawal watching, not mempool event matching. Default true.
@@ -163,11 +181,14 @@ export type TomlTargetRow = {
   sell_reprice_attempts?: number;
   sell_reprice_deadline_ms?: number;
   sell_max_slippage_frac?: number;
+  buy_reprice_attempts?: number;
+  buy_reprice_deadline_ms?: number;
   market?: string | string[];
   new_wallet?: boolean;
   new_wallet_min_usd?: number;
   safe_sell?: number;
   order_type?: string;
+  main_side_only?: boolean;
   enabled?: boolean;
 };
 
@@ -262,11 +283,14 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       sell_reprice_attempts: numOrUndef("sell_reprice_attempts", src),
       sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", src),
       sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", src),
+      buy_reprice_attempts: numOrUndef("buy_reprice_attempts", src),
+      buy_reprice_deadline_ms: numOrUndef("buy_reprice_deadline_ms", src),
       market: strOrStrArrayOrUndef("market", src),
       new_wallet: boolOrUndef("new_wallet", src),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", src),
       safe_sell: numOrUndef("safe_sell", src),
       order_type: strOrUndef("order_type", src),
+      main_side_only: boolOrUndef("main_side_only", src),
       enabled: boolOrUndef("enabled", src),
     };
   }
@@ -314,11 +338,14 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       sell_reprice_attempts: numOrUndef("sell_reprice_attempts", row),
       sell_reprice_deadline_ms: numOrUndef("sell_reprice_deadline_ms", row),
       sell_max_slippage_frac: numOrUndef("sell_max_slippage_frac", row),
+      buy_reprice_attempts: numOrUndef("buy_reprice_attempts", row),
+      buy_reprice_deadline_ms: numOrUndef("buy_reprice_deadline_ms", row),
       market: strOrStrArrayOrUndef("market", row),
       new_wallet: boolOrUndef("new_wallet", row),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", row),
       safe_sell: numOrUndef("safe_sell", row),
       order_type: strOrUndef("order_type", row),
+      main_side_only: boolOrUndef("main_side_only", row),
       enabled: boolOrUndef("enabled", row),
     });
   }

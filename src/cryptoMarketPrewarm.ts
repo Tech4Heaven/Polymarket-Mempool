@@ -28,6 +28,10 @@ export type CryptoMarketInfo = {
   /** Outcome label for THIS tokenId ("Up" / "Down"). */
   outcome: string;
   endMs: number;
+  /** Min order size (shares) from gamma `orderMinSize`; lets the WS book feed serve a full book. */
+  minOrderSize?: number;
+  /** Tick size from gamma `orderPriceMinTickSize`. */
+  tickSize?: number;
 };
 
 const GAMMA_URL = "https://gamma-api.polymarket.com/markets";
@@ -170,10 +174,19 @@ async function refreshOnce(): Promise<void> {
       const event = typeof m["question"] === "string" ? (m["question"] as string).trim() : "";
       const tokenIds = parseTokenIds(m["clobTokenIds"]);
       const outcomes = parseOutcomes(m["outcomes"]);
+      // Market params for the WS book feed (so it can serve a full REST-shaped book without a per-token
+      // REST call). gamma: orderMinSize (shares), orderPriceMinTickSize (price tick).
+      const rawMin = typeof m["orderMinSize"] === "number" ? (m["orderMinSize"] as number) : Number(m["orderMinSize"]);
+      const minOrderSize = Number.isFinite(rawMin) && rawMin > 0 ? rawMin : undefined;
+      const rawTick =
+        typeof m["orderPriceMinTickSize"] === "number"
+          ? (m["orderPriceMinTickSize"] as number)
+          : Number(m["orderPriceMinTickSize"]);
+      const tickSize = Number.isFinite(rawTick) && rawTick > 0 ? rawTick : undefined;
       for (let i = 0; i < tokenIds.length; i++) {
         const tid = normalizeTokenKey(tokenIds[i]!);
         const outcome = i < outcomes.length ? outcomes[i]! : "(unknown)";
-        next.set(tid, { asset, event, outcome, endMs });
+        next.set(tid, { asset, event, outcome, endMs, minOrderSize, tickSize });
       }
     }
     if (rows.length < PAGE_SIZE) {
@@ -217,6 +230,14 @@ export function startCryptoMarketPrewarm(intervalMs: number = DEFAULT_REFRESH_MS
 /** Fast, network-free lookup of a crypto up/down market (any cadence) by tokenId. undefined = miss. */
 export function lookupCryptoMarket(tokenId: string): CryptoMarketInfo | undefined {
   return cache.get(normalizeTokenKey(tokenId));
+}
+
+/**
+ * All currently-cached crypto tokenIds (normalized decimal strings). The WS book feed polls this to
+ * keep its live orderbook subscriptions in sync with the rolling crypto universe.
+ */
+export function getCryptoTokenIds(): string[] {
+  return [...cache.keys()];
 }
 
 /**
