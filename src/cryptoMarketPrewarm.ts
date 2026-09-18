@@ -127,7 +127,7 @@ function assetFromSlug(slug: string): string | null {
   return first ? normalizeAssetKey(first) : null;
 }
 
-async function fetchPage(offset: number): Promise<Record<string, unknown>[] | null> {
+async function fetchPage(offset: number, endDateMinIso: string): Promise<Record<string, unknown>[] | null> {
   const url = new URL(GAMMA_URL);
   url.searchParams.set("closed", "false");
   url.searchParams.set("tag_id", CRYPTO_UPDOWN_TAG_ID);
@@ -135,6 +135,12 @@ async function fetchPage(offset: number): Promise<Record<string, unknown>[] | nu
   url.searchParams.set("offset", String(offset));
   url.searchParams.set("order", "endDate");
   url.searchParams.set("ascending", "true");
+  // Drop already-ended markets server-side. Polymarket lags flipping ended markets to closed=true, so
+  // WITHOUT this ~100 resolution-pending markets pad the front of the endDate-ascending list and push
+  // the currently-active markets onto later pages — where a single flaky/short page fetch drops them
+  // from the cache (the copy path then skips real trades on a "miss"). end_date_min keeps the fetch to
+  // the live [now, now+2h] window so active markets sit on page 0.
+  url.searchParams.set("end_date_min", endDateMinIso);
   const res = await fetch(url);
   if (!res.ok) {
     return null;
@@ -146,17 +152,18 @@ async function fetchPage(offset: number): Promise<Record<string, unknown>[] | nu
 async function refreshOnce(): Promise<void> {
   const now = Date.now();
   const horizon = now + HORIZON_MS;
+  // Only fetch markets ending from ~now onward (a small grace so a market mid-resolution isn't dropped
+  // a hair early). Strips the resolution-pending backlog that used to pad the front pages.
+  const endDateMinIso = new Date(now - 60_000).toISOString().replace(/\.\d{3}Z$/, "Z");
   const next = new Map<string, CryptoMarketInfo>();
   let reachedHorizon = false;
   for (let page = 0; page < MAX_PAGES && !reachedHorizon; page++) {
-    const rows = await fetchPage(page * PAGE_SIZE);
+    const rows = await fetchPage(page * PAGE_SIZE, endDateMinIso);
     if (rows === null) {
-      // On the very first page failing we keep the previous cache (return without swapping); a later
-      // page failing just caps this refresh at what we already gathered.
-      if (page === 0) {
-        return;
-      }
-      break;
+      // ATOMIC refresh: ANY page failing aborts the whole refresh and keeps the previous good cache.
+      // Never swap in a partial (page-truncated) map — that was the source of transient "cache miss"
+      // skips of real trades when an active market happened to sit on a later, flaky page.
+      return;
     }
     for (const m of rows) {
       const parsedEnd = m["endDate"] ? Date.parse(String(m["endDate"])) : NaN;
