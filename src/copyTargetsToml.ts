@@ -110,10 +110,11 @@ export type TomlDefaultsSection = {
   buy_reprice_attempts?: number;
   buy_reprice_deadline_ms?: number;
   /**
-   * Restrict copying to specific crypto 5-minute "Up or Down" markets by asset. A single asset
-   * (market = "btc") or a list (market = ["btc", "eth"]). Values match the market slug prefix; long
-   * names are aliased (bitcoin→btc, ethereum→eth, …). When set, trades on any other asset — and any
-   * non-crypto market — are skipped. Omit to copy every market the target trades.
+   * Restrict copying to specific crypto "Up or Down" markets by asset. A single asset (market = "btc")
+   * or a list (market = ["btc", "eth"]). Values match the market slug prefix; long names are aliased
+   * (bitcoin→btc, ethereum→eth, …). The special value "crypto" is a WILDCARD — it allows ANY crypto
+   * up/down market (any asset) while still skipping non-crypto / unknown markets. When set, trades on
+   * any other asset — and any non-crypto market — are skipped. Omit to copy every market the target trades.
    */
   market?: string | string[];
   /**

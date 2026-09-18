@@ -120,7 +120,11 @@ max_position_usdc = 100
 # match the market slug prefix, long names aliased (bitcoin→btc, ethereum→eth, …). When set, trades on
 # any other asset — and any non-crypto market — are skipped (a cache miss is skipped too). Resolved
 # network-free from a background cache (no gamma call on the copy path). Omit = copy every market.
-# market = "btc"                  # or:  market = ["btc", "eth"]
+# Special value "crypto" is a WILDCARD: copy ANY crypto up/down market (btc, eth, sol, xrp, …) while
+# still skipping non-crypto / unknown markets — i.e. "all crypto, nothing else". Can be mixed in a list.
+# market = "btc"                  # one asset
+# market = ["btc", "eth"]         # a specific set
+# market = "crypto"               # any crypto up/down market
 # Fresh-wallet bait guard. Skips a target's small "test" positions until he opens a real one: his spend
 # is tallied PER market and every trade in a market whose running total stays below new_wallet_min_usd
 # is skipped — across every market — until SOME market reaches the threshold (proof he's really trading),

@@ -1885,9 +1885,12 @@ export async function executeCopyTrade(
   // and anything not in the cache (unknown). This is deliberate: when copying a fresh/unknown wallet
   // you don't know what it will trade, so only confirmed-asset trades should go through. The prewarm
   // reliably holds every live crypto market for the next ~2h, so a real btc trade is a hit in practice.
+  // Special value "crypto" is a WILDCARD: it allows ANY crypto up/down market (any asset in the cache),
+  // while still skipping non-crypto / unknown tokens — i.e. "all crypto, nothing else".
   if (cfg.marketFilter && cfg.marketFilter.length > 0) {
     const asset = lookupCryptoMarket(digest.tokenId)?.asset;
-    if (!asset || !cfg.marketFilter.includes(asset)) {
+    const anyCrypto = cfg.marketFilter.includes("crypto"); // wildcard: any crypto market passes
+    if (!asset || !(anyCrypto || cfg.marketFilter.includes(asset))) {
       await logCopySkip(
         `market filter · asset=${asset ?? "unknown"} not in [${cfg.marketFilter.join(",")}] · token=${digest.tokenId}`,
         digest,
