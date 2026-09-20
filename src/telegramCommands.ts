@@ -8,6 +8,7 @@ import {
   sendTelegramKeyboard,
   sendTelegramTo,
   telegramConfig,
+  tgEsc,
   type InlineKeyboard,
 } from "./telegram.js";
 import { buildTargetPnlReport, discoverBots, type BotRef } from "./targetPnl.js";
@@ -28,6 +29,18 @@ function pnlKeyboard(bots: BotRef[], selected: Set<number>): InlineKeyboard {
   ]);
   rows.push([{ text: "📊 Show P&L", callback_data: "pnl:go" }]);
   return rows;
+}
+
+/** Side picker for /panic: Up / Down / Both, plus Cancel. */
+function panicSideKeyboard(): InlineKeyboard {
+  return [
+    [
+      { text: "🟢 Up", callback_data: "panic:up" },
+      { text: "🔴 Down", callback_data: "panic:down" },
+    ],
+    [{ text: "⚖️ Both", callback_data: "panic:both" }],
+    [{ text: "✖️ Cancel", callback_data: "panic:cancel" }],
+  ];
 }
 
 /**
@@ -78,12 +91,49 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
   const warnedStrangers = new Set<string>(); // log each unauthorized id once, not on every poke
   // /pnl checkbox state: `${chatId}:${messageId}` → selected bot indices (into discoverBots() order).
   const pnlSel = new Map<string, Set<number>>();
+  // /panic conversational state per chat: awaiting the slug, or the side, with a freshness stamp.
+  const panicPending = new Map<string, { stage: "slug" | "side"; slug?: string; ts: number }>();
+  const PANIC_PENDING_TTL_MS = 5 * 60_000;
   let warnedConflict = false;
   let offset = 0;
   let stopped = false;
 
+  // Fire the fleet-wide panic for a resolved (chat, slug, side): write the shared file + confirm.
+  const firePanic = async (chatId: string, slug: string, side: "up" | "down" | "both"): Promise<void> => {
+    await appendPanicEntry(config, slug, side);
+    panicPending.delete(chatId);
+    await sendTelegramTo(
+      chatId,
+      `🚨 PANIC broadcast · ${tgEsc(slug)} · ${side.toUpperCase()}\nAll bots are cancelling orders, sweep-selling, and blocking further copies. Each bot with a position will report back.`
+    );
+  };
+
   const handleText = async (chatId: string, text: string): Promise<void> => {
-    const cmd = text.trim().split(/\s+/)[0]?.toLowerCase().replace(/@.*$/, "") ?? "";
+    const trimmed = text.trim();
+    const cmd = trimmed.split(/\s+/)[0]?.toLowerCase().replace(/@.*$/, "") ?? "";
+
+    // Conversational /panic capture: a pending prompt takes the NEXT non-command message as its input.
+    const pend = panicPending.get(chatId);
+    if (pend && Date.now() - pend.ts > PANIC_PENDING_TTL_MS) {
+      panicPending.delete(chatId); // stale — don't capture an unrelated later message
+    } else if (pend && !trimmed.startsWith("/")) {
+      if (pend.stage === "slug") {
+        const slug = trimmed.split(/\s+/)[0]!;
+        panicPending.set(chatId, { stage: "side", slug, ts: Date.now() });
+        await sendTelegramKeyboard(chatId, `🚨 Market: ${tgEsc(slug)}\nWhich side to panic-sell + block?`, panicSideKeyboard());
+        return;
+      }
+      if (pend.stage === "side" && pend.slug) {
+        const s = trimmed.toLowerCase();
+        const side = s === "up" || s === "down" || s === "both" ? (s as "up" | "down" | "both") : null;
+        if (side) {
+          await firePanic(chatId, pend.slug, side);
+        } else {
+          await sendTelegramKeyboard(chatId, `Tap a side for ${tgEsc(pend.slug)} (or type up/down/both):`, panicSideKeyboard());
+        }
+        return;
+      }
+    }
     if (cmd === "/balance" || cmd === "/balances") {
       const refs = await loadWalletList(config);
       if (refs.length === 0) {
@@ -104,44 +154,75 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
         pnlSel.set(`${chatId}:${msgId}`, selected);
       }
     } else if (cmd === "/panic") {
-      // /panic <slug> [up|down|both] — fleet-wide emergency exit + block. Writes the shared file that
-      // EVERY bot watches; each cancels its orders, sweep-sells the side(s), and blocks the market.
-      const parts = text.trim().split(/\s+/);
+      // Interactive: `/panic` → ask for the slug → pick the side (buttons). Shortcut: `/panic SLUG [side]`
+      // fires in one shot. Writes the shared file every bot watches (cancel + sweep-sell + block side).
+      const parts = trimmed.split(/\s+/);
       const slug = parts[1];
-      const sideRaw = (parts[2] ?? "both").toLowerCase();
-      const side = sideRaw === "up" || sideRaw === "down" ? sideRaw : "both";
-      if (!slug) {
-        await sendTelegramTo(chatId, "Usage: /panic <market-slug> [up|down|both]\ne.g. /panic btc-updown-5m-1789439400 up");
-        return;
+      const sideRaw = (parts[2] ?? "").toLowerCase();
+      if (slug && (sideRaw === "up" || sideRaw === "down" || sideRaw === "both")) {
+        await firePanic(chatId, slug, sideRaw); // one-shot: slug + side both given
+      } else if (slug) {
+        // slug given, no side → jump to the side picker
+        panicPending.set(chatId, { stage: "side", slug, ts: Date.now() });
+        await sendTelegramKeyboard(chatId, `🚨 Market: ${tgEsc(slug)}\nWhich side to panic-sell + block?`, panicSideKeyboard());
+      } else {
+        // nothing given → ask for the slug first
+        panicPending.set(chatId, { stage: "slug", ts: Date.now() });
+        await sendTelegramTo(chatId, "🚨 PANIC. Send the market slug (e.g. btc-updown-5m-1789439400), or /cancel.");
       }
-      await appendPanicEntry(config, slug, side);
-      await sendTelegramTo(
-        chatId,
-        `🚨 PANIC broadcast · ${slug} · ${side.toUpperCase()}\nAll bots are cancelling orders, sweep-selling, and blocking further copies. Each bot with a position will report back.`
-      );
+    } else if (cmd === "/cancel") {
+      panicPending.delete(chatId);
+      await sendTelegramTo(chatId, "Cancelled.");
     } else if (cmd === "/unpanic") {
       const slug = text.trim().split(/\s+/)[1];
       if (!slug) {
-        await sendTelegramTo(chatId, "Usage: /unpanic <market-slug>  (lifts the copy block; does not re-buy)");
+        await sendTelegramTo(chatId, "Usage: /unpanic SLUG  (lifts the copy block; does not re-buy)");
         return;
       }
       const removed = await removePanicEntries(config, slug);
       await sendTelegramTo(
         chatId,
         removed > 0
-          ? `✅ Unblocked ${slug} (removed ${removed} entr${removed === 1 ? "y" : "ies"}). Copies may resume for it. No positions were re-bought.`
-          : `No panic entries found for ${slug}.`
+          ? `✅ Unblocked ${tgEsc(slug)} (removed ${removed} entr${removed === 1 ? "y" : "ies"}). Copies may resume for it. No positions were re-bought.`
+          : `No panic entries found for ${tgEsc(slug)}.`
       );
     } else if (cmd === "/start" || cmd === "/help") {
       await sendTelegramTo(
         chatId,
-        "Commands:\n/balance — cash + open positions for every wallet\n/pnl — realized P&L per active target (pick bots)\n/panic <slug> [up|down|both] — 🚨 fleet-wide sell + block a market\n/unpanic <slug> — lift a panic block"
+        "Commands:\n/balance — cash + open positions for every wallet\n/pnl — realized P&L per active target (pick bots)\n/panic — 🚨 fleet-wide sell + block (asks for the slug, then pick a side). Shortcut: /panic SLUG [up|down|both]\n/unpanic SLUG — lift a panic block\n/cancel — abort a /panic prompt"
       );
     }
     // unknown commands: ignore silently
   };
 
   const handleCallback = async (cbId: string, chatId: string, messageId: number, data: string): Promise<void> => {
+    // /panic side picker (no bot list needed).
+    if (data.startsWith("panic:")) {
+      const choice = data.slice("panic:".length);
+      if (choice === "cancel") {
+        panicPending.delete(chatId);
+        await editTelegramMessage(chatId, messageId, "Panic cancelled.");
+        await answerCallback(cbId, "Cancelled");
+        return;
+      }
+      const pend = panicPending.get(chatId);
+      if (!pend || !pend.slug) {
+        await editTelegramMessage(chatId, messageId, "⏳ This panic prompt expired. Send /panic again.");
+        await answerCallback(cbId, "Expired");
+        return;
+      }
+      const side = choice === "up" || choice === "down" ? choice : "both";
+      await appendPanicEntry(config, pend.slug, side);
+      panicPending.delete(chatId);
+      await editTelegramMessage(
+        chatId,
+        messageId,
+        `🚨 PANIC broadcast · ${tgEsc(pend.slug)} · ${side.toUpperCase()}\nAll bots are cancelling orders, sweep-selling, and blocking further copies. Each bot with a position will report back.`
+      );
+      await answerCallback(cbId, "🚨 Broadcast");
+      return;
+    }
+
     const bots = await discoverBots();
     const key = `${chatId}:${messageId}`;
     let sel = pnlSel.get(key) ?? new Set(bots.map((_, i) => i));

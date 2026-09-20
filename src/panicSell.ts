@@ -5,7 +5,7 @@ import { AssetType, OrderType, Side } from "@polymarket/clob-client-v2";
 import type { AppConfig, CopyTradeConfig } from "./env.js";
 import { ensureClobClient } from "./copyTrade.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
-import { sendTelegram } from "./telegram.js";
+import { sendTelegram, tgEsc } from "./telegram.js";
 
 /**
  * Fleet-wide PANIC exit + market blocklist.
@@ -194,14 +194,14 @@ async function processEntry(entry: PanicEntry, cfg: CopyTradeConfig): Promise<vo
 
   const tokens = await resolveSlugToTokens(entry.slug);
   if (!tokens || (!tokens.up && !tokens.down)) {
-    const msg = `🚨 ${botName()} PANIC: could not resolve market slug "${entry.slug}" (not found on gamma) — nothing sold.`;
+    const msg = `🚨 ${botName()} PANIC: could not resolve market slug "${tgEsc(entry.slug)}" (not found on gamma) — nothing sold.`;
     console.error(msg);
     void sendTelegram(msg);
     return;
   }
   const sideTokens = sideTokensFor(entry.side, tokens);
   if (sideTokens.length === 0) {
-    const msg = `🚨 ${botName()} PANIC: market "${entry.slug}" has no ${entry.side.toUpperCase()} token — nothing sold.`;
+    const msg = `🚨 ${botName()} PANIC: market "${tgEsc(entry.slug)}" has no ${entry.side.toUpperCase()} token — nothing sold.`;
     console.error(msg);
     void sendTelegram(msg);
     return;
@@ -222,7 +222,7 @@ async function processEntry(entry: PanicEntry, cfg: CopyTradeConfig): Promise<vo
   // Telegram: notify only when this bot actually had exposure (avoid 13× "flat" spam); always log.
   if (anyPosition) {
     void sendTelegram(
-      `🚨 ${botName()} PANIC-SOLD ${entry.side.toUpperCase()} · ${entry.slug}\n` +
+      `🚨 ${botName()} PANIC-SOLD ${entry.side.toUpperCase()} · ${tgEsc(entry.slug)}\n` +
         `sold ${totalSh.toFixed(2)} sh → $${totalUsd.toFixed(2)} · market blocked from further copies`
     );
   } else {
