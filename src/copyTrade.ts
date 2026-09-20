@@ -21,6 +21,7 @@ import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { lookupCryptoMarket, resolveMarketLabelsFast } from "./cryptoMarketPrewarm.js";
 import { getCryptoBook } from "./cryptoBookFeed.js";
+import { isPanicBlocked } from "./panicSell.js";
 import { registerSimOrder } from "./fillSim.js";
 
 function aggregateOutcomeByTokenId(rows: Ctf1155TransferRow[]): Map<string, bigint> {
@@ -1869,6 +1870,14 @@ export async function executeCopyTrade(
   txHash: string,
   opts?: { fromRewatch?: boolean }
 ): Promise<void> {
+  // PANIC blocklist: a SIDE the operator panic-exited (/panic) is blocked fleet-wide (the opposite
+  // outcome keeps copying). Skip ALL copies of this token — buys (no new exposure) AND sells (we've
+  // already dumped it; nothing to mirror).
+  if (isPanicBlocked(digest.tokenId)) {
+    await logCopySkip(`panic-blocked side · token=${digest.tokenId}`, digest, txHash, cfg);
+    return;
+  }
+
   // Drawdown circuit breaker: halt NEW exposure (buys) for a target that breached its P&L limit.
   // Sells/exits are still allowed so existing positions can be unwound.
   if (digest.side === "buy") {

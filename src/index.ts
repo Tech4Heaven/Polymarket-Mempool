@@ -17,6 +17,7 @@ import { aggregatePusdForTargets } from "./pusdTransfers.js";
 import { startWithdrawalWatcher } from "./withdrawalWatcher.js";
 import { startCryptoMarketPrewarm, isCryptoCacheReady } from "./cryptoMarketPrewarm.js";
 import { startCryptoBookFeed, isCryptoBookFeedHealthy } from "./cryptoBookFeed.js";
+import { startPanicWatcher } from "./panicSell.js";
 
 function formatLogErr(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -252,6 +253,11 @@ async function main() {
         `bot started · pid=${process.pid} · in-memory state cleared (hedge tracking, absorbed-side markers, accumulator buffers all empty) · GTC cleanup ${gtcNote}`,
         config
       );
+      // Fleet-wide PANIC watcher: reacts to /panic entries in the shared file (cancel + sweep-sell +
+      // block the market). Live mode only — dry-run bots never post real sells. Uses this wallet's client.
+      if (!probeCfg.dryRun) {
+        startPanicWatcher(config, probeCfg);
+      }
     }
   }
 

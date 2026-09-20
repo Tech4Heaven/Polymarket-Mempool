@@ -235,6 +235,11 @@ export type AppConfig = {
    * CRYPTO_BOOK_WS=false to disable.
    */
   cryptoBookWsEnabled: boolean;
+  /**
+   * Path to the shared PANIC file watched by every bot (default ../panic.jsonl in the common parent, so
+   * all sibling deployments share one). `/panic <slug> [side]` appends here; each bot sells + blocks.
+   */
+  panicFile: string;
   /** Trader wallets to watch in the mempool matcher. */
   targetTraderAddresses: string[];
   /** Subset of targets the withdrawal watcher polls (per-target `watch_withdrawals`, default false). */
@@ -446,6 +451,7 @@ function loadRpcOnly(): Pick<
   | "polynodeApiKey"
   | "polynodeRelayUrl"
   | "cryptoBookWsEnabled"
+  | "panicFile"
   | "exchangeAddresses"
   | "maxConcurrentTxLookups"
   | "withdrawalPollMinutes"
@@ -457,6 +463,8 @@ function loadRpcOnly(): Pick<
   // Default ON: only an explicit false/0/no/off disables the crypto book WS feed.
   const cbw = process.env["CRYPTO_BOOK_WS"]?.trim().toLowerCase();
   const cryptoBookWsEnabled = !(cbw === "false" || cbw === "0" || cbw === "no" || cbw === "off");
+  // Shared panic file: default to the common parent dir so all sibling bots watch the SAME file.
+  const panicFile = process.env["PANIC_FILE"]?.trim() || resolve(process.cwd(), "..", "panic.jsonl");
   // With a relay, the bot needs no key (the relay holds the single shared upstream connection + key).
   if ((detectionSource === "polynode" || detectionSource === "both") && !polynodeApiKey && !polynodeRelayUrl) {
     throw new Error(
@@ -491,6 +499,7 @@ function loadRpcOnly(): Pick<
     polynodeApiKey,
     polynodeRelayUrl,
     cryptoBookWsEnabled,
+    panicFile,
     exchangeAddresses,
     maxConcurrentTxLookups,
     withdrawalPollMinutes,

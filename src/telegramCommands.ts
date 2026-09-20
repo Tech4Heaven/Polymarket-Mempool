@@ -12,6 +12,7 @@ import {
 } from "./telegram.js";
 import { buildTargetPnlReport, discoverBots, type BotRef } from "./targetPnl.js";
 import { fetchAllBalances, formatBalancesMessage, loadWalletList } from "./walletBalances.js";
+import { appendPanicEntry, removePanicEntries } from "./panicSell.js";
 
 const CHECKED = "✅";
 const UNCHECKED = "⬜️";
@@ -102,10 +103,39 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
       if (msgId !== null) {
         pnlSel.set(`${chatId}:${msgId}`, selected);
       }
+    } else if (cmd === "/panic") {
+      // /panic <slug> [up|down|both] — fleet-wide emergency exit + block. Writes the shared file that
+      // EVERY bot watches; each cancels its orders, sweep-sells the side(s), and blocks the market.
+      const parts = text.trim().split(/\s+/);
+      const slug = parts[1];
+      const sideRaw = (parts[2] ?? "both").toLowerCase();
+      const side = sideRaw === "up" || sideRaw === "down" ? sideRaw : "both";
+      if (!slug) {
+        await sendTelegramTo(chatId, "Usage: /panic <market-slug> [up|down|both]\ne.g. /panic btc-updown-5m-1789439400 up");
+        return;
+      }
+      await appendPanicEntry(config, slug, side);
+      await sendTelegramTo(
+        chatId,
+        `🚨 PANIC broadcast · ${slug} · ${side.toUpperCase()}\nAll bots are cancelling orders, sweep-selling, and blocking further copies. Each bot with a position will report back.`
+      );
+    } else if (cmd === "/unpanic") {
+      const slug = text.trim().split(/\s+/)[1];
+      if (!slug) {
+        await sendTelegramTo(chatId, "Usage: /unpanic <market-slug>  (lifts the copy block; does not re-buy)");
+        return;
+      }
+      const removed = await removePanicEntries(config, slug);
+      await sendTelegramTo(
+        chatId,
+        removed > 0
+          ? `✅ Unblocked ${slug} (removed ${removed} entr${removed === 1 ? "y" : "ies"}). Copies may resume for it. No positions were re-bought.`
+          : `No panic entries found for ${slug}.`
+      );
     } else if (cmd === "/start" || cmd === "/help") {
       await sendTelegramTo(
         chatId,
-        "Commands:\n/balance — cash + open positions for every wallet\n/pnl — realized P&L per active target (pick bots)"
+        "Commands:\n/balance — cash + open positions for every wallet\n/pnl — realized P&L per active target (pick bots)\n/panic <slug> [up|down|both] — 🚨 fleet-wide sell + block a market\n/unpanic <slug> — lift a panic block"
       );
     }
     // unknown commands: ignore silently
@@ -262,7 +292,7 @@ export function startTelegramCommandListener(config: AppConfig): { stop: () => v
     }
   };
 
-  console.info("telegram commands: listening for /balance, /pnl");
+  console.info("telegram commands: listening for /balance, /pnl, /panic, /unpanic");
   void poll();
   return { stop: () => {
     stopped = true;
