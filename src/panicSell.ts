@@ -194,16 +194,14 @@ async function processEntry(entry: PanicEntry, cfg: CopyTradeConfig): Promise<vo
 
   const tokens = await resolveSlugToTokens(entry.slug);
   if (!tokens || (!tokens.up && !tokens.down)) {
-    const msg = `🚨 ${botName()} PANIC: could not resolve market slug "${tgEsc(entry.slug)}" (not found on gamma) — nothing sold.`;
-    console.error(msg);
-    void sendTelegram(msg);
+    // LOG ONLY (no Telegram): a slug that won't resolve is almost always an already-resolved market
+    // whose entry lingers in the file — re-hit on every bot and every restart, which spammed Telegram.
+    console.warn(`[PANIC] ${botName()} could not resolve slug "${entry.slug}" (likely already resolved) — nothing to do`);
     return;
   }
   const sideTokens = sideTokensFor(entry.side, tokens);
   if (sideTokens.length === 0) {
-    const msg = `🚨 ${botName()} PANIC: market "${tgEsc(entry.slug)}" has no ${entry.side.toUpperCase()} token — nothing sold.`;
-    console.error(msg);
-    void sendTelegram(msg);
+    console.warn(`[PANIC] ${botName()} market "${entry.slug}" has no ${entry.side.toUpperCase()} token — nothing to do`);
     return;
   }
   // Block ONLY the panicked side(s) from further copies — the OTHER outcome keeps copying normally.
