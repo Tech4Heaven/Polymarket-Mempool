@@ -130,18 +130,23 @@ function numToTickSize(n: number): TickSize | null {
 }
 
 /**
- * The CLOB rejects a post whose price violates the market's tick with e.g.
- * `{"error":"price 0.046 breaks minimum tick size rule 0.01","status":400}`. Our cached tick can be
- * finer than what order-placement enforces (Polymarket's tick is price-dependent), so we parse the
- * REQUIRED tick out of the error to self-correct and retry. Returns null if not a tick-size error.
+ * Parse the REQUIRED tick out of a CLOB tick-size error message. Two known wordings, both handled:
+ *   - response 400:  `price 0.046 breaks minimum tick size rule 0.01`
+ *   - client throw:  `invalid tick size (0.001), minimum for the market is 0.01`
+ * Our cached/PolyNode tick can be FINER than what the market enforces (Polymarket's tick is
+ * price-dependent), so we recover the real tick to self-correct and retry. Returns null if not a
+ * tick-size error. `numToTickSize` maps the parsed value to the enum, so unusual values coerce safely.
  */
+function tickSizeFromErrorText(text: string): TickSize | null {
+  // Prefer the "minimum for the market is X" value (the tick to actually use); fall back to "tick size rule X".
+  const m =
+    text.match(/minimum for the market is\s+([0-9.]+)/i) ?? text.match(/tick size rule\s+([0-9.]+)/i);
+  return m ? numToTickSize(parseFloat(m[1]!)) : null;
+}
+
 function tickSizeFromError(resp: unknown): TickSize | null {
   const err = (resp as { error?: unknown })?.error;
-  if (typeof err !== "string") {
-    return null;
-  }
-  const m = err.match(/tick size rule\s+([0-9.]+)/i);
-  return m ? numToTickSize(parseFloat(m[1]!)) : null;
+  return typeof err === "string" ? tickSizeFromErrorText(err) : null;
 }
 
 /** A rejection message if the CLOB refused the order (error / 4xx-5xx), else null (order accepted). */
@@ -2072,12 +2077,24 @@ export async function executeCopyTrade(
   // book already carries both sides, and currentPrice is only ever used as max(mid,ask) for buys
   // / min(mid,bid) for sells — both collapse to the book's ask/bid. Saves one CLOB request per
   // copy and removes the sequential getPrice fallback.
-  // Prefer the real-time tick from the PolyNode settlement (digest.tickSize) — it's the market's
-  // actual tick at trade time, so the order prices correctly on the FIRST post. Only fall back to the
-  // CLOB lookup on the on-chain detection path (no settlement tick). Seed the cache with the
-  // authoritative value so the hedge path and any fallback use it too.
-  if (digest.tickSize) {
-    tickSizeByToken.set(digest.tokenId, digest.tickSize);
+  // Tick to price against. PolyNode's settlement tick (digest.tickSize) is convenient (no round-trip)
+  // but has been seen WRONG — e.g. 0.001 while the market's real minimum is 0.01 — which rejects every
+  // copy. For crypto we cache the AUTHORITATIVE tick from gamma (orderPriceMinTickSize); most crypto
+  // up/down markets are 0.01 but some are genuinely 0.001, so we can't just pick the coarser — we must
+  // use the market's real tick. So: PREFER the gamma tick when available (correct for both 0.01 and
+  // 0.001 markets); else use PolyNode's; else the CLOB lookup (on-chain path). Any residual too-fine
+  // tick is still caught by the self-heal on post below. Seed the cache so the hedge/fallback paths
+  // use the same value.
+  let seedTick: TickSize | undefined = digest.tickSize;
+  const gammaTickNum = lookupCryptoMarket(digest.tokenId)?.tickSize;
+  if (gammaTickNum !== undefined && gammaTickNum > 0) {
+    const gammaTick = numToTickSize(gammaTickNum);
+    if (gammaTick) {
+      seedTick = gammaTick; // gamma is authoritative for crypto — override PolyNode's tick
+    }
+  }
+  if (seedTick) {
+    tickSizeByToken.set(digest.tokenId, seedTick);
   }
   // Sell-path reads (our balance, the target's on-chain balance, our tracked position) are independent
   // of the order book and of each other. Start them NOW so they run concurrently with the book fetch
@@ -2095,7 +2112,7 @@ export async function executeCopyTrade(
         }
       : null;
   const [tickSize, negRisk, book] = await Promise.all([
-    digest.tickSize ?? getTickSizeCached(client, digest.tokenId),
+    seedTick ?? getTickSizeCached(client, digest.tokenId),
     getNegRiskCached(client, digest.tokenId),
     readBook(client, digest.tokenId),
   ]);
@@ -2479,12 +2496,45 @@ export async function executeCopyTrade(
       }
     }
   } catch (e) {
-    // Post failed after we reserved — release the reservation so a failed order doesn't
-    // permanently consume max_market_usdc capacity. This is the only refund path.
-    if (reservedUsdc > 0) {
-      addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
+    // Tick-size self-heal on a THROWN error: the CLOB client validates the tick locally and THROWS
+    // (e.g. "invalid tick size (0.001), minimum for the market is 0.01") before posting — the response
+    // self-heal above never sees it. Recover the real tick from the message, re-round, and retry ONCE.
+    // Without this, a market whose PolyNode tick is finer than the enforced tick fails every copy
+    // (that's how a winning 1c position got missed).
+    const thrownTick = tickSizeFromErrorText(e instanceof Error ? e.message : String(e));
+    if (thrownTick && thrownTick !== postTick) {
+      const newPrice = roundToTick(postPrice, thrownTick, digest.side === "buy" ? "down" : "up");
+      if (newPrice > 0) {
+        tickSizeByToken.set(digest.tokenId, thrownTick);
+        const note = `tick-size retry (throw) · token=${digest.tokenId} tick ${postTick}→${thrownTick} · price ${postPrice}→${newPrice} · tx=${txHash}`;
+        console.warn(note);
+        void appendCopyTradeSuccessLine(note, cfg.copyTradeLogPath);
+        postPrice = newPrice;
+        postTick = thrownTick;
+        try {
+          resp = await postOnce(postPrice, postTick);
+        } catch (e2) {
+          if (reservedUsdc > 0) {
+            addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
+          }
+          throw e2;
+        }
+        limitPrice = postPrice; // retry succeeded — fall through to the normal accepted/rejected path
+        // (do NOT release the reservation: the order was posted)
+        // eslint-disable-next-line no-empty
+      } else {
+        if (reservedUsdc > 0) {
+          addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
+        }
+        throw e;
+      }
+    } else {
+      // Not a tick-size error (or same tick) — release the reservation and propagate.
+      if (reservedUsdc > 0) {
+        addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
+      }
+      throw e;
     }
-    throw e;
   }
   limitPrice = postPrice; // reflect any tick-retry adjustment in the logs/ledger below
 
