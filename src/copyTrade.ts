@@ -1016,6 +1016,11 @@ type HedgeRest = {
   tokenId: string;
   price: number;
   size: number;
+  /**
+   * Shares of THIS order already rolled into `absorbedByToken`. A resting hedge fills in pieces while
+   * it sits, so only `matched − absorbed` is new on each read — re-reading can never double-count.
+   */
+  absorbed: number;
 };
 
 /**
@@ -1356,7 +1361,33 @@ function computeIdealHedge(state: MarketHedgeState, hedgePrice: number, hedgePer
   if (size <= 0) {
     return null;
   }
-  return { orderId: "", tokenId: hedgeToken, price: hedgePrice, size };
+  return { orderId: "", tokenId: hedgeToken, price: hedgePrice, size, absorbed: 0 };
+}
+
+/**
+ * Roll any NEW fills of `hedge` into this target's held shares. Returns the order's total matched
+ * size, or null when the CLOB can't be read (caller must then leave the hedge untouched rather than
+ * assume it's unfilled).
+ *
+ * Only `matched − hedge.absorbed` is added, so this is safe to call on every reconcile. Fills go into
+ * `absorbedByToken` because `sharesByToken` is derived and would be recomputed away.
+ */
+async function absorbHedgeFills(
+  client: ClobClient,
+  state: MarketHedgeState,
+  hedge: HedgeRest
+): Promise<number | null> {
+  const matched = await readOrderMatched(client, hedge.orderId);
+  if (matched === null) {
+    return null;
+  }
+  const newlyFilled = matched - hedge.absorbed;
+  if (newlyFilled > 0) {
+    state.absorbedByToken.set(hedge.tokenId, (state.absorbedByToken.get(hedge.tokenId) ?? 0) + newlyFilled);
+    hedge.absorbed = matched;
+    recomputeShares(state);
+  }
+  return matched;
 }
 
 /**
@@ -1373,28 +1404,44 @@ async function reconcileHedge(
   if (cfg.hedgePrice === undefined) {
     return;
   }
+  // Roll fills of the RESTING hedge into held shares BEFORE sizing the next one. The old code sized
+  // first and assumed the cancel always beat the fill, so each re-place re-bought the whole gap: on
+  // 2026-09-23 that stacked 24 placements into 11,939 hedge shares against a 1,025-share main
+  // position. Sizing must see what already filled, or the hedge runs away.
+  if (state.hedge) {
+    const absorbed = await absorbHedgeFills(client, state, state.hedge);
+    if (absorbed === null) {
+      // Fill status unknown — replacing blind is what caused the runaway. Keep the resting order.
+      const warn = `hedge · fill status unreadable, leaving hedge in place · condition=${state.conditionId} orderId=${state.hedge.orderId} · tx=${txHash}`;
+      console.warn(warn);
+      void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
+      return;
+    }
+  }
+
   const ideal = computeIdealHedge(state, cfg.hedgePrice, cfg.hedgeTokenPercent ?? DEFAULT_HEDGE_TOKEN_PERCENT);
 
-  // If current hedge already matches ideal, nothing to do (avoids needless cancel/replace churn).
+  // If what's still RESTING (placed minus already filled) matches the ideal, nothing to do.
+  const restingRemaining = state.hedge ? Math.max(0, state.hedge.size - state.hedge.absorbed) : 0;
   if (
     state.hedge &&
     ideal &&
     state.hedge.tokenId === ideal.tokenId &&
-    Math.abs(state.hedge.size - ideal.size) < 1e-9 &&
+    Math.abs(restingRemaining - ideal.size) < 1e-9 &&
     state.hedge.price === ideal.price
   ) {
     return;
   }
 
-  // Cancel current hedge if any. Refund its full cost to the bucket — we assume the cancel
-  // succeeds before any fill. If it raced with a fill, our accounting will be slightly off
-  // until next reconcile (the addSideSpent clamp-at-zero prevents going negative).
+  // Cancel current hedge if any, refunding ONLY the unmatched remainder — the filled part was really
+  // bought and its cost must stay on the books.
   if (state.hedge) {
     const old = state.hedge;
     await safeCancel(client, old.orderId, cfg, `reconcile condition=${state.conditionId}`);
-    addSideSpent(cfg.targetAddress, old.tokenId, -(old.price * old.size));
+    const unmatched = Math.max(0, old.size - old.absorbed);
+    addSideSpent(cfg.targetAddress, old.tokenId, -(old.price * unmatched));
     state.hedge = null;
-    const msg = `hedge cancelled · condition=${state.conditionId} oldToken=${old.tokenId} oldSize=${old.size} oldPrice=${old.price} refunded=$${(old.price * old.size).toFixed(4)} · tx=${txHash}`;
+    const msg = `hedge cancelled · condition=${state.conditionId} oldToken=${old.tokenId} oldSize=${old.size} filled=${old.absorbed} oldPrice=${old.price} refunded=$${(old.price * unmatched).toFixed(4)} · tx=${txHash}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
   }
@@ -1702,18 +1749,16 @@ async function checkRestingHedgeSuppression(
       return;
     }
 
-    const matched = await readOrderMatched(client, hedge.orderId);
+    // absorbHedgeFills rolls in only what's NEW since the last read, so a fill already absorbed by
+    // reconcileHedge is not counted twice here.
+    const matched = await absorbHedgeFills(client, state, hedge);
     if (matched !== null && matched > 0) {
-      // Treat as fully done: roll matched portion into held shares, cancel the unmatched remainder.
+      // Treat as fully done: the matched portion is now in held shares; cancel the unmatched remainder.
       await safeCancel(client, hedge.orderId, cfg, "matched-but-cleanup-remainder");
       const unmatchedShares = Math.max(0, hedge.size - matched);
       if (unmatchedShares > 0) {
         addSideSpent(cfg.targetAddress, hedge.tokenId, -(unmatchedShares * hedge.price));
       }
-      // Into absorbedByToken (not sharesByToken) — the latter is derived and would be recomputed away.
-      const existingAbsorbed = state.absorbedByToken.get(hedge.tokenId) ?? 0;
-      state.absorbedByToken.set(hedge.tokenId, existingAbsorbed + matched);
-      recomputeShares(state);
       // Per-target marker so subsequent buys from THIS target on this side stay suppressed.
       state.absorbedSideByTarget.set(cfg.targetAddress.toLowerCase(), hedge.tokenId);
       state.hedge = null;
