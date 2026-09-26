@@ -10,6 +10,8 @@
     "encrypt-wallet": "tsx scripts/encryptWalletJson.ts",
     "check-wallet": "tsx scripts/checkWalletJson.ts",
     "test-wallet": "tsx scripts/testClobBtc5mCheapBuy.ts",
+    "buy-ui": "tsx scripts/manualBuyServer.ts",
+    "buy-ui:pm2": "./start-buy-ui.sh",
     "find-thresholds": "tsx scripts/findThresholds.ts",
     "analyze-target": "tsx scripts/analyzeTargetLog.ts",
     "test": "tsx --test src/settlementDigest.test.ts src/pnlReconciler.test.ts src/drawdownGuard.test.ts src/takerBump.test.ts",
