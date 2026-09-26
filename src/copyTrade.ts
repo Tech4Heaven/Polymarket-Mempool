@@ -20,6 +20,7 @@ import { appendLedger, readLedger, type LedgerRecord } from "./orderLedger.js";
 import { isTargetStopped } from "./drawdownGuard.js";
 import { appendCopyTradeSuccessLine } from "./copyTradeSuccessLog.js";
 import { lookupCryptoMarket, resolveMarketLabelsFast } from "./cryptoMarketPrewarm.js";
+import { lookupLiveCryptoToken, refreshLiveCryptoTokenBook } from "./cryptoLiveMarkets.js";
 import { getCryptoBook } from "./cryptoBookFeed.js";
 import { isPanicBlocked } from "./panicSell.js";
 import { registerSimOrder } from "./fillSim.js";
@@ -124,6 +125,33 @@ function roundToTick(price: number, tick: TickSize, mode: "up" | "down"): number
   return Math.max(0, Math.floor(price / t + 1e-12) * t);
 }
 
+/**
+ * Maker bid one tick below `bestAsk` so a GTC `postOnly` buy does not cross the spread.
+ * Mirrors speed-outcome-entry `post_only_buy_price`. Returns null if no valid resting price.
+ */
+export function postOnlyBuyPrice(
+  bestAsk: number,
+  tick: TickSize,
+  buyPriceMin?: number,
+  buyPriceMax?: number
+): number | null {
+  const t = parseFloat(tick);
+  if (!(bestAsk > 0) || !(t > 0) || bestAsk <= t) {
+    return null;
+  }
+  const price = roundToTick(bestAsk - t, tick, "down");
+  if (!(price > 0) || price >= bestAsk) {
+    return null;
+  }
+  if (buyPriceMin !== undefined && price < buyPriceMin) {
+    return null;
+  }
+  if (buyPriceMax !== undefined && price > buyPriceMax) {
+    return null;
+  }
+  return price;
+}
+
 const TICK_SIZES: TickSize[] = ["0.1", "0.01", "0.001", "0.0001"];
 function numToTickSize(n: number): TickSize | null {
   return TICK_SIZES.find((t) => Math.abs(parseFloat(t) - n) < 1e-9) ?? null;
@@ -159,6 +187,11 @@ function postErrorMessage(resp: unknown): string | null {
     return `HTTP ${r.status}`;
   }
   return null;
+}
+
+/** Post-only buy rejected because the bid would take the ask (stale ask / book moved). */
+function isPostOnlyCrossesBook(err: string): boolean {
+  return /crosses book/i.test(err);
 }
 
 /**
@@ -1585,7 +1618,13 @@ async function recordCopyBuyAndReconcile(
   filledShares: number,
   txHash: string,
   orderId: string,
-  postedShares: number
+  postedShares: number,
+  /**
+   * Shares already bought by superseded maker-reprice attempts (cancelled, no longer on the book).
+   * Registered as a terminal entry so the derived position reflects them but the poller never
+   * re-checks a dead order. Default 0 (single-post buy, no reprice).
+   */
+  terminalPriorFill = 0
 ): Promise<void> {
   const state = await getOrCreateHedgeState(cfg, primaryTokenId);
   if (!state) {
@@ -1596,9 +1635,23 @@ async function recordCopyBuyAndReconcile(
   }
 
   await runExclusive(state, async () => {
+    if (terminalPriorFill > 1e-9) {
+      state.mainOrders.set(`BUY_REPRICED:${primaryTokenId}:${state.mainOrders.size}`, {
+        tokenId: primaryTokenId,
+        side: "buy",
+        postedSize: terminalPriorFill,
+        matched: terminalPriorFill,
+        terminal: true,
+      });
+    }
     // Track the order itself, not just its immediate fill: a resting GTC buy posts with
     // filledShares=0 and only fills later — the poller reads size_matched for it from here on.
-    registerMainOrder(state, orderId, primaryTokenId, "buy", postedShares, filledShares);
+    // Skip when the remainder was abandoned (no resting order and nothing filled on this attempt).
+    if (orderId !== "" || filledShares > 1e-9) {
+      registerMainOrder(state, orderId, primaryTokenId, "buy", postedShares, filledShares);
+    } else {
+      recomputeShares(state);
+    }
     state.lastActivityMs = Date.now();
     await reconcileHedge(cfg, client, state, txHash);
   });
@@ -1960,6 +2013,20 @@ export async function executeCopyTrade(
     }
   }
 
+  // Maker order type: only fire on live crypto 5m/15m/1h Up/Down markets tracked by cryptoLiveMarkets
+  // (slug discovery + ask cache, same pattern as speed-outcome-entry).
+  const liveCrypto = lookupLiveCryptoToken(digest.tokenId);
+  const isMaker = cfg.orderType === "maker";
+  if (isMaker && !liveCrypto) {
+    await logCopySkip(
+      `maker order_type · token not in live crypto 5m/15m/1h cache · token=${digest.tokenId}`,
+      digest,
+      txHash,
+      cfg
+    );
+    return;
+  }
+
   const implied = impliedPrice(digest.pusdRaw, digest.outcomeRaw);
   const originPusd = parseFloat(formatUnits(digest.pusdRaw, 6));
   const originShares = parseFloat(formatUnits(digest.outcomeRaw, 6));
@@ -2141,6 +2208,25 @@ export async function executeCopyTrade(
   if (seedTick) {
     tickSizeByToken.set(digest.tokenId, seedTick);
   }
+  // Seed tick/negRisk from the live crypto cache when Gamma already gave them (maker path).
+  if (liveCrypto?.tickSize) {
+    const tk = numToTickSize(parseFloat(liveCrypto.tickSize));
+    if (tk && !tickSizeByToken.has(digest.tokenId)) {
+      tickSizeByToken.set(digest.tokenId, tk);
+    }
+  }
+  if (liveCrypto?.negRisk !== undefined && !negRiskByToken.has(digest.tokenId)) {
+    negRiskByToken.set(digest.tokenId, liveCrypto.negRisk);
+  }
+
+  // Maker hot path: price from the prewarmed 5m/15m/1h ask/bid cache (polled in background) —
+  // skip the CLOB getOrderBook round-trip on detection. Taker / cache-miss still fetches the book.
+  const cacheHasSide =
+    isMaker &&
+    liveCrypto != null &&
+    ((digest.side === "buy" && liveCrypto.bestAsk != null && liveCrypto.bestAsk > 0) ||
+      (digest.side === "sell" && liveCrypto.bestBid != null && liveCrypto.bestBid > 0));
+
   // Sell-path reads (our balance, the target's on-chain balance, our tracked position) are independent
   // of the order book and of each other. Start them NOW so they run concurrently with the book fetch
   // instead of sequentially after it — cutting a sell's time-to-post from ~4 round-trips to ~1. They're
@@ -2156,14 +2242,55 @@ export async function executeCopyTrade(
           tracked: getTargetPosition(cfg, digest.tokenId), // never rejects (reads local state)
         }
       : null;
-  const [tickSize, negRisk, book] = await Promise.all([
-    seedTick ?? getTickSizeCached(client, digest.tokenId),
-    getNegRiskCached(client, digest.tokenId),
-    readBook(client, digest.tokenId),
-  ]);
+  type BookSnap = {
+    asks: { price: string; size: string }[];
+    bids: { price: string; size: string }[];
+    min_order_size: string;
+  };
 
-  const topBid = bestBid(book);
-  const topAsk = bestAsk(book);
+  let tickSize: TickSize;
+  let negRisk: boolean;
+  let book: BookSnap;
+  let askSrc: "cache" | "clob" = "clob";
+
+  if (cacheHasSide && liveCrypto) {
+    const [tk, nr] = await Promise.all([
+      seedTick ?? getTickSizeCached(client, digest.tokenId),
+      getNegRiskCached(client, digest.tokenId),
+    ]);
+    tickSize = tk;
+    negRisk = nr;
+    const a = liveCrypto.bestAsk;
+    const b = liveCrypto.bestBid;
+    book = {
+      asks: a != null && a > 0 ? [{ price: String(a), size: "1" }] : [],
+      bids: b != null && b > 0 ? [{ price: String(b), size: "1" }] : [],
+      min_order_size: String(liveCrypto.minOrderSize ?? 5),
+    };
+    askSrc = "cache";
+  } else {
+    const [tk, nr, clobBook] = await Promise.all([
+      seedTick ?? getTickSizeCached(client, digest.tokenId),
+      getNegRiskCached(client, digest.tokenId),
+      readBook(client, digest.tokenId),
+    ]);
+    tickSize = tk;
+    negRisk = nr;
+    book = clobBook as BookSnap;
+    // If maker cache was cold, refresh it from this fetch for the next trade.
+    if (isMaker && liveCrypto) {
+      const a = bestAsk(book);
+      const b = bestBid(book);
+      if (a != null) liveCrypto.bestAsk = a;
+      if (b != null) liveCrypto.bestBid = b;
+      const mos = parseFloat(book.min_order_size);
+      if (Number.isFinite(mos) && mos > 0) liveCrypto.minOrderSize = mos;
+      liveCrypto.updatedAtMs = Date.now();
+    }
+  }
+
+  const topBid = bestBid(book) ?? liveCrypto?.bestBid ?? null;
+  const topAsk = bestAsk(book) ?? liveCrypto?.bestAsk ?? null;
   // Both sides → true midpoint. One-sided book → use the side that exists; the side-specific
   // empty asks/bids checks below still gate a buy/sell that needs the missing side.
   let currentPrice: number | null;
@@ -2182,8 +2309,10 @@ export async function executeCopyTrade(
 
   let limitPrice: number;
   let takerBumpNote = ""; // shows in the copy-posted/dry-run log whether the taker bump was applied
+  let postOnly = false;
   if (digest.side === "buy") {
-    const ask = bestAsk(book);
+    // Maker: prefer prewarmed ask (already in `book` when cacheHasSide). Taker: CLOB book ask.
+    const ask = bestAsk(book) ?? liveCrypto?.bestAsk ?? null;
     if (ask === null) {
       await logCopySkip("empty asks", digest, txHash, cfg, {
         copyUsd: clippedUsdc ?? undefined,
@@ -2257,48 +2386,77 @@ export async function executeCopyTrade(
       }
     }
 
-    const baseLimit = roundToTick(effectivePrice, tickSize, "up");
-    // Taker bump (fill improvement): cross above the ask so the order fills, capped relative to price
-    // and tick-aware. After the drift check (option B), before the buy_price bounds below.
-    limitPrice = applyTakerBump(ask, baseLimit, tickSize, cfg.takerBump, cfg.maxTakerBumpFrac);
-    if (cfg.takerBump !== undefined && cfg.takerBump > 0) {
+    if (isMaker) {
+      // speed-outcome-entry ORDER_TYPE=maker: GTC post-only one tick below best ask.
+      const makerPx = postOnlyBuyPrice(ask, tickSize, cfg.buyPriceMin, cfg.buyPriceMax);
+      if (makerPx === null) {
+        await logCopySkip(
+          `maker post-only · no valid resting bid below ask=${ask.toFixed(4)} tick=${tickSize}` +
+            (liveCrypto ? ` · ${liveCrypto.asset}-${liveCrypto.interval} ${liveCrypto.outcome}` : ""),
+          digest,
+          txHash,
+          cfg,
+          { copyUsd: clippedUsdc ?? undefined, implied: effectiveImplied }
+        );
+        return;
+      }
+      limitPrice = makerPx;
+      postOnly = true;
       takerBumpNote =
-        limitPrice > baseLimit
-          ? ` · takerBump=+${(limitPrice - baseLimit).toFixed(4)} (ask=${ask.toFixed(4)} base=${baseLimit.toFixed(4)}→${limitPrice.toFixed(4)})`
-          : ` · takerBump=none (ask=${ask.toFixed(4)} base=${baseLimit.toFixed(4)}; cap/tick blocked)`;
-    }
+        ` · orderType=maker postOnly ask=${ask.toFixed(4)}→${limitPrice.toFixed(4)} askSrc=${askSrc}` +
+        (liveCrypto ? ` · ${liveCrypto.slug} ${liveCrypto.outcome}` : "");
+    } else {
+      const baseLimit = roundToTick(effectivePrice, tickSize, "up");
+      // Taker bump (fill improvement): cross above the ask so the order fills, capped relative to price
+      // and tick-aware. After the drift check (option B), before the buy_price bounds below.
+      limitPrice = applyTakerBump(ask, baseLimit, tickSize, cfg.takerBump, cfg.maxTakerBumpFrac);
+      if (cfg.takerBump !== undefined && cfg.takerBump > 0) {
+        takerBumpNote =
+          limitPrice > baseLimit
+            ? ` · takerBump=+${(limitPrice - baseLimit).toFixed(4)} (ask=${ask.toFixed(4)} base=${baseLimit.toFixed(4)}→${limitPrice.toFixed(4)})`
+            : ` · takerBump=none (ask=${ask.toFixed(4)} base=${baseLimit.toFixed(4)}; cap/tick blocked)`;
+      }
 
-    if (cfg.buyPriceMin !== undefined && limitPrice < cfg.buyPriceMin) {
-      await logCopySkip(
-        `buy limitPrice=${limitPrice.toFixed(4)} below buy_price_min=${cfg.buyPriceMin}`,
-        digest,
-        txHash,
-        cfg,
-        { copyUsd: clippedUsdc ?? undefined, limitPrice, implied: effectiveImplied }
-      );
-      return;
-    }
-    if (cfg.buyPriceMax !== undefined && limitPrice > cfg.buyPriceMax) {
-      await logCopySkip(
-        `buy limitPrice=${limitPrice.toFixed(4)} above buy_price_max=${cfg.buyPriceMax}`,
-        digest,
-        txHash,
-        cfg,
-        { copyUsd: clippedUsdc ?? undefined, limitPrice, implied: effectiveImplied }
-      );
-      return;
+      if (cfg.buyPriceMin !== undefined && limitPrice < cfg.buyPriceMin) {
+        await logCopySkip(
+          `buy limitPrice=${limitPrice.toFixed(4)} below buy_price_min=${cfg.buyPriceMin}`,
+          digest,
+          txHash,
+          cfg,
+          { copyUsd: clippedUsdc ?? undefined, limitPrice, implied: effectiveImplied }
+        );
+        return;
+      }
+      if (cfg.buyPriceMax !== undefined && limitPrice > cfg.buyPriceMax) {
+        await logCopySkip(
+          `buy limitPrice=${limitPrice.toFixed(4)} above buy_price_max=${cfg.buyPriceMax}`,
+          digest,
+          txHash,
+          cfg,
+          { copyUsd: clippedUsdc ?? undefined, limitPrice, implied: effectiveImplied }
+        );
+        return;
+      }
     }
   } else {
     // Sells: no drift check (per design). Price to top of book, then optionally cross BELOW the bid
     // (sell_bump) so the exit fills as a taker instead of resting on a bid that can vanish in a fast
     // market. The reprice loop after the post chases the bid down further if this still doesn't fill.
-    const bid = bestBid(book);
+    // Maker order_type: rest at the top bid (no sell_bump) so exits stay maker-style.
+    const bid = bestBid(book) ?? liveCrypto?.bestBid ?? null;
     if (bid === null) {
       await logCopySkip("empty bids", digest, txHash, cfg, { implied: effectiveImplied });
       return;
     }
     const baseSellLimit = roundToTick(Math.min(currentPrice, bid), tickSize, "down");
-    limitPrice = applySellBump(bid, baseSellLimit, tickSize, cfg.sellBump, cfg.maxSellBumpFrac);
+    if (isMaker) {
+      limitPrice = baseSellLimit;
+      takerBumpNote =
+        ` · orderType=maker sell@bid=${limitPrice.toFixed(4)} askSrc=${askSrc}` +
+        (liveCrypto ? ` · ${liveCrypto.slug} ${liveCrypto.outcome}` : "");
+    } else {
+      limitPrice = applySellBump(bid, baseSellLimit, tickSize, cfg.sellBump, cfg.maxSellBumpFrac);
+    }
   }
 
   // Buy: size from clipped notional. Sell: immediately liquidate full token balance.
@@ -2478,7 +2636,7 @@ export async function executeCopyTrade(
     const pUsdForLog = digest.side === "buy" ? (clippedUsdc ?? 0) : originPusd;
     const flushSuffix = flushedFromBufferCount > 0 ? ` · flushedFromBuffer=${flushedFromBufferCount}` : "";
     const msg =
-      `[DRY RUN] would post GTC · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${effectiveImplied.toFixed(4)}${takerBumpNote} · tx=${txHash}${flushSuffix}`;
+      `[DRY RUN] would post GTC${postOnly ? " postOnly" : ""} · side=${digest.side} shares=${orderShares} pUSD=${pUsdForLog.toFixed(6)} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · tokenID=${digest.tokenId} limitPrice=${limitPrice} tickSize=${tickSize} negRisk=${negRisk} · implied=${effectiveImplied.toFixed(4)}${takerBumpNote} · tx=${txHash}${flushSuffix}`;
     console.log(msg);
     void appendCopyTradeSuccessLine(msg, cfg.copyTradeLogPath);
     // Fill simulation (dry-run only): track how this order would fill against real live market flow.
@@ -2518,7 +2676,8 @@ export async function executeCopyTrade(
     client.createAndPostOrder(
       { tokenID: digest.tokenId, price, side, size },
       { tickSize: tk, negRisk },
-      OrderType.GTC
+      OrderType.GTC,
+      postOnly
     );
 
   let resp;
@@ -2586,16 +2745,85 @@ export async function executeCopyTrade(
   // A rejected order (error / 4xx in the response, not a throw) is NOT on the book — do not log it as
   // "posted", do not record it for P&L, and release the max_market_usdc reservation so a rejection
   // can't permanently consume the cap.
-  const postErr = postErrorMessage(resp);
+  //
+  // Maker post-only exception: "order crosses book" usually means the live ask was 1+ ticks stale.
+  // Force-refresh that token in the live market cache, recompute ask−1 tick, retry a few times.
+  let postErr = postErrorMessage(resp);
+  let crossRetryNote = "";
+  const MAKER_CROSS_RETRIES = 3;
+  if (
+    postErr &&
+    isMaker &&
+    postOnly &&
+    digest.side === "buy" &&
+    isPostOnlyCrossesBook(postErr)
+  ) {
+    for (let attempt = 1; attempt <= MAKER_CROSS_RETRIES && postErr && isPostOnlyCrossesBook(postErr); attempt++) {
+      const refreshed = await refreshLiveCryptoTokenBook(digest.tokenId);
+      const freshAsk = refreshed?.bestAsk ?? lookupLiveCryptoToken(digest.tokenId)?.bestAsk ?? null;
+      if (freshAsk === null || !(freshAsk > 0)) {
+        crossRetryNote += ` cross-retry${attempt}-no-ask`;
+        break;
+      }
+      const drift = freshAsk - effectiveImplied;
+      if (drift > cfg.maxPriceDifference) {
+        crossRetryNote += ` cross-retry${attempt}-drift ask=${freshAsk.toFixed(4)} drift=${drift.toFixed(4)}`;
+        break;
+      }
+      let freshPx = postOnlyBuyPrice(freshAsk, postTick, cfg.buyPriceMin, cfg.buyPriceMax);
+      // Live ask still implies the same bid that just crossed → step one more tick under it.
+      if (freshPx !== null && Math.abs(freshPx - postPrice) < 1e-12) {
+        const t = parseFloat(postTick);
+        const stepped = roundToTick(postPrice - t, postTick, "down");
+        if (
+          stepped > 0 &&
+          stepped < freshAsk &&
+          (cfg.buyPriceMin === undefined || stepped >= cfg.buyPriceMin) &&
+          (cfg.buyPriceMax === undefined || stepped <= cfg.buyPriceMax)
+        ) {
+          freshPx = stepped;
+        }
+      }
+      if (freshPx === null) {
+        crossRetryNote += ` cross-retry${attempt}-no-px ask=${freshAsk.toFixed(4)}`;
+        break;
+      }
+      const prev = postPrice;
+      try {
+        resp = await postOnce(freshPx, postTick);
+      } catch {
+        crossRetryNote += ` cross-retry${attempt}-throw`;
+        break;
+      }
+      postPrice = freshPx;
+      limitPrice = freshPx;
+      postErr = postErrorMessage(resp);
+      crossRetryNote += ` cross-retry${attempt} ${prev.toFixed(4)}→${freshPx.toFixed(4)}(ask=${freshAsk.toFixed(4)} askSrc=cache)`;
+      if (!postErr) {
+        crossRetryNote += ` ok`;
+        break;
+      }
+    }
+  }
+
   if (postErr) {
     if (reservedUsdc > 0) {
       addSideSpent(cfg.targetAddress, digest.tokenId, -reservedUsdc);
     }
     const { event, outcome } = await resolveMarketLabelsFast(digest.tokenId);
-    const fmsg = `copy REJECTED · ${digest.side} shares=${orderShares} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)} · limit=${limitPrice} tick=${postTick} · error=${JSON.stringify(postErr)} · tx=${txHash}${targetTag(cfg)}`;
+    const fmsg =
+      `copy REJECTED · ${digest.side} shares=${orderShares} · event=${JSON.stringify(event)} outcome=${JSON.stringify(outcome)}` +
+      ` · limit=${limitPrice} tick=${postTick} · error=${JSON.stringify(postErr)}` +
+      `${crossRetryNote ? ` ·${crossRetryNote}` : ""} · tx=${txHash}${targetTag(cfg)}`;
     console.warn(fmsg);
     void appendCopyTradeSuccessLine(fmsg, cfg.copyTradeLogPath);
     return;
+  }
+
+  if (crossRetryNote) {
+    const note = `maker cross-book retry succeeded ·${crossRetryNote} · tx=${txHash}${targetTag(cfg)}`;
+    console.info(note);
+    void appendCopyTradeSuccessLine(note, cfg.copyTradeLogPath);
   }
 
   // Actual fill from the CLOB response. The labels flip by side:
@@ -2695,6 +2923,281 @@ export async function executeCopyTrade(
     }
   }
 
+  // ── MAKER BUY reprice / drift-cancel ──────────────────────────────────────────────────────
+  // Resting post-only bids often sit unfilled. Every ~1s: refresh size_matched; if still open,
+  // reprice to ask−1 tick off the background ask cache (CLOB REST only on cache miss). If the
+  // live ask has drifted above implied by more than max_price_difference, cancel the remainder.
+  const MAKER_REPRICE_MS = 1_000;
+  if (
+    isMaker &&
+    digest.side === "buy" &&
+    restingOrderId &&
+    orderShares - restingFillShares >= minOrder
+  ) {
+    const windowDeadlineMs = liveCrypto
+      ? liveCrypto.windowEndSecs * 1000
+      : Date.now() + 5 * 60_000;
+    let repriced = 0;
+    let makerLoopNote = "";
+
+    while (restingOrderId && Date.now() < windowDeadlineMs) {
+      await new Promise((r) => setTimeout(r, MAKER_REPRICE_MS));
+
+      const matched = await readOrderMatched(client, restingOrderId);
+      if (matched !== null) {
+        restingFillShares = matched;
+        restingFillUsdc = matched * postPrice;
+      }
+      const remainingBefore = orderShares - terminalFillShares - restingFillShares;
+      if (remainingBefore < minOrder) {
+        break; // filled (or dust left)
+      }
+
+      // Prefer background-polled ask cache; only hit CLOB REST if cache is cold/stale-empty.
+      const liveNow = lookupLiveCryptoToken(digest.tokenId);
+      let freshAsk = liveNow?.bestAsk ?? null;
+      if (freshAsk === null || !(freshAsk > 0)) {
+        try {
+          const freshBook = await client.getOrderBook(digest.tokenId);
+          freshAsk = bestAsk(freshBook);
+          if (liveNow && freshAsk != null) {
+            liveNow.bestAsk = freshAsk;
+            const b = bestBid(freshBook);
+            if (b != null) liveNow.bestBid = b;
+            liveNow.updatedAtMs = Date.now();
+          }
+        } catch {
+          break;
+        }
+      }
+      if (freshAsk === null || !(freshAsk > 0)) {
+        makerLoopNote += ` no-ask-cancel`;
+        try {
+          await client.cancelOrder({ orderID: restingOrderId });
+        } catch {
+          break;
+        }
+        terminalFillShares += restingFillShares;
+        terminalFillUsdc += restingFillUsdc;
+        restingOrderId = "";
+        restingPosted = 0;
+        restingFillShares = 0;
+        restingFillUsdc = 0;
+        break;
+      }
+
+      // Same overbid gate as the initial copy: ask moved too far above the target's implied → cancel.
+      const drift = freshAsk - effectiveImplied;
+      if (drift > cfg.maxPriceDifference) {
+        makerLoopNote += ` drift-cancel ask=${freshAsk.toFixed(4)} drift=${drift.toFixed(4)} maxΔ=${cfg.maxPriceDifference}`;
+        try {
+          await client.cancelOrder({ orderID: restingOrderId });
+        } catch {
+          // Cancel failed — may have filled; keep tracking and stop the loop.
+          break;
+        }
+        terminalFillShares += restingFillShares;
+        terminalFillUsdc += restingFillUsdc;
+        restingOrderId = "";
+        restingPosted = 0;
+        restingFillShares = 0;
+        restingFillUsdc = 0;
+        break;
+      }
+
+      const freshMakerPx = postOnlyBuyPrice(freshAsk, postTick, cfg.buyPriceMin, cfg.buyPriceMax);
+      if (freshMakerPx === null) {
+        makerLoopNote += ` no-maker-px-cancel ask=${freshAsk.toFixed(4)}`;
+        try {
+          await client.cancelOrder({ orderID: restingOrderId });
+        } catch {
+          break;
+        }
+        terminalFillShares += restingFillShares;
+        terminalFillUsdc += restingFillUsdc;
+        restingOrderId = "";
+        restingPosted = 0;
+        restingFillShares = 0;
+        restingFillUsdc = 0;
+        break;
+      }
+
+      // Ask unchanged → leave the resting order alone; fill check runs again next second.
+      const tickNum = parseFloat(postTick) || 0.01;
+      if (Math.abs(freshMakerPx - postPrice) < tickNum / 2) {
+        continue;
+      }
+
+      // Ask moved → refresh live monitor ask, then cancel+replace.
+      // Critical: re-read size_matched BEFORE cancel. After cancel, getOrder often returns null —
+      // treating that as 0 fill and reposting full orderShares doubles the buy (~2× vs copy_ratio).
+      const refreshed = await refreshLiveCryptoTokenBook(digest.tokenId);
+      const refreshAsk = refreshed?.bestAsk ?? freshAsk;
+      let replacePx = postOnlyBuyPrice(refreshAsk, postTick, cfg.buyPriceMin, cfg.buyPriceMax);
+      if (replacePx === null) {
+        replacePx = freshMakerPx;
+      }
+      // Still same as resting → nothing to do this tick.
+      if (Math.abs(replacePx - postPrice) < tickNum / 2) {
+        continue;
+      }
+
+      const prevPrice = postPrice;
+      const prevOrderId = restingOrderId;
+      const matchedPreCancel = await readOrderMatched(client, prevOrderId);
+      if (matchedPreCancel !== null) {
+        restingFillShares = matchedPreCancel;
+        restingFillUsdc = matchedPreCancel * prevPrice;
+      }
+      if (orderShares - terminalFillShares - restingFillShares < minOrder) {
+        // Already filled enough while deciding to reprice — leave resting order alone.
+        continue;
+      }
+
+      try {
+        await client.cancelOrder({ orderID: prevOrderId });
+      } catch {
+        // Cancel failed → may have just filled; stop rather than posting a second size.
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+
+      const matchedAfter = await readOrderMatched(client, prevOrderId);
+      // null after cancel = unknown. Prefer pre-cancel match; never invent 0 and double-post.
+      const filledOnCancelled =
+        matchedAfter !== null
+          ? matchedAfter
+          : matchedPreCancel !== null
+            ? matchedPreCancel
+            : restingFillShares;
+      restingFillShares = filledOnCancelled;
+      restingFillUsdc = filledOnCancelled * prevPrice;
+      terminalFillShares += restingFillShares;
+      terminalFillUsdc += restingFillUsdc;
+      restingOrderId = "";
+      restingPosted = 0;
+      restingFillShares = 0;
+      restingFillUsdc = 0;
+
+      const remaining = orderShares - terminalFillShares;
+      if (remaining < minOrder) {
+        break;
+      }
+      if (matchedAfter === null && matchedPreCancel === null) {
+        makerLoopNote += ` reprice-skip-unknown-match`;
+        break;
+      }
+
+      const MAKER_REPRICE_POST_RETRIES = 3;
+      let rp: unknown = null;
+      let postedPx = replacePx;
+      let replaceOk = false;
+      for (let attempt = 1; attempt <= MAKER_REPRICE_POST_RETRIES; attempt++) {
+        let tryAsk = refreshAsk;
+        if (attempt > 1) {
+          const again = await refreshLiveCryptoTokenBook(digest.tokenId);
+          tryAsk = again?.bestAsk ?? tryAsk;
+          let nextPx = postOnlyBuyPrice(tryAsk, postTick, cfg.buyPriceMin, cfg.buyPriceMax);
+          if (nextPx !== null && Math.abs(nextPx - postedPx) < 1e-12) {
+            const stepped = roundToTick(postedPx - tickNum, postTick, "down");
+            if (
+              stepped > 0 &&
+              stepped < tryAsk &&
+              (cfg.buyPriceMin === undefined || stepped >= cfg.buyPriceMin) &&
+              (cfg.buyPriceMax === undefined || stepped <= cfg.buyPriceMax)
+            ) {
+              nextPx = stepped;
+            }
+          }
+          if (nextPx === null) {
+            makerLoopNote += ` reprice-retry${attempt}-no-px`;
+            break;
+          }
+          const drift2 = tryAsk - effectiveImplied;
+          if (drift2 > cfg.maxPriceDifference) {
+            makerLoopNote += ` reprice-retry${attempt}-drift`;
+            break;
+          }
+          postedPx = nextPx;
+        }
+        try {
+          rp = await postOnce(postedPx, postTick, remaining);
+        } catch {
+          makerLoopNote += ` reprice-throw`;
+          rp = null;
+          break;
+        }
+        const err = postErrorMessage(rp);
+        if (!err) {
+          replaceOk = true;
+          if (attempt > 1) {
+            makerLoopNote += ` reprice-retry${attempt}-ok`;
+          }
+          break;
+        }
+        if (!isPostOnlyCrossesBook(err)) {
+          makerLoopNote += ` reprice-reject`;
+          break;
+        }
+        makerLoopNote += ` reprice-cross${attempt}`;
+      }
+
+      // Replacement failed → try to put the old maker bid back so we don't sit flat.
+      if (!replaceOk) {
+        try {
+          rp = await postOnce(prevPrice, postTick, remaining);
+          if (!postErrorMessage(rp)) {
+            postedPx = prevPrice;
+            replaceOk = true;
+            makerLoopNote += ` reprice-restore@${prevPrice.toFixed(4)}`;
+          } else {
+            makerLoopNote += ` reprice-reject-abandoned`;
+            break;
+          }
+        } catch {
+          makerLoopNote += ` reprice-reject-abandoned`;
+          break;
+        }
+      }
+
+      const rpObj = rp as { takingAmount?: string; makingAmount?: string; orderID?: string };
+      restingOrderId = rpObj.orderID ?? "";
+      restingPosted = remaining;
+      restingFillShares = parseFloat(rpObj.takingAmount ?? "0") || 0;
+      restingFillUsdc = parseFloat(rpObj.makingAmount ?? "0") || 0;
+      resp = rp;
+      postPrice = postedPx;
+      limitPrice = postedPx;
+      postedResps.push(rp);
+      repriced++;
+    }
+
+    // Window ended while still resting → cancel remainder (don't leave orphan maker bids).
+    if (restingOrderId && Date.now() >= windowDeadlineMs) {
+      makerLoopNote += ` window-end-cancel`;
+      try {
+        await client.cancelOrder({ orderID: restingOrderId });
+        const matchedEnd = await readOrderMatched(client, restingOrderId);
+        if (matchedEnd !== null) {
+          restingFillShares = matchedEnd;
+          restingFillUsdc = matchedEnd * postPrice;
+        }
+        terminalFillShares += restingFillShares;
+        terminalFillUsdc += restingFillUsdc;
+        restingOrderId = "";
+        restingPosted = 0;
+        restingFillShares = 0;
+        restingFillUsdc = 0;
+      } catch {
+        // Keep restingOrderId so the poller can still track a late fill.
+      }
+    }
+
+    if (repriced > 0 || makerLoopNote) {
+      repriceNote = ` · makerReprice×${repriced}${makerLoopNote ? ` ·${makerLoopNote}` : ""}`;
+    }
+  }
+
   // ── BUY reprice-until-filled ──────────────────────────────────────────────────────────────
   // A GTC buy priced at ask + bump can rest unfilled when the ask climbs in the latency window (fast
   // markets). Chase it UP: cancel the resting remainder, re-price off a FRESH book (WS book for crypto,
@@ -2703,7 +3206,7 @@ export async function executeCopyTrade(
   // filters — min(buy_price_max, implied + max_price_difference) — so a chase never pays more than the
   // drift/price checks already allow. Budget-sized: each re-post buys (remaining USDC ÷ new price)
   // shares, so total spend stays within the reserved notional. Live buys only; dry-run posts nothing.
-  if (digest.side === "buy" && (cfg.buyRepriceAttempts ?? 0) > 0 && restingOrderId) {
+  if (!isMaker && digest.side === "buy" && (cfg.buyRepriceAttempts ?? 0) > 0 && restingOrderId) {
     const startTs = Date.now();
     const deadlineMs = cfg.buyRepriceDeadlineMs ?? 2500;
     const budget = clippedUsdc ?? 0;
@@ -2814,9 +3317,22 @@ export async function executeCopyTrade(
         void appendCopyTradeSuccessLine(warn, cfg.copyTradeLogPath);
       }
     }
-    // postedShares = the FINAL resting order's size (restingPosted): equals orderShares when the buy
-    // didn't reprice, or the last re-posted remainder when it did — so the poller tracks the right order.
-    await recordCopyBuyAndReconcile(cfg, client, digest.tokenId, filledShares, txHash, postedOrderId, restingPosted);
+    // Maker/taker reprice may have cancelled an unfilled remainder — refund that slice of the reservation
+    // so max_market_usdc isn't stuck holding cancelled USDC.
+    if (reservedUsdc > 0 && filledUsdc + 1e-9 < reservedUsdc) {
+      addSideSpent(cfg.targetAddress, digest.tokenId, -(reservedUsdc - filledUsdc));
+    }
+    // postedShares = the FINAL resting order's size; terminalPriorFill covers superseded reprice fills.
+    await recordCopyBuyAndReconcile(
+      cfg,
+      client,
+      digest.tokenId,
+      restingFillShares,
+      txHash,
+      postedOrderId,
+      restingPosted || orderShares,
+      terminalFillShares
+    );
     // Protective take-profit: rest a GTC SELL of the just-filled position at safe_sell (e.g. 0.99), so a
     // spike there exits fee-free before a possible 99c->1c flip. Best-effort; never blocks the copy.
     await placeSafeSell(cfg, client, digest.tokenId, filledShares, postTick, negRisk, minOrder, txHash);

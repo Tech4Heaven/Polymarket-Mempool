@@ -134,6 +134,13 @@ export type TomlDefaultsSection = {
    */
   safe_sell?: number;
   /**
+   * Order style for copy posts:
+   *  - "maker" / "post_only": GTC post-only at ask−1 tick (buys) using the live crypto 5m/15m/1h ask
+   *    cache (speed-outcome-entry pattern). Only copies live 5m/15m/1h crypto Up/Down markets.
+   *  - "taker" / omit: existing behavior (GTC; optional taker_bump / sell_bump to cross).
+   */
+  order_type?: string;
+  /**
    * Copy only the target's MAIN side. Some traders buy BOTH outcomes of a market (a self-hedge);
    * copying both guarantees a losing leg. When true, we copy the FIRST outcome the target buys in each
    * market and SKIP any buy on the opposite outcome (his hedge/second leg) — a clean directional copy.
@@ -181,6 +188,7 @@ export type TomlTargetRow = {
   new_wallet?: boolean;
   new_wallet_min_usd?: number;
   safe_sell?: number;
+  order_type?: string;
   main_side_only?: boolean;
   enabled?: boolean;
 };
@@ -282,6 +290,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       new_wallet: boolOrUndef("new_wallet", src),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", src),
       safe_sell: numOrUndef("safe_sell", src),
+      order_type: strOrUndef("order_type", src),
       main_side_only: boolOrUndef("main_side_only", src),
       enabled: boolOrUndef("enabled", src),
     };
@@ -336,6 +345,7 @@ export async function parseCopyTargetsTomlFile(filePath: string): Promise<Parsed
       new_wallet: boolOrUndef("new_wallet", row),
       new_wallet_min_usd: numOrUndef("new_wallet_min_usd", row),
       safe_sell: numOrUndef("safe_sell", row),
+      order_type: strOrUndef("order_type", row),
       main_side_only: boolOrUndef("main_side_only", row),
       enabled: boolOrUndef("enabled", row),
     });

@@ -7,6 +7,9 @@
 copy_ratio = 1
 # Overbid skip: when effective ask > target's implied by more than this, skip the copy
 # (market moved up faster than us — we'd pay too much).
+# For order_type = "maker": also used while a resting maker bid is open — every ~1s the bot
+# checks fill status; if unfilled it reprices to ask−1 tick; if the live ask drifts above
+# implied by more than this, the resting order is cancelled.
 max_price_difference = 0.1
 # Underbid skip (optional): when effective ask < target's implied by more than this, skip the copy
 # (market re-priced AWAY from target's side in the gap between their fill and ours — strong
@@ -116,6 +119,14 @@ max_position_usdc = 100
 #   buy_reprice_deadline_ms: stop repricing this many ms after the first post (default 2500).
 # buy_reprice_attempts = 4
 # buy_reprice_deadline_ms = 2500
+# Order style for copy posts (per target or defaults):
+#   order_type = "maker" | "post_only" — GTC post-only at ask−1 tick on live crypto 5m/15m/1h only
+#                 (slug discovery + ask cache, same pattern as speed-outcome-entry). Non-5m/15m/1h skipped.
+#   order_type = "taker" | omit — legacy GTC; use taker_bump / sell_bump to cross.
+# For order_type = "maker": max_price_difference also gates the resting maker bid — every ~1s the bot
+# checks fill status; if unfilled it reprices to ask−1 tick; if the live ask drifts above implied by
+# more than this, the resting order is cancelled.
+# order_type = "maker"
 # Restrict copying to specific crypto "Up or Down" assets (ALLOWLIST). A single asset or a list; values
 # match the market slug prefix, long names aliased (bitcoin→btc, ethereum→eth, …). When set, trades on
 # any other asset — and any non-crypto market — are skipped (a cache miss is skipped too). Resolved

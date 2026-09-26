@@ -17,6 +17,11 @@
  *   pm2 start ecosystem.config.cjs --only relay
  *   pm2 logs relay
  * On hosts that only run bots (no key), delete the `relay` app entry below.
+ * The `buy-ui` app is the BTC Manual Buy web UI (scripts/manualBuyServer.ts) — run it alongside
+ * the bot as a separate PM2 process (does not share the bot process):
+ *   ./start-buy-ui.sh
+ *   pm2 logs buy-ui
+ *   http://127.0.0.1:3847
  */
 
 const path = require("path");
@@ -46,6 +51,28 @@ module.exports = {
         // your wallet has a different name; defaults inside the bot use euqoriueusu.json.
         // COPY_WALLET_KEY_JSON: "euqoriueusu.json",
         COPY_WALLET_KEY_PASSPHRASE: process.env.COPY_WALLET_KEY_PASSPHRASE,
+      },
+    },
+    {
+      name: "buy-ui",
+      script: path.join(cwd, "node_modules", "tsx", "dist", "cli.mjs"),
+      args: "scripts/manualBuyServer.ts",
+      cwd,
+      interpreter: "node",
+      instances: 1,
+      exec_mode: "fork",
+      max_restarts: 50,
+      restart_delay: 5_000,
+      min_uptime: "10s",
+      out_file: path.join(cwd, "logs", "pm2-buy-ui-out.log"),
+      error_file: path.join(cwd, "logs", "pm2-buy-ui-err.log"),
+      merge_logs: true,
+      time: true,
+      max_memory_restart: "1G",
+      env: {
+        NODE_ENV: "production",
+        BUY_UI_HOST: process.env.BUY_UI_HOST || "127.0.0.1",
+        BUY_UI_PORT: process.env.BUY_UI_PORT || "3847",
       },
     },
     {
